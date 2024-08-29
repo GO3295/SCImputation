@@ -1,0 +1,9 @@
+setup.py
+afMF/__init__.py
+afMF/runafMF.py
+afMF.egg-info/PKG-INFO
+afMF.egg-info/SOURCES.txt
+afMF.egg-info/dependency_links.txt
+afMF.egg-info/not-zip-safe
+afMF.egg-info/requires.txt
+afMF.egg-info/top_level.txt

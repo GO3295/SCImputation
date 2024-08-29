@@ -1,0 +1,11 @@
+Metadata-Version: 2.1
+Name: afMF
+Version: 0.1
+Summary: afMF:single cell RNA-seq dropout imputation
+Home-page: http://github.com/jh50/scRNAseqImpute
+Author: AC & JH
+Author-email: 1155186461@link.cuhk.edu.hk
+License: MIT
+Requires-Dist: pandas
+Requires-Dist: numpy
+Requires-Dist: scikit-learn
