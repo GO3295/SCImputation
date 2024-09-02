@@ -16,7 +16,7 @@ def afMF(X, iteration=int(1e4), tolerence=1e-4, lambda_P=0, lambda_Q=0, sigma=3,
     log_norm_X = log_norm(X)
 
     k = k_rank_selection(log_norm_X, sigma, random_seed)
-
+    print('k=',k)
     num_latent_features = k
     alpha = 0
 
