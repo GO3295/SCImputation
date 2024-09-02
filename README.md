@@ -5,6 +5,7 @@ To impute the data: <br />
   
 import pandas as pd  
 from afMF.runafMF import afMF  
+  
 dat = pd.read_csv("/your_dir/data.txt", sep="\t", index_col=0)  
 imputed_dat = afMF(dat)  
 print(imputed_dat.iloc[:, : 5].head(5))
