@@ -1,5 +1,5 @@
 # afMF: Low-rank Full Matrix Factorization for dropout imputation in single cell RNA-seq and benchmarking with imputation algorithms for downstream applications 
-Install the package locally: (1) download / clone 'afMF' to your directory; (2) enter the 'afMF' directory; (3) then run ' pip install . '  <br />
+Install the package locally: (1) download / clone 'afMF' to your directory; (2) enter the 'afMF' directory; (3) run ' pip install . '  <br />
   
 To impute the data: <br />
   
