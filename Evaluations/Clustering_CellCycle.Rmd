@@ -23,13 +23,10 @@ library(mclust)
 library(cluster)
 library(SCINA)
 library(caret)
-library(robCompositions)
-library(easyCODA)
 library(MAST)
 library(AUCell)
 library(HGNChelper)
 library(SeuratDisk)
-library(scmap)
 library(monocle3)
 library(ggpubr)
 library(slingshot)
@@ -45,8 +42,6 @@ library(TSCAN)
 library(reshape2)
 library(pheatmap)
 library(philentropy)
-library(SCeQTL)
-library(eQTLsingle)
 library(rawr)
 library(splatter)
 library(combinat)
@@ -91,42 +86,12 @@ evalClustering <- function(x,npc=10,method="lv_clu"){
     }))
 
     ARI <- adjustedRandIndex(x$celltype,x@meta.data[,method])
-
-    d <- dist(x@reductions$pca@cell.embeddings[,1:npc])
-    s <- silhouette(x@meta.data[,method],dist=d)
-    medianSil <- median(s[,3])
     
     NMI_value <- NMI(x@meta.data[,method],x$celltype)
     #NMI_value <- NMI(x$lv_clu,x$celltype,variant="sum")
     
-    df <- c(acc,pur,ARI,medianSil,NMI_value)
-    names(df) <- c("acc","pur","ARI","medianSil","NMI")
-    return(df)
-}
-
-evalClustering_status <- function(x,npc=10,method="lv_clu"){
-    
-    acc <- -mean(sapply(unique(x@meta.data[,method]),function(i){
-        p <- table(x@meta.data[x@meta.data[,method]==i,"label"])/sum(x@meta.data[,method]==i)
-        sum(p*log(p),na.rm=TRUE)
-    }))
-
-    pur <- -mean(sapply(unique(x$label),function(sct){
-        p <- table(x@meta.data[x$label==sct,method])/sum(x$label==sct)
-        sum(p*log(p),na.rm=TRUE)
-    }))
-
-    ARI <- adjustedRandIndex(x$label,x@meta.data[,method])
-
-    d <- dist(x@reductions$pca@cell.embeddings[,1:npc])
-    s <- silhouette(x@meta.data[,method],dist=d)
-    medianSil <- median(s[,3])
-    
-    NMI_value <- NMI(x@meta.data[,method],x$label)
-    #NMI_value <- NMI(x$lv_clu,x$celltype,variant="sum")
-    
-    df <- c(acc,pur,ARI,medianSil,NMI_value)
-    names(df) <- c("acc","pur","ARI","medianSil","NMI")
+    df <- c(acc,pur,ARI,NMI_value)
+    names(df) <- c("acc","pur","ARI","NMI")
     return(df)
 }
 ```
@@ -524,7 +489,7 @@ res3_km <- d3$km
 ### process data lv
 ```{r}
 ##LV cluster
-rownames(res1_lv) <- c("Hacc","Hpur","ARI","medianSil","NMI")
+rownames(res1_lv) <- c("Hacc","Hpur","ARI","NMI")
 
 res_lv <- data.frame()
 res_lv_median <- data.frame()
@@ -539,7 +504,7 @@ for(i in 1:2){
     res_lv_median <- rbind(res_lv_median,tmp_median)
 }
 
-for(i in 3:5){
+for(i in 3:4){
     tmp1 <- res1_lv[i,-1]-res1_lv[i,1]
     tmp2 <- res2_lv[i,-1]-res2_lv[i,1]
     tmp3 <- res3_lv[i,-1]-res3_lv[i,1]
@@ -552,7 +517,7 @@ for(i in 3:5){
 
 res_lv_median <- as.data.frame(t(res_lv_median))
 rownames(res_lv_median) <- colnames(res1_lv)[-1]
-colnames(res_lv_median) <- c("Hacc","Hpur","ARI","medianSil","NMI")
+colnames(res_lv_median) <- c("Hacc","Hpur","ARI","NMI")
 
 res_lv_median$method <- rownames(res_lv_median)
 res_lv_median_melt <- data.table::melt(res_lv_median,id.vars=c("method"))
@@ -577,7 +542,7 @@ res_lv_median_melt$method <- factor(res_lv_median_melt$method,levels=rank1)
 tmp_hm <- res_lv_median_melt[,]
 tmp_hm[tmp_hm$Metrics_Difference<(-0.03),]$Metrics_Difference <- -0.03
 tmp_hm[tmp_hm$Metrics_Difference>(0.03),]$Metrics_Difference <- 0.03
-tmp_hm <- tmp_hm[tmp_hm$Metrics!="medianSil",]
+
 clu_4metric_lv_hm <- ggplot(tmp_hm,aes(method,Metrics,fill=Metrics_Difference))+geom_tile()+theme(axis.text.x=element_text(angle=90))+scale_fill_gradient2(low="blue",mid="white",high="red",midpoint=0)+ggtitle("Louvain Clustering Evaluation Metrics(Values of Difference)")+xlab("Method")+theme(legend.title=element_text(size=15),legend.text=element_text(size=14),axis.text=element_text(size=15),axis.title=element_text(size=15),plot.title=element_text(size=15))#+geom_vline(xintercept=neg_md+0.5,linetype="dashed")
 clu_4metric_lv_hm
 ```
@@ -585,7 +550,7 @@ clu_4metric_lv_hm
 ### process data kmeans
 ```{r}
 ##LV cluster
-rownames(res1_km) <- c("Hacc","Hpur","ARI","medianSil","NMI")
+rownames(res1_km) <- c("Hacc","Hpur","ARI","NMI")
 
 res_km <- data.frame()
 res_km_median <- data.frame()
@@ -600,7 +565,7 @@ for(i in 1:2){
     res_km_median <- rbind(res_km_median,tmp_median)
 }
 
-for(i in 3:5){
+for(i in 3:4){
     tmp1 <- res1_km[i,-1]-res1_km[i,1]
     tmp2 <- res2_km[i,-1]-res2_km[i,1]
     tmp3 <- res3_km[i,-1]-res3_km[i,1]
@@ -613,7 +578,7 @@ for(i in 3:5){
 
 res_km_median <- as.data.frame(t(res_km_median))
 rownames(res_km_median) <- colnames(res1_km)[-1]
-colnames(res_km_median) <- c("Hacc","Hpur","ARI","medianSil","NMI")
+colnames(res_km_median) <- c("Hacc","Hpur","ARI","NMI")
 
 res_km_median$method <- rownames(res_km_median)
 res_km_median_melt <- data.table::melt(res_km_median,id.vars=c("method"))
@@ -639,7 +604,7 @@ res_km_median_melt <- res_km_median_melt[res_km_median_melt$method!="New",]
 tmp_hm <- res_km_median_melt[,]
 tmp_hm[tmp_hm$Metrics_Difference<(-0.01),]$Metrics_Difference <- -0.01
 tmp_hm[tmp_hm$Metrics_Difference>(0.01),]$Metrics_Difference <- 0.01
-tmp_hm <- tmp_hm[tmp_hm$Metrics!="medianSil",]
+
 clu_4metric_km_hm <- ggplot(tmp_hm,aes(method,Metrics,fill=Metrics_Difference))+geom_tile()+theme(axis.text.x=element_text(angle=90))+scale_fill_gradient2(low="blue",mid="white",high="red",midpoint=0)+ggtitle("K-means Clustering Evaluation Metrics(Values of Difference)")+xlab("Method")+theme(legend.title=element_text(size=15),legend.text=element_text(size=14),axis.text=element_text(size=15),axis.title=element_text(size=15),plot.title=element_text(size=15))#+geom_vline(xintercept=neg_md+0.5,linetype="dashed")
 clu_4metric_km_hm
 ```

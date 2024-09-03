@@ -1,0 +1,1157 @@
+---
+title: "Advanced_Applications"
+output: html_notebook
+---
+
+load library
+```{r message=FALSE, warning=FALSE}
+library(Seurat)
+library(ggplot2)
+library(SingleCellExperiment)
+library(scran)
+library(SeuratData)
+library(edgeR)
+library(limma)
+library(clusterProfiler)
+library(data.table)
+library(SingleCellExperiment)
+library(SummarizedExperiment)
+library(muscat)
+library(pROC)
+library(igraph)
+library(mclust)
+library(cluster)
+library(SCINA)
+library(caret)
+library(MAST)
+library(AUCell)
+library(HGNChelper)
+library(SeuratDisk)
+library(monocle3)
+library(ggpubr)
+library(slingshot)
+library(grDevices)
+library(RColorBrewer)
+library(randomForest)
+library(caTools)
+library(mltools)
+#library(stringr)
+library(reldist)
+library(aricode)
+library(TSCAN)
+library(reshape2)
+library(pheatmap)
+library(philentropy)
+library(rawr)
+library(splatter)
+library(combinat)
+library(Hmisc)
+library(dplyr,lib.loc="/share/pkg.7/r/4.2.1/install/lib64/R/library")
+library(ggvenn)
+
+selected_palette2 <- c("plum1","aquamarine4","azure4","powderblue","cornflowerblue","darkgoldenrod2","darkorange3","peachpuff","royalblue")
+selected_palette3 <- c("plum1","aquamarine4","azure4","powderblue","cornflowerblue","darkorange3","peachpuff","royalblue")
+selected_palette4 <- c("aquamarine4","azure4","powderblue","darkorange3","peachpuff","royalblue")
+```
+
+function
+```{r}
+getAUCell <- function(x,GeneList){
+    set.seed(333)
+    tmp <- AUCell_run(x,GeneList)
+    cells_assignment <- AUCell_exploreThresholds(tmp,plotHist=FALSE,assign=TRUE)
+    cellsAssigned <- lapply(cells_assignment,function(y) y$assignment)
+    assignmentTable <- reshape2::melt(cellsAssigned,value.name="cell")
+    colnames(assignmentTable)[2] <- "geneSet"
+    assignmentMat <- t(table(assignmentTable[,"geneSet"], assignmentTable[,"cell"]))
+    return(assignmentMat)
+}
+
+evalAUCellIFN <- function(x,scol){
+    NormPct <- sum(rownames(x[x[,scol]==1,])%in%NormalCells)/length(NormalCells)
+    CovidPct <- sum(rownames(x[x[,scol]==1,])%in%COVIDCells)/length(COVIDCells)
+    res <- c(NormPct,CovidPct)
+    return(res)
+}
+
+evalAUCellIFNmedian <- function(x){
+    NormPct <- median(sapply(1:ncol(x),function(y)sum(rownames(x[x[,y]==1,])%in%NormalCells)/length(NormalCells) ))
+    CovidPct <- median(sapply(1:ncol(x),function(y)sum(rownames(x[x[,y]==1,])%in%COVIDCells)/length(COVIDCells) ))
+    res <- c(NormPct,CovidPct)
+    return(res)
+}
+
+getHeatmap <- function(x,meta,y="raw"){
+    tmpmeta <- meta[order(meta$status),]
+    tmpmeta$status <- factor(tmpmeta$status,levels=c("normal","COVID19"))
+    tmp_hm <- matrix(data=0,nrow=nrow(tmpmeta)-nrow(x),ncol=ncol(x))
+    rownames(tmp_hm) <- rownames(tmpmeta[!rownames(tmpmeta)%in%rownames(x),])
+    colnames(tmp_hm) <- colnames(x)
+    tmp_hm <- rbind(x,tmp_hm)
+    tmp_hm <- tmp_hm[rownames(tmpmeta),]
+    tmp_hm <- t(tmp_hm)
+    tmpmeta <- data.frame(status=tmpmeta$status,row.names=rownames(tmpmeta))
+    print(pheatmap(tmp_hm,cluster_cols=F,cluster_rows=F,show_colnames=F,show_rownames=T,annotation_col=tmpmeta,fontsize_row=8,main=y))
+}
+
+getHeatmap2 <- function(x,meta,y="raw"){
+    tmpmeta <- meta[order(meta$status),]
+    tmpmeta$status <- factor(tmpmeta$status,levels=c("normal","COVID19"))
+    tmp_hm <- x[rownames(tmpmeta),]
+    tmp_hm <- t(tmp_hm)
+    tmp_hm[tmp_hm>=0.3] <- 0.3
+    tmpmeta <- data.frame(celltype=tmpmeta$status,row.names=rownames(tmpmeta))
+    print(pheatmap(tmp_hm,cluster_cols=F,cluster_rows=F,show_colnames=F,show_rownames=T,annotation_col=tmpmeta,fontsize_row=8,main=y))
+}
+
+
+getUMAPPlot <- function(x,meta){
+    tmpmeta <- meta[,]
+    tmpmeta$status <- factor(tmpmeta$status,levels=c("normal","COVID19"))
+    tmpmeta$IFN_alpha <- ifelse(rownames(tmpmeta)%in%rownames(res[[x]][res[[x]][,1]==1,]),"acitivated","No")
+    tmpmeta$IFN_gamma <- ifelse(rownames(tmpmeta)%in%rownames(res[[x]][res[[x]][,2]==1,]),"acitivated","No")
+    tmp_umap <- CreateSeuratObject(dat[[x]],meta.data=tmpmeta,min.cells=0,min.features=0)
+    tmp_umap <- NormalizeData(tmp_umap)
+    tmp_umap <- FindVariableFeatures(tmp_umap)
+    tmp_umap <- ScaleData(tmp_umap)
+    tmp_umap <- RunPCA(tmp_umap,verbose=FALSE)
+    tmp_umap <- RunUMAP(tmp_umap,dims=1:10,verbose=FALSE)
+    p1 <- UMAPPlot(tmp_umap,group.by="IFN_alpha",split.by="status")+ggtitle(paste0(x,"-IFN ALPHA"))
+    p2 <- UMAPPlot(tmp_umap,group.by="IFN_gamma",split.by="status")+ggtitle(paste0(x,"-IFN GAMMA"))
+    #print(p1)
+    #print(p2)
+    return(list(p1=p1,p2=p2))
+}
+
+evalAUCellAUC <- function(x,scol){
+    NormMean <- mean(x[rownames(x)%in%NormalCells,scol])
+    COVIDMean <- mean(x[rownames(x)%in%COVIDCells,scol])
+    res <- c(NormMean,COVIDMean)
+    return(res)
+}
+```
+
+# AUCell for COVID19/normal for interferon-related genes
+## read data(Arun)
+```{r message=FALSE, warning=FALSE}
+#PBMC
+##raw
+raw_dat <- readRDS("rawcount_rds/azimuth_PBMC_demo_Arunachalam_rawnorm2.rds")
+metadat <- as.data.frame(raw_dat@colData)
+metadat$status <- ifelse(metadat$disease=="normal","normal","COVID19")
+metadat$monocyte <- ifelse(metadat$Cell.group%in%c("CD14+ Monocyte","CD16+ Monocyte"),"monocyte","other")
+
+raw_dat <- as.matrix(raw_dat@assays@data$counts)
+##imputed
+alra_dat <- fread("alra/azimuth_PBMC_demo_Arunachalam_genebycell_alra.txt",sep="\t",stringsAsFactors=FALSE)
+alra_dat <- as.matrix(alra_dat,rownames=1)
+colnames(alra_dat) <- colnames(raw_dat)
+MAGIClog_dat <- fread("MAGIC_log/azimuth_PBMC_demo_Arunachalam_genebycell.tsv",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+MAGIClog_dat <- as.matrix(MAGIClog_dat,rownames=1)
+MAGIC_dat <- fread("MAGIC/azimuth_PBMC_demo_Arunachalam_genebycell.tsv",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+MAGIC_dat <- as.matrix(MAGIC_dat,rownames=1)
+dca_dat <- fread("dca/azimuth_PBMC_demo_Arunachalam/mean.tsv",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+dca_dat <- as.matrix(dca_dat,rownames=1)
+AutoClass_dat <- fread("AutoClass/azimuth_PBMC_demo_Arunachalam_genebycell_AC.txt",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+AutoClass_dat <- as.matrix(AutoClass_dat,rownames=1)
+ks_dat <- fread("knn_smoothing/azimuth_PBMC_demo_Arunachalam_genebycell_ks.txt",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+ks_dat <- as.matrix(ks_dat,rownames=1)
+scRMDnorm_dat <- fread("scRMD/azimuth_PBMC_demo_Arunachalam_genebycell_scRMDlognorm.txt",sep="\t",stringsAsFactors=FALSE)
+scRMDnorm_dat <- as.matrix(scRMDnorm_dat,rownames=1)
+
+afMF_dat <- fread("afMF/imputed_data/azimuth_PBMC_demo_Arunachalam_sigma3_0_convergence_True.txt",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+afMF_dat <- as.matrix(afMF_dat,rownames=1)
+```
+
+normalized data
+```{r}
+raw_dat <- CreateSeuratObject(counts=raw_dat,meta.data=metadat,min.cells=0,min.features=0)
+raw_dat <- NormalizeData(raw_dat)
+raw_dat <- as.matrix(raw_dat@assays$RNA@data)
+
+dca_dat <- log2(dca_dat)
+
+ks_dat <- CreateSeuratObject(counts=ks_dat,meta.data=metadat,min.cells=0,min.features=0)
+ks_dat <- NormalizeData(ks_dat)
+ks_dat <- as.matrix(ks_dat@assays$RNA@data)
+```
+
+combine normalized data
+```{r}
+dat <- list(raw=raw_dat,ALRA=alra_dat,AutoClass=AutoClass_dat,DCA=dca_dat,kNN_smoothing=ks_dat,MAGIC=MAGIC_dat,MAGIC_log=MAGIClog_dat,scRMD=scRMDnorm_dat,afMF=afMF_dat)
+rm(raw_dat)
+rm(alra_dat)
+rm(AutoClass_dat)
+rm(ks_dat)
+rm(dca_dat)
+rm(MAGIC_dat)
+rm(MAGIClog_dat)
+rm(scRMDnorm_dat)
+rm(afMF_dat)
+
+#change to symbol
+GeneSymbol <- bitr(rownames(dat$raw),fromType="ENSEMBL",toType="SYMBOL",OrgDb="org.Hs.eg.db")
+GeneSymbol <- GeneSymbol[!duplicated(GeneSymbol$SYMBOL),]
+GeneSymbol <- GeneSymbol[!duplicated(GeneSymbol$ENSEMBL),]
+
+metadat <- metadat[metadat$monocyte=="monocyte",]
+dat <- lapply(dat,function(x) x[GeneSymbol$ENSEMBL,rownames(metadat)] )
+
+rownames(dat$raw) <- GeneSymbol$SYMBOL
+rownames(dat$ALRA) <- GeneSymbol$SYMBOL
+rownames(dat$AutoClass) <- GeneSymbol$SYMBOL
+rownames(dat$DCA) <- GeneSymbol$SYMBOL
+rownames(dat$kNN_smoothing) <- GeneSymbol$SYMBOL
+rownames(dat$MAGIC) <- GeneSymbol$SYMBOL
+rownames(dat$MAGIC_log) <- GeneSymbol$SYMBOL
+rownames(dat$scRMD) <- GeneSymbol$SYMBOL
+rownames(dat$afMF) <- GeneSymbol$SYMBOL
+```
+
+interferon genes
+```{r}
+GeneAnnoH <- fgsea::gmtPathways("GeneAnnotation/h.all.v2023.1.Hs.symbols.gmt")
+GeneAnnoGO <- fgsea::gmtPathways("GeneAnnotation/c5.go.v2023.1.Hs.symbols.gmt")
+
+IFN_H <- names(GeneAnnoH)[grep("INTERFERON",names(GeneAnnoH))] #2
+IFN_GO <- names(GeneAnnoGO)[grep("INTERFERON",names(GeneAnnoGO))] #31
+
+IFN_GO_Genes <- c()
+for(x in c(IFN_GO)){
+    IFN_GO_Genes <- c(IFN_GO_Genes,GeneAnnoGO[[x]])
+}
+IFN_GO_Genes <- unique(IFN_GO_Genes)
+
+IFN_H_Genes <- c()
+for(x in c(IFN_H)){
+    IFN_H_Genes <- c(IFN_H_Genes,GeneAnnoH[[x]])
+}
+IFN_H_Genes <- unique(IFN_H_Genes)
+
+AllIFNGenes <- unique(c(IFN_GO_Genes,IFN_H_Genes))
+AllIFNGenes <- AllIFNGenes[AllIFNGenes%in%rownames(dat$raw)]
+
+GeneAnnoHIFN <- GeneAnnoH[IFN_H]
+GeneAnnoGOIFN <- GeneAnnoGO[IFN_GO]
+
+NormalCells <- rownames(metadat[metadat$status=="normal",])
+COVIDCells <- rownames(metadat[metadat$status=="COVID19",])
+```
+
+## analysis (activated)
+### run hallmark genesets
+```{r}
+res <- lapply(dat,getAUCell,GeneAnnoHIFN)
+```
+
+eval
+```{r}
+tmpres1 <- as.data.frame(lapply(res,evalAUCellIFN,1))
+tmpres1 <- as.data.frame(t(tmpres1))
+colnames(tmpres1) <- c("Normal","COVID19")
+tmpres1$methods <- rownames(tmpres1)
+
+tmpres2 <- as.data.frame(lapply(res,evalAUCellIFN,2))
+tmpres2 <- as.data.frame(t(tmpres2))
+colnames(tmpres2) <- c("Normal","COVID19")
+tmpres2$methods <- rownames(tmpres2)
+
+tmpres <- cbind(tmpres1,tmpres2)
+tmpres
+
+tmpres_m <- as.data.frame(lapply(res,evalAUCellIFNmedian))
+tmpres_m <- as.data.frame(t(tmpres_m))
+colnames(tmpres_m) <- c("Normal","COVID19")
+tmpres_m$methods <- rownames(tmpres_m)
+tmpres_m
+```
+
+barplot(two pathways)
+```{r fig.height=4}
+res_melt <- data.table::melt(tmpres1,id.vars=c("methods"),variable.name="Status",value.name="Activated_Pct")
+res_melt <- res_melt[res_melt$methods!="New",]
+res_melt$Method <- factor(res_melt$methods,levels=c("raw",names(dat)[-1][order(names(dat)[-1])]))
+tmp_bar <- res_melt[,]
+aucell_HM1_bp <- ggbarplot(tmp_bar,x="Status",y="Activated_Pct",fill="Method",position=position_dodge(0.9),xlab="Status",ylab="Pct of IFN activated,%",palette=selected_palette2)+ggtitle("Percentage of Monocytes with Hallmark IFN ALPHA Response Activated")+theme(plot.title=element_text(size=16),legend.title=element_text(size=14),legend.text=element_text(size=13),axis.title=element_text(size=18),axis.text=element_text(size=16))
+
+res_melt <- data.table::melt(tmpres2,id.vars=c("methods"),variable.name="Status",value.name="Activated_Pct")
+res_melt <- res_melt[res_melt$methods!="New",]
+res_melt$Method <- factor(res_melt$methods,levels=c("raw",names(dat)[-1][order(names(dat)[-1])]))
+tmp_bar <- res_melt[,]
+aucell_HM2_bp <- ggbarplot(tmp_bar,x="Status",y="Activated_Pct",fill="Method",position=position_dodge(0.9),xlab="Status",ylab="Pct of IFN activated,%",palette=selected_palette2)+ggtitle("Percentage of Monocytes with Hallmark IFN GAMMA Response Activated")+theme(plot.title=element_text(size=16),legend.title=element_text(size=14),legend.text=element_text(size=13),axis.title=element_text(size=18),axis.text=element_text(size=16))
+
+ggarrange(aucell_HM1_bp,aucell_HM2_bp,nrow=2,labels="AUTO")
+```
+
+UMAP plot
+```{r fig.height=6, fig.width=7}
+p1 <- getUMAPPlot("raw",metadat)
+p1$p1 <- p1$p1+scale_color_manual(values=c("darkorange","dodgerblue"))
+p1$p2 <- p1$p2+scale_color_manual(values=c("darkorange","dodgerblue"))
+p2 <- getUMAPPlot("afMF",metadat)
+p2$p1 <- p2$p1+scale_color_manual(values=c("darkorange","dodgerblue"))
+p2$p2 <- p2$p2+scale_color_manual(values=c("darkorange","dodgerblue"))
+#p3 <- getUMAPPlot("ALRA",metadat)
+p4 <- getUMAPPlot("AutoClass",metadat)
+p4$p1 <- p4$p1+scale_color_manual(values=c("darkorange","dodgerblue"))
+p4$p2 <- p4$p2+scale_color_manual(values=c("darkorange","dodgerblue"))
+
+aucell_HM_umap <- ggarrange(plotlist=c(p1,p2,p4),ncol=2,nrow=3)
+aucell_HM_umap
+```
+
+### run GO genesets
+```{r message=FALSE, warning=FALSE}
+res <- lapply(dat,getAUCell,GeneAnnoGOIFN)
+```
+
+eval
+```{r}
+tmpres_m <- as.data.frame(lapply(res,evalAUCellIFNmedian))
+tmpres_m <- as.data.frame(t(tmpres_m))
+colnames(tmpres_m) <- c("Normal","COVID19")
+tmpres_m$methods <- rownames(tmpres_m)
+tmpres_m
+```
+
+barplot(median)
+```{r}
+res_melt <- data.table::melt(tmpres_m,id.vars=c("methods"),variable.name="Status",value.name="Activated_Pct")
+head(res_melt)
+res_melt <- res_melt[res_melt$methods!="New",]
+res_melt$Method <- factor(res_melt$methods,levels=c("raw",names(dat)[-1][order(names(dat)[-1])]))
+
+tmp_bar <- res_melt[,]
+aucell_GO_bp <- ggbarplot(tmp_bar,x="Status",y="Activated_Pct",fill="Method",position=position_dodge(0.9),xlab="Status",ylab="Pct of IFN activated,%",palette=selected_palette2)+ggtitle("Percentage of Monocytes with GO IFN Pathways Activated(Median)")+theme(plot.title=element_text(size=16),legend.title=element_text(size=14),legend.text=element_text(size=13),axis.title=element_text(size=18),axis.text=element_text(size=16))
+aucell_GO_bp
+```
+
+# SCENIC analysis
+read data
+```{r}
+regulon_raw <- read.csv("test_SCENIC/ImputeEvaluation/results/GSE115978raw_CellTypeRegulonZ.csv",header=TRUE,stringsAsFactors=FALSE)
+regulon_raw[regulon_raw$cell_type=="?",]$cell_type <- "unknown"
+regulon_raw$term <- paste0(regulon_raw$cell_type,"_",regulon_raw$regulon)
+rownames(regulon_raw) <- regulon_raw$term
+regulon_raw$method_cell_type <- paste0("Raw_",regulon_raw$cell_type)
+
+regulon_alra <- read.csv("test_SCENIC/ImputeEvaluation/results/GSE115978alra_CellTypeRegulonZ.csv",header=TRUE,stringsAsFactors=FALSE)
+regulon_alra[regulon_alra$cell_type=="?",]$cell_type <- "unknown"
+regulon_alra$term <- paste0(regulon_alra$cell_type,"_",regulon_alra$regulon)
+rownames(regulon_alra) <- regulon_alra$term
+regulon_alra$method_cell_type <- paste0("ALRA_",regulon_alra$cell_type)
+
+regulon_magiclog <- read.csv("test_SCENIC/ImputeEvaluation/results/GSE115978magiclog_CellTypeRegulonZ.csv",header=TRUE,stringsAsFactors=FALSE)
+regulon_magiclog[regulon_magiclog$cell_type=="?",]$cell_type <- "unknown"
+regulon_magiclog$term <- paste0(regulon_magiclog$cell_type,"_",regulon_magiclog$regulon)
+rownames(regulon_magiclog) <- regulon_magiclog$term
+regulon_magiclog$method_cell_type <- paste0("MAGICLog_",regulon_magiclog$cell_type)
+
+regulon_magic <- read.csv("test_SCENIC/ImputeEvaluation/results/GSE115978magic_CellTypeRegulonZ.csv",header=TRUE,stringsAsFactors=FALSE)
+regulon_magic[regulon_magic$cell_type=="?",]$cell_type <- "unknown"
+regulon_magic$term <- paste0(regulon_magic$cell_type,"_",regulon_magic$regulon)
+rownames(regulon_magic) <- regulon_magic$term
+regulon_magic$method_cell_type <- paste0("MAGIC_",regulon_magic$cell_type)
+
+regulon_AC <- read.csv("test_SCENIC/ImputeEvaluation/results/GSE115978AutoClass_CellTypeRegulonZ.csv",header=TRUE,stringsAsFactors=FALSE)
+regulon_AC[regulon_AC$cell_type=="?",]$cell_type <- "unknown"
+regulon_AC$term <- paste0(regulon_AC$cell_type,"_",regulon_AC$regulon)
+rownames(regulon_AC) <- regulon_AC$term
+regulon_AC$method_cell_type <- paste0("AutoClass_",regulon_AC$cell_type)
+
+regulon_afMF <- read.csv("test_SCENIC/ImputeEvaluation/results/GSE115978afMF_CellTypeRegulonZ.csv",header=TRUE,stringsAsFactors=FALSE)
+regulon_afMF[regulon_afMF$cell_type=="?",]$cell_type <- "unknown"
+regulon_afMF$term <- paste0(regulon_afMF$cell_type,"_",regulon_afMF$regulon)
+rownames(regulon_afMF) <- regulon_afMF$term
+regulon_afMF$method_cell_type <- paste0("afMF_",regulon_afMF$cell_type)
+
+regulon_scRMD <- read.csv("test_SCENIC/ImputeEvaluation/results/GSE115978scRMD_CellTypeRegulonZ.csv",header=TRUE,stringsAsFactors=FALSE)
+regulon_scRMD[regulon_scRMD$cell_type=="?",]$cell_type <- "unknown"
+regulon_scRMD$term <- paste0(regulon_scRMD$cell_type,"_",regulon_scRMD$regulon)
+rownames(regulon_scRMD) <- regulon_scRMD$term
+regulon_scRMD$method_cell_type <- paste0("scRMD_",regulon_scRMD$cell_type)
+```
+
+## bubble plot/heatmap
+z>=3 all
+```{r fig.height=4.5,fig.width=9}
+#z>=3
+tmp <- rbind(regulon_raw,regulon_afMF,regulon_alra,regulon_AC,regulon_magic,regulon_magiclog,regulon_scRMD)
+tmp <- tmp[tmp$term%in%unique(c(regulon3raw,regulon3afMF,regulon3alra,regulon3AC,regulon3magic,regulon3magiclog,regulon3scRMD)),]
+tmp$method_cell_type <- factor(tmp$method_cell_type,levels=unique(tmp$method_cell_type))
+tmp$regulon <- factor(tmp$regulon,levels=unique(tmp$regulon))
+# ggballoonplot(tmp,x="regulon",y="method_cell_type",size="Z",fill="Z",ggtheme=theme_bw(),size.range=c(3,7))+scale_fill_gradient2(low="blue",mid="white",high="red",midpoint=0)+guides(size=guide_legend("Z-value"))+ggtitle("Regulon Activity")+
+#     #geom_vline(xintercept=c(5.5,10.5,15.5,20.5))+
+#     geom_hline(yintercept=c(4.5,8.5,12.5,16.5,20.5,24.5))+
+#     #scale_size_continuous(labels=c(">0.05","<0.05","<0.005"),range=c(3,5),breaks=c(-3,-2,-1))+
+#     theme(axis.text.x=element_text(angle=90))
+
+scenic_reg3Z_hm <- ggplot(tmp,aes(x=regulon,y=method_cell_type,fill=Z))+geom_tile()+scale_fill_gradient2(low="blue",mid="white",high="red",midpoint=0)+guides(size=guide_legend("Z-value"))+ggtitle("Regulon activities across different cell types")+geom_hline(yintercept=c(4.5,8.5,12.5,16.5,20.5,24.5))+theme(axis.text.x=element_text(angle=90))
+scenic_reg3Z_hm
+```
+
+z>=3 separate
+```{r fig.height=2.5, fig.width=5}
+#z>=3
+getRegulonHeatmap <- function(dat,regulon,yintcp=c(4.5)){
+    tmp <- rbind(regulon_raw,dat)
+    tmp <- tmp[tmp$term%in%unique(c(regulon3raw,regulon)),]
+    tmp$method_cell_type <- factor(tmp$method_cell_type,levels=unique(tmp$method_cell_type))
+    tmp$regulon <- factor(tmp$regulon,levels=unique(tmp$regulon))
+    ggplot(tmp,aes(x=regulon,y=method_cell_type,fill=Z))+geom_tile()+scale_fill_gradient2(low="blue",mid="white",high="red",midpoint=0)+guides(size=guide_legend("Z-value"))+ggtitle("Regulon activities across different cell types")+geom_hline(yintercept=yintcp)+theme(axis.text.x=element_text(angle=90))
+}
+
+#p1 <- getRegulonHeatmap(regulon_alra,regulon3alra)
+#p2 <- getRegulonHeatmap(regulon_magic,regulon3magic)
+#p3 <- getRegulonHeatmap(regulon_magiclog,regulon3magiclog,yintcp=c(3.5))
+#p4 <- getRegulonHeatmap(regulon_AC,regulon3AC,yintcp=c(3.5))
+scenic_reg3ZafMF_hm <- getRegulonHeatmap(regulon_afMF,regulon3afMF)+theme(plot.title=element_text(size=16),legend.title=element_text(size=14),legend.text=element_text(size=13),axis.title=element_text(size=18),axis.text=element_text(size=14))
+scenic_reg3ZafMF_hm
+#p6 <- getRegulonHeatmap(regulon_scRMD,regulon3scRMD,yintcp=c(3.5))
+
+
+#ggarrange(p1,p2,p3,p4,p5,p6,ncol=2,nrow=3,labels="AUTO")
+```
+
+z>=3 all cell types
+```{r fig.height=4, fig.width=10}
+#z>=3
+regulons3all <- unique(c(regulon_raw[regulon_raw$Z>=3,]$regulon,regulon_alra[regulon_alra$Z>=3,]$regulon,regulon_magiclog[regulon_magiclog$Z>=3,]$regulon,regulon_magic[regulon_magic$Z>=3,]$regulon,regulon_AC[regulon_AC$Z>=3,]$regulon,regulon_New[regulon_New$Z>=3,]$regulon,regulon_scRMD[regulon_scRMD$Z>=3,]$regulon))
+tmp <- rbind(regulon_raw,regulon_alra,regulon_magiclog,regulon_magic,regulon_AC,regulon_New,regulon_scRMD)
+tmp <- tmp[tmp$regulon%in%regulons3all,]
+tmp$method_cell_type <- factor(tmp$method_cell_type,levels=unique(tmp$method_cell_type))
+tmp$regulon <- factor(tmp$regulon,levels=unique(tmp$regulon))
+# ggballoonplot(tmp,x="regulon",y="method_cell_type",size="Z",fill="Z",ggtheme=theme_bw(),size.range=c(3,7))+scale_fill_gradient2(low="blue",mid="white",high="red",midpoint=0)+guides(size=guide_legend("Z-value"))+ggtitle("Regulon Activity")+
+#     #geom_vline(xintercept=c(5.5,10.5,15.5,20.5))+
+#     geom_hline(yintercept=c(10.5,20.5,30.5,40.5,50.5,60.5))+
+#     #scale_size_continuous(labels=c(">0.05","<0.05","<0.005"),range=c(3,5),breaks=c(-3,-2,-1))+
+#     theme(axis.text.x=element_text(angle=90))
+
+ggplot(tmp,aes(x=regulon,y=method_cell_type,fill=Z))+geom_tile()+scale_fill_gradient2(low="blue",mid="white",high="red",midpoint=0)+guides(size=guide_legend("Z-value"))+ggtitle("Regulon Activity")+geom_hline(yintercept=c(10.5,20.5,30.5,40.5,50.5,60.5))+theme(axis.text.x=element_text(angle=90))
+```
+
+
+## AUCell part(binarize)
+```{r message=FALSE, warning=FALSE}
+metadat <- read.csv("test_SCENIC/ImputeEvaluation/GSE115978_cell.annotations.csv",header=TRUE,stringsAsFactors=FALSE)
+metadat[metadat$cell.types=="?",]$cell.types <- "unknown"
+metadat[metadat$cell.types=="Mal",]$cell.types <- "Malignant Cell"
+metadat[metadat$cell.types=="Endo.",]$cell.types <- "Endothelial Cell"
+metadat[metadat$cell.types=="T.CD4",]$cell.types <- "Thelper Cell"
+metadat[metadat$cell.types=="CAF",]$cell.types <- "Fibroblast"
+metadat[metadat$cell.types=="T.CD8",]$cell.types <- "Tcytotoxic Cell"
+metadat[metadat$cell.types=="T.cell",]$cell.types <- "T Cell"
+metadat[metadat$cell.types=="NK",]$cell.types <- "NK Cell"
+metadat[metadat$cell.types=="B.cell",]$cell.types <- "B Cell"
+
+##raw
+raw_dat <- fread("test_SCENIC/ImputeEvaluation/SCENIC_GSE115978_rawlognorm.txt",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+raw_dat <- as.matrix(raw_dat,rownames=1)
+##imputed
+alra_dat <- fread("alra/SCENIC_GSE115978_genebycell_alra.txt",sep="\t",stringsAsFactors=FALSE)
+alra_dat <- as.matrix(alra_dat,rownames=1)
+magiclog_dat <- fread("MAGIC_log/SCENIC_GSE115978_genebycell.tsv",sep="\t",stringsAsFactors=FALSE)
+magiclog_dat <- as.matrix(magiclog_dat,rownames=1)
+magic_dat <- fread("MAGIC/SCENIC_GSE115978_genebycell.tsv",sep="\t",stringsAsFactors=FALSE)
+magic_dat <- as.matrix(magic_dat,rownames=1)
+AC_dat <- fread("AutoClass/SCENIC_GSE115978_genebycell_AC.txt",sep="\t",stringsAsFactors=FALSE)
+AC_dat <- as.matrix(AC_dat,rownames=1)
+afMF_dat <- fread("afMF/imputed_data/SCENIC_GSE115978_sigma3_0_convergence_True.txt",sep="\t",stringsAsFactors=FALSE)
+afMF_dat <- as.matrix(afMF_dat,rownames=1)
+scRMD_dat <- fread("scRMD/SCENIC_GSE115978_genebycell_scRMDlognorm.txt",sep="\t",stringsAsFactors=FALSE)
+scRMD_dat <- as.matrix(scRMD_dat,rownames=1)
+```
+
+combine normalized data
+```{r}
+dat <- list(raw=raw_dat,afMF=afMF_dat,ALRA=alra_dat,AutoClass=AC_dat,MAGIC=magic_dat,MAGIClog=magiclog_dat,scRMD=scRMD_dat)
+rm(raw_dat)
+rm(alra_dat)
+rm(magiclog_dat)
+rm(magic_dat)
+rm(AC_dat)
+rm(afMF_dat)
+rm(scRMD_dat)
+```
+
+### read binary AUCell data(from python)
+```{r}
+##raw
+raw_dat <- fread("test_SCENIC/ImputeEvaluation/results/GSE115978raw.bin.csv",sep=",",stringsAsFactors=FALSE)
+raw_dat <- as.matrix(raw_dat,rownames=1)
+##imputed
+alra_dat <- fread("test_SCENIC/ImputeEvaluation/results/GSE115978alra.bin.csv",sep=",",stringsAsFactors=FALSE)
+alra_dat <- as.matrix(alra_dat,rownames=1)
+magiclog_dat <- fread("test_SCENIC/ImputeEvaluation/results/GSE115978magiclog.bin.csv",sep=",",stringsAsFactors=FALSE)
+magiclog_dat <- as.matrix(magiclog_dat,rownames=1)
+magic_dat <- fread("test_SCENIC/ImputeEvaluation/results/GSE115978magic.bin.csv",sep=",",stringsAsFactors=FALSE)
+magic_dat <- as.matrix(magic_dat,rownames=1)
+AC_dat <- fread("test_SCENIC/ImputeEvaluation/results/GSE115978AutoClass.bin.csv",sep=",",stringsAsFactors=FALSE)
+AC_dat <- as.matrix(AC_dat,rownames=1)
+afMF_dat <- fread("test_SCENIC/ImputeEvaluation/results/GSE115978afMF.bin.csv",sep=",",stringsAsFactors=FALSE)
+afMF_dat <- as.matrix(afMF_dat,rownames=1)
+scRMD_dat <- fread("test_SCENIC/ImputeEvaluation/results/GSE115978scRMD.bin.csv",sep=",",stringsAsFactors=FALSE)
+scRMD_dat <- as.matrix(scRMD_dat,rownames=1)
+
+res_aucell <- list(raw=raw_dat,afMF=afMF_dat,ALRA=alra_dat,AutoClass=AC_dat,MAGIC=magic_dat,MAGIClog=magiclog_dat,scRMD=scRMD_dat)
+res_aucell <- lapply(res_aucell,function(x) as.data.frame(x) )
+rm(raw_dat)
+rm(alra_dat)
+rm(magiclog_dat)
+rm(magic_dat)
+rm(AC_dat)
+rm(afMF_dat)
+rm(scRMD_dat)
+```
+
+function
+```{r}
+evalAUCellRegulons <- function(x,scol,celltypes){
+    CTCells <- metadat[metadat$cell.types%in%celltypes,]$labels
+    NCTCells <- metadat[!metadat$cell.types%in%celltypes,]$labels
+    CTPct <- sum(rownames(x[x[,scol]==1,])%in%CTCells)/length(CTCells)
+    NCTPct <- sum(rownames(x[x[,scol]==1,])%in%NCTCells)/length(NCTCells)
+    res <- c(CTPct,NCTPct)
+    return(res)
+}
+```
+
+eval
+```{r}
+tmpres1 <- as.data.frame(lapply(res_aucell,evalAUCellRegulons,"TCF7",c("Thelper Cell")))
+rownames(tmpres1) <- c("TrueCT_TCF7","OtherCT_TCF7")
+tmpres2 <- as.data.frame(lapply(res_aucell,evalAUCellRegulons,"EOMES",c("Tcytotoxic Cell")))
+rownames(tmpres2) <- c("TrueCT_EOMES","OtherCT_EOMES")
+tmpres3 <- as.data.frame(lapply(res_aucell,evalAUCellRegulons,"TBX21",c("Tcytotoxic Cell","Thelper Cell")))
+rownames(tmpres3) <- c("TrueCT_TBX21","OtherCT_TBX21")
+tmpres4 <- as.data.frame(lapply(res_aucell,evalAUCellRegulons,"MITF",c("Malignant Cell","Macrophage")))
+rownames(tmpres4) <- c("TrueCT_MITF","OtherCT_MITF")
+tmpres5 <- as.data.frame(lapply(res_aucell,evalAUCellRegulons,"MYC",c("Malignant Cell")))
+rownames(tmpres5) <- c("TrueCT_MYC","OtherCT_MYC")
+tmpres6 <- as.data.frame(lapply(res_aucell,evalAUCellRegulons,"MAFB",c("Macrophage")))
+rownames(tmpres6) <- c("TrueCT_MAFB","OtherCT_MAFB")
+tmpres7 <- as.data.frame(lapply(res_aucell,evalAUCellRegulons,"PAX5",c("B Cell")))
+rownames(tmpres7) <- c("TrueCT_PAX5","OtherCT_PAX5")
+
+tmpres <- rbind(tmpres1,tmpres2,tmpres3,tmpres4,tmpres5,tmpres6,tmpres7)
+tmpres
+```
+
+boxplot
+process data
+```{r}
+md_raw_true <- median(tmpres$raw[seq(1,13,2)])
+md_raw_other <- median(tmpres$raw[seq(2,14,2)])
+
+tmpres_diff <- as.data.frame(apply(tmpres[,-1],2,function(x) x-tmpres[,1] ))
+tmpres_diff$Cell_Type <- rep(c("Expected Cell Type","Other Cell Types"))
+tmpres_diff$Regulon <- rep(c("TCF7","EOMES","TBX21","MITF","MYC","MAFB","PAX5"),each=2)
+tmpres_diff_melt <- data.table::melt(tmpres_diff,id.vars=c("Cell_Type","Regulon"))
+
+#rank by cor coefficient diff
+mdv <- tmpres_diff_melt[tmpres_diff_melt$Cell_Type=="Expected Cell Type",] %>% group_by(variable) %>% summarise(md=median(value))
+rank1 <- mdv[order(mdv$md),]$variable
+tmpres_diff_melt$Method <- factor(tmpres_diff_melt$variable,levels=colnames(tmpres_diff)[1:6])
+tmpres_diff_melt$variable <- factor(tmpres_diff_melt$variable,levels=rank1)
+neg_md <- sum(mdv$md<=0)
+```
+
+plot
+```{r}
+tmp_labels <- paste0("Raw","\n","ECT median=",round(md_raw_true,2),"\n","OCT median=",round(md_raw_other,2))
+
+tmp_bp <- tmpres_diff_melt[,]
+#tmp_bp[tmp_bp$value>0.1,]$value <- 0.1
+#tmp_bp[tmp_bp$value<(-0.1),]$value <- -0.1
+scenic_7reg_bp <- ggboxplot(tmp_bp,x="variable",y="value",fill="Method",ylab="PCT difference,%",xlab="Method",title="Difference of percentage of cells with activated regulons",palette=selected_palette4,facet.by="Cell_Type")+theme(axis.text.x=element_text(angle=90))+geom_hline(yintercept=0,linetype="dashed")+annotate(geom="text",x=9,y=0.2,label=tmp_labels)+coord_cartesian(xlim=c(1,11))+NoLegend()+theme(plot.title=element_text(size=16),legend.title=element_text(size=14),legend.text=element_text(size=13),axis.title=element_text(size=18),axis.text=element_text(size=16))
+scenic_7reg_bp
+```
+
+# cellphoneDB analysis
+process data(don't run)
+```{r}
+dat <- readRDS("test_CellPhoneDB/Vento.rds")
+dat <- subset(dat,assay!="Smart-seq2")
+dat_d <- subset(x=dat,tissue=="decidua")
+dat_d <- subset(x=dat_d,downsample=10000)
+dat_p <- subset(x=dat,tissue=="placenta")
+dat_p <- subset(x=dat_p,downsample=10000)
+
+GeneSymbol <- as.character(dat@assays$RNA@meta.features$feature_name)
+ERCCGenes <- !grepl("^ERCC-",GeneSymbol)
+MTGenes <- !grepl("^MT-",GeneSymbol)
+
+#process decidua data
+dat_d <- as.SingleCellExperiment(dat_d)
+dat_d <- dat_d[ERCCGenes&MTGenes,]
+lowExprssedGenes <- apply(dat_d@assays@data$counts,1,function(x) 
+    sum(x>0))/ncol(dat_d@assays@data$counts)
+lowExprssedGenes <- lowExprssedGenes<0.01
+dat_d <- dat_d[!lowExprssedGenes,]
+
+dat_d2 <- as.matrix(dat_d@assays@data$counts)
+GeneSymbol <- bitr(rownames(dat_d2),fromType="ENSEMBL",toType="SYMBOL",OrgDb="org.Hs.eg.db")
+GeneSymbol <- GeneSymbol[!duplicated(GeneSymbol$ENSEMBL),]
+GeneSymbol <- GeneSymbol[!duplicated(GeneSymbol$SYMBOL),]
+dat_d2 <- dat_d2[GeneSymbol$ENSEMBL,]
+rownames(dat_d2) <- GeneSymbol$SYMBOL
+
+write.table(dat_d2,"test_CellPhoneDB/rawTXT/decidua_downsample10k_filteredGenes.txt",quote=FALSE,sep="\t",row.names=TRUE,col.names=TRUE)
+metadat_d <- as.data.frame(colData(dat_d))
+write.table(metadat_d,"test_CellPhoneDB/rawTXT/decidua_downsample10k_metadata.txt",quote=FALSE,sep="\t",row.names=TRUE,col.names=TRUE)
+
+#process placenta data
+dat_p <- as.SingleCellExperiment(dat_p)
+dat_p <- dat_p[ERCCGenes&MTGenes,]
+lowExprssedGenes <- apply(dat_p@assays@data$counts,1,function(x) 
+    sum(x>0))/ncol(dat_p@assays@data$counts)
+lowExprssedGenes <- lowExprssedGenes<0.01
+dat_p <- dat_p[!lowExprssedGenes,]
+
+dat_p2 <- as.matrix(dat_p@assays@data$counts)
+GeneSymbol <- bitr(rownames(dat_p2),fromType="ENSEMBL",toType="SYMBOL",OrgDb="org.Hs.eg.db")
+GeneSymbol <- GeneSymbol[!duplicated(GeneSymbol$ENSEMBL),]
+GeneSymbol <- GeneSymbol[!duplicated(GeneSymbol$SYMBOL),]
+dat_p2 <- dat_p2[GeneSymbol$ENSEMBL,]
+rownames(dat_p2) <- GeneSymbol$SYMBOL
+
+write.table(dat_p2,"test_CellPhoneDB/rawTXT/placenta_downsample10k_filteredGenes.txt",quote=FALSE,sep="\t",row.names=TRUE,col.names=TRUE)
+metadat_p <- as.data.frame(colData(dat_p))
+write.table(metadat_p,"test_CellPhoneDB/rawTXT/placenta_downsample10k_metadata.txt",quote=FALSE,sep="\t",row.names=TRUE,col.names=TRUE)
+
+#cutted columns metadat
+tmp1 <- fread("test_CellPhoneDB/rawTXT/decidua_downsample10k_metadata.txt",sep="\t",stringsAsFactors=FALSE)
+tmp1$barcode_sample <- tmp1$V1
+tmp1$cell_type <- tmp1$author_cell_type
+write.table(tmp1[,c("barcode_sample","cell_type")],"test_CellPhoneDB/rawTXT/decidua_downsample10k_metadata_cutted.txt",quote=FALSE,sep="\t",row.names=FALSE)
+
+tmp1 <- fread("test_CellPhoneDB/rawTXT/placenta_downsample10k_metadata.txt",sep="\t",stringsAsFactors=FALSE)
+tmp1$barcode_sample <- tmp1$V1
+tmp1$cell_type <- tmp1$author_cell_type
+write.table(tmp1[,c("barcode_sample","cell_type")],"test_CellPhoneDB/rawTXT/placenta_downsample10k_metadata_cutted.txt",quote=FALSE,sep="\t",row.names=FALSE)
+
+#log-normalized raw data and write-out
+tmp1 <- fread("test_CellPhoneDB/rawTXT/decidua_downsample10k_filteredGenes.txt",sep="\t",stringsAsFactors=FALSE,header=TRUE)
+tmp1 <- as.matrix(tmp1,rownames=1)
+tmp1 <- CreateSeuratObject(tmp1,min.cells=0,min.features=0)
+tmp1 <- NormalizeData(tmp1)
+tmp1 <- as.matrix(tmp1@assays$RNA@data)
+write.table(tmp1,"test_CellPhoneDB/rawTXT/decidua_downsample10k_filteredGenes_lognorm.txt",quote=FALSE,sep="\t")
+
+tmp1 <- fread("test_CellPhoneDB/rawTXT/placenta_downsample10k_filteredGenes.txt",sep="\t",stringsAsFactors=FALSE,header=TRUE)
+tmp1 <- as.matrix(tmp1,rownames=1)
+tmp1 <- CreateSeuratObject(tmp1,min.cells=0,min.features=0)
+tmp1 <- NormalizeData(tmp1)
+tmp1 <- as.matrix(tmp1@assays$RNA@data)
+write.table(tmp1,"test_CellPhoneDB/rawTXT/placenta_downsample10k_filteredGenes_lognorm.txt",quote=FALSE,sep="\t")
+```
+
+## evaluation:bubble plot
+read data
+```{r}
+#read means
+RawDatM <- fread("test_CellPhoneDB/imputed_res/rawLogNorm/decidua/statistical_analysis_means_08_14_2023_03:32:24.txt",header=TRUE,sep="\t",stringsAsFactors=FALSE)
+AlraDatM <- fread("test_CellPhoneDB/imputed_res/alra/decidua/statistical_analysis_means_08_14_2023_03:34:19.txt",header=TRUE,sep="\t",stringsAsFactors=FALSE)
+MagicDatM <- fread("test_CellPhoneDB/imputed_res/magic/decidua/statistical_analysis_means_08_14_2023_03:36:10.txt",header=TRUE,sep="\t",stringsAsFactors=FALSE)
+MagiclogDatM <- fread("test_CellPhoneDB/imputed_res/magic_log/decidua/statistical_analysis_means_08_14_2023_03:38:24.txt",header=TRUE,sep="\t",stringsAsFactors=FALSE)
+DcaDatM <- fread("test_CellPhoneDB/imputed_res/dca/decidua/statistical_analysis_means_08_14_2023_03:40:19.txt",header=TRUE,sep="\t",stringsAsFactors=FALSE)
+AutoClassDatM <- fread("test_CellPhoneDB/imputed_res/AutoClass/decidua/statistical_analysis_means_10_27_2023_04:47:49.txt",header=TRUE,sep="\t",stringsAsFactors=FALSE)
+afMFDatM <- fread("test_CellPhoneDB/imputed_res/afMF/decidua/statistical_analysis_means_02_02_2024_11:30:14.txt",header=TRUE,sep="\t",stringsAsFactors=FALSE)
+scRMDDatM <- fread("test_CellPhoneDB/imputed_res/scRMD/decidua/statistical_analysis_means_10_27_2023_05:20:57.txt",header=TRUE,sep="\t",stringsAsFactors=FALSE)
+
+#read p
+RawDatP <- fread("test_CellPhoneDB/imputed_res/rawLogNorm/decidua/statistical_analysis_pvalues_08_14_2023_03:32:24.txt",header=TRUE,sep="\t",stringsAsFactors=FALSE)
+AlraDatP <- fread("test_CellPhoneDB/imputed_res/alra/decidua/statistical_analysis_pvalues_08_14_2023_03:34:19.txt",header=TRUE,sep="\t",stringsAsFactors=FALSE)
+MagicDatP <- fread("test_CellPhoneDB/imputed_res/magic/decidua/statistical_analysis_pvalues_08_14_2023_03:36:10.txt",header=TRUE,sep="\t",stringsAsFactors=FALSE)
+MagiclogDatP <- fread("test_CellPhoneDB/imputed_res/magic_log/decidua/statistical_analysis_pvalues_08_14_2023_03:38:24.txt",header=TRUE,sep="\t",stringsAsFactors=FALSE)
+DcaDatP <- fread("test_CellPhoneDB/imputed_res/dca/decidua/statistical_analysis_pvalues_08_14_2023_03:40:19.txt",header=TRUE,sep="\t",stringsAsFactors=FALSE)
+AutoClassDatP <- fread("test_CellPhoneDB/imputed_res/AutoClass/decidua/statistical_analysis_pvalues_10_27_2023_04:47:49.txt",header=TRUE,sep="\t",stringsAsFactors=FALSE)
+afMFDatP <- fread("test_CellPhoneDB/imputed_res/afMF/decidua/statistical_analysis_pvalues_02_02_2024_11:30:14.txt",header=TRUE,sep="\t",stringsAsFactors=FALSE)
+scRMDDatP <- fread("test_CellPhoneDB/imputed_res/scRMD/decidua/statistical_analysis_pvalues_10_27_2023_05:20:57.txt",header=TRUE,sep="\t",stringsAsFactors=FALSE)
+
+#highlight celltype and interactions/genes
+query_cell_types_1 <- c('EVT', 'Endo', 'dS2', 'dM2', 'DC1')
+query_cell_types_2 <- c('dNK1', 'dNK2', 'dNK3','dM1','dM2','DC1','Tcells')
+#cell_type1 <- 'EVT|Endo|dS2|dM2|DC1'
+#cell_type2 <- 'dNK1|dNK2|dNK3|dM1|dM2|DC1|Tcells'
+
+query_interactions <- c('EFNA5_EPHB2','CSF1_CSF1R','CCL5_CCR1','SEMA4D_PLXNB1','NCAM1_FGFR1','CXCL12_CXCR4','VEGFB_FLT1','VEGFA_FLT1','VEGFA_KDR','AREG_EGFR','OSM_OSMR','HLA-G_LILRB1','CCL5_ACKR2','CCL3_ACKR2','CCL4_ACKR2','PVR_TIGIT','KLRB1_CLEC2D','ADORA2B_ENTPD1','ADORA3_ENTPD1','LGALS9_HAVCR2','ANXA1_FPR1','IL10_IL10_receptor')
+
+CellInteractions <- c('EVT|dNK1','dNK1|EVT','EVT|dNK2','dNK2|EVT','EVT|dNK3','dNK3|EVT','EVT|dM1','dM1|EVT','EVT|dM2','dM2|EVT','EVT|DC1','DC1|EVT','EVT|Tcells','Tcells|EVT','Endo|dNK1','dNK1|Endo','Endo|dNK2','dNK2|Endo','Endo|dNK3','dNK3|Endo','Endo|dM1','dM1|Endo','Endo|dM2','dM2|Endo','Endo|DC1','DC1|Endo','Endo|Tcells','Tcells|Endo','dS2|dNK1','dNK1|dS2','dS2|dNK2','dNK2|dS2','dS2|dNK3','dNK3|dS2','dS2|dM1','dM1|dS2','dS2|dM2','dM2|dS2','dS2|DC1','DC1|dS2','dS2|Tcells','Tcells|dS2','dM2|dNK1','dNK1|dM2','dM2|dNK2','dNK2|dM2','dM2|dNK3','dNK3|dM2','dM2|dM1','dM1|dM2','dM2|dM2','dM2|dM2','dM2|DC1','DC1|dM2','dM2|Tcells','Tcells|dM2','DC1|dNK1','dNK1|DC1','DC1|dNK2','dNK2|DC1','DC1|dNK3','dNK3|DC1','DC1|dM1','dM1|DC1','DC1|dM2','dM2|DC1','DC1|DC1','DC1|DC1','DC1|Tcells','Tcells|DC1')
+```
+
+subset
+```{r}
+selectedCol <- c(colnames(RawDatM)[2],CellInteractions)
+
+RawDatM <- as.data.frame(RawDatM)
+rownames(RawDatM) <- RawDatM$interacting_pair
+RawDatM_sub <- RawDatM[query_interactions,unique(selectedCol)]
+
+AlraDatM <- as.data.frame(AlraDatM)
+rownames(AlraDatM) <- AlraDatM$interacting_pair
+AlraDatM_sub <- AlraDatM[query_interactions,unique(selectedCol)]
+
+MagicDatM <- as.data.frame(MagicDatM)
+rownames(MagicDatM) <- MagicDatM$interacting_pair
+MagicDatM_sub <- MagicDatM[query_interactions,unique(selectedCol)]
+
+MagiclogDatM <- as.data.frame(MagiclogDatM)
+rownames(MagiclogDatM) <- MagiclogDatM$interacting_pair
+MagiclogDatM_sub <- MagiclogDatM[query_interactions,unique(selectedCol)]
+
+DcaDatM <- as.data.frame(DcaDatM)
+rownames(DcaDatM) <- DcaDatM$interacting_pair
+DcaDatM_sub <- DcaDatM[query_interactions,unique(selectedCol)]
+
+AutoClassDatM <- as.data.frame(AutoClassDatM)
+rownames(AutoClassDatM) <- AutoClassDatM$interacting_pair
+AutoClassDatM_sub <- AutoClassDatM[query_interactions,unique(selectedCol)]
+
+afMFDatM <- as.data.frame(afMFDatM)
+rownames(afMFDatM) <- afMFDatM$interacting_pair
+afMFDatM_sub <- afMFDatM[query_interactions,unique(selectedCol)]
+
+scRMDDatM <- as.data.frame(scRMDDatM)
+rownames(scRMDDatM) <- scRMDDatM$interacting_pair
+scRMDDatM_sub <- scRMDDatM[query_interactions,unique(selectedCol)]
+
+#p value
+RawDatP <- as.data.frame(RawDatP)
+rownames(RawDatP) <- RawDatP$interacting_pair
+RawDatP_sub <- RawDatP[query_interactions,unique(selectedCol)]
+
+AlraDatP <- as.data.frame(AlraDatP)
+rownames(AlraDatP) <- AlraDatP$interacting_pair
+AlraDatP_sub <- AlraDatP[query_interactions,unique(selectedCol)]
+
+MagicDatP <- as.data.frame(MagicDatP)
+rownames(MagicDatP) <- MagicDatP$interacting_pair
+MagicDatP_sub <- MagicDatP[query_interactions,unique(selectedCol)]
+
+MagiclogDatP <- as.data.frame(MagiclogDatP)
+rownames(MagiclogDatP) <- MagiclogDatP$interacting_pair
+MagiclogDatP_sub <- MagiclogDatP[query_interactions,unique(selectedCol)]
+
+DcaDatP <- as.data.frame(DcaDatP)
+rownames(DcaDatP) <- DcaDatP$interacting_pair
+DcaDatP_sub <- DcaDatP[query_interactions,unique(selectedCol)]
+
+AutoClassDatP <- as.data.frame(AutoClassDatP)
+rownames(AutoClassDatP) <- AutoClassDatP$interacting_pair
+AutoClassDatP_sub <- AutoClassDatP[query_interactions,unique(selectedCol)]
+
+afMFDatP <- as.data.frame(afMFDatP)
+rownames(afMFDatP) <- afMFDatP$interacting_pair
+afMFDatP_sub <- afMFDatP[query_interactions,unique(selectedCol)]
+
+scRMDDatP <- as.data.frame(scRMDDatP)
+rownames(scRMDDatP) <- scRMDDatP$interacting_pair
+scRMDDatP_sub <- scRMDDatP[query_interactions,unique(selectedCol)]
+```
+
+melt data
+```{r message=FALSE, warning=FALSE}
+RawDat <- data.table::melt(RawDatM_sub,id.vars="interacting_pair",variable.name="Cell",value.name="Mean")
+RawDat2 <- data.table::melt(RawDatP_sub,id.vars="interacting_pair",variable.name="Cell",value.name="P")
+RawDat$P <- RawDat2$P 
+rm(RawDat2)
+
+AlraDat <- data.table::melt(AlraDatM_sub,id.vars="interacting_pair",variable.name="Cell",value.name="Mean")
+AlraDat2 <- data.table::melt(AlraDatP_sub,id.vars="interacting_pair",variable.name="Cell",value.name="P")
+AlraDat$P <- AlraDat2$P 
+rm(AlraDat2)
+
+MagicDat <- data.table::melt(MagicDatM_sub,id.vars="interacting_pair",variable.name="Cell",value.name="Mean")
+MagicDat2 <- data.table::melt(MagicDatP_sub,id.vars="interacting_pair",variable.name="Cell",value.name="P")
+MagicDat$P <- MagicDat2$P 
+rm(MagicDat2)
+
+MagiclogDat <- data.table::melt(MagiclogDatM_sub,id.vars="interacting_pair",variable.name="Cell",value.name="Mean")
+MagiclogDat2 <- data.table::melt(MagiclogDatP_sub,id.vars="interacting_pair",variable.name="Cell",value.name="P")
+MagiclogDat$P <- MagiclogDat2$P 
+rm(MagiclogDat2)
+
+DcaDat <- data.table::melt(DcaDatM_sub,id.vars="interacting_pair",variable.name="Cell",value.name="Mean")
+DcaDat2 <- data.table::melt(DcaDatP_sub,id.vars="interacting_pair",variable.name="Cell",value.name="P")
+DcaDat$P <- DcaDat2$P 
+rm(DcaDat2)
+
+AutoClassDat <- data.table::melt(AutoClassDatM_sub,id.vars="interacting_pair",variable.name="Cell",value.name="Mean")
+AutoClassDat2 <- data.table::melt(AutoClassDatP_sub,id.vars="interacting_pair",variable.name="Cell",value.name="P")
+AutoClassDat$P <- AutoClassDat2$P 
+rm(AutoClassDat2)
+
+afMFDat <- data.table::melt(afMFDatM_sub,id.vars="interacting_pair",variable.name="Cell",value.name="Mean")
+afMFDat2 <- data.table::melt(afMFDatP_sub,id.vars="interacting_pair",variable.name="Cell",value.name="P")
+afMFDat$P <- afMFDat2$P 
+rm(afMFDat2)
+
+scRMDDat <- data.table::melt(scRMDDatM_sub,id.vars="interacting_pair",variable.name="Cell",value.name="Mean")
+scRMDDat2 <- data.table::melt(scRMDDatP_sub,id.vars="interacting_pair",variable.name="Cell",value.name="P")
+scRMDDat$P <- scRMDDat2$P 
+rm(scRMDDat2)
+```
+
+function
+```{r}
+pvalue_cutoff <- function(x){
+  res <- c()
+  for(v in x){
+    if(v>0.05 | is.na(v)){
+      res <- c(res,">0.05")
+    }else if(v<=0.05&v>0.005){
+      res <- c(res,"<0.05")
+    }else if(v<=0.005&v>0.0005){
+      res <- c(res,"<0.005")
+    }else if(v<=0.0005&v>0.00005){
+      res <- c(res,"<0.0005")
+    }else if(v<=0.00005){
+      res <- c(res,"<0.00005")
+    }
+  }
+  return(res)
+}
+
+pvalue_cutoff2 <- function(x){
+  res <- c()
+  for(v in x){
+    if(v>0.01 | is.na(v)){
+      res <- c(res,">0.01")
+    }else if(v<=0.01&v>0.001){
+      res <- c(res,"<0.01")
+    }else if(v<=0.001&v>0.0001){
+      res <- c(res,"<0.001")
+    }else if(v<=0.0001&v>0.00001){
+      res <- c(res,"<0.0001")
+    }else if(v<=0.00001){
+      res <- c(res,"<0.00001")
+    }
+  }
+  return(res)
+}
+
+pvalue_cutoff3 <- function(x){
+  res <- c()
+  for(v in x){
+    if(v>0.05 | is.na(v)){
+      res <- c(res,">0.05")
+    }else if(v<=0.05&v>0.01){
+      res <- c(res,"<0.05")
+    }else if(v<=0.01&v>0.001){
+      res <- c(res,"<0.01")    
+    }else if(v<=0.001&v>0.0001){
+      res <- c(res,"<0.001")
+    }else if(v<=0.0001&v>0.00001){
+      res <- c(res,"<0.0001")
+    }else if(v<=0.00001){
+      res <- c(res,"<0.00001")
+    }
+  }
+  return(res)
+}
+
+pvalue_cutoff4 <- function(x){
+  res <- c()
+  for(v in x){
+    if(v>0.05 | is.na(v)){
+      res <- c(res,">0.05")
+    }else if(v<=0.05&v>0.005){
+      res <- c(res,"<0.05")
+    }else if(v<=0.005){
+      res <- c(res,"<0.005")
+    }
+  }
+  return(res)
+}
+
+pvalue_cutoff5 <- function(x){
+  res <- c()
+  for(v in x){
+    if(v>0.01 | is.na(v)){
+      res <- c(res,">0.01")
+    }else if(v<=0.01&v>0.001){
+      res <- c(res,"<0.01")
+    }else if(v<=0.001){
+      res <- c(res,"<0.001")
+    }
+  }
+  return(res)
+}
+```
+
+calculate p adjusted and preprocess datasets
+```{r}
+RawDat$interacting_pair <- factor(RawDat$interacting_pair,levels=query_interactions)
+#datForBubble$effectSize <- datForBubble$effectSize*(-1)
+#datForBubble$effectSize <- ifelse(datForBubble$effectSize>=2.5,2.5,ifelse(datForBubble$effectSize<=-2.5,-2.5,datForBubble$effectSize))
+RawDat$`-log10(P)` <- -log10(RawDat$P)
+RawDat$P_value <- sapply(RawDat$P,pvalue_cutoff4)
+RawDat$pvalue_size <- as.numeric(as.factor(RawDat$P_value)) * -1
+
+RawDat$P_fdr <- p.adjust(RawDat$P,method="fdr")
+RawDat$P_adj <- sapply(RawDat$P_fdr,pvalue_cutoff4)
+RawDat$padj_size <- as.numeric(as.factor(RawDat$P_adj)) * -1
+
+#ALRA
+AlraDat$interacting_pair <- factor(AlraDat$interacting_pair,levels=query_interactions)
+AlraDat$`-log10(P)` <- -log10(AlraDat$P)
+AlraDat$P_value <- sapply(AlraDat$P,pvalue_cutoff4)
+AlraDat$pvalue_size <- as.numeric(as.factor(AlraDat$P_value)) * -1
+
+AlraDat$P_fdr <- p.adjust(AlraDat$P,method="fdr")
+AlraDat$P_adj <- sapply(AlraDat$P_fdr,pvalue_cutoff4)
+AlraDat$padj_size <- as.numeric(as.factor(AlraDat$P_adj)) * -1
+
+#MAGIC
+MagicDat$interacting_pair <- factor(MagicDat$interacting_pair,levels=query_interactions)
+MagicDat$`-log10(P)` <- -log10(MagicDat$P)
+MagicDat$P_value <- sapply(MagicDat$P,pvalue_cutoff4)
+MagicDat$pvalue_size <- as.numeric(as.factor(MagicDat$P_value)) * -1
+
+MagicDat$P_fdr <- p.adjust(MagicDat$P,method="fdr")
+MagicDat$P_adj <- sapply(MagicDat$P_fdr,pvalue_cutoff4)
+MagicDat$padj_size <- as.numeric(as.factor(MagicDat$P_adj)) * -1
+
+#MAGIClog
+MagiclogDat$interacting_pair <- factor(MagiclogDat$interacting_pair,levels=query_interactions)
+MagiclogDat$`-log10(P)` <- -log10(MagiclogDat$P)
+MagiclogDat$P_value <- sapply(MagiclogDat$P,pvalue_cutoff4)
+MagiclogDat$pvalue_size <- as.numeric(as.factor(MagiclogDat$P_value)) * -1
+
+MagiclogDat$P_fdr <- p.adjust(MagiclogDat$P,method="fdr")
+MagiclogDat$P_adj <- sapply(MagiclogDat$P_fdr,pvalue_cutoff4)
+MagiclogDat$padj_size <- as.numeric(as.factor(MagiclogDat$P_adj)) * -1
+
+#DCA
+DcaDat$interacting_pair <- factor(DcaDat$interacting_pair,levels=query_interactions)
+DcaDat$`-log10(P)` <- -log10(DcaDat$P)
+DcaDat$P_value <- sapply(DcaDat$P,pvalue_cutoff4)
+DcaDat$pvalue_size <- as.numeric(as.factor(DcaDat$P_value)) * -1
+
+DcaDat$P_fdr <- p.adjust(DcaDat$P,method="fdr")
+DcaDat$P_adj <- sapply(DcaDat$P_fdr,pvalue_cutoff4)
+DcaDat$padj_size <- as.numeric(as.factor(DcaDat$P_adj)) * -1
+
+#AutoClass
+AutoClassDat$interacting_pair <- factor(AutoClassDat$interacting_pair,levels=query_interactions)
+AutoClassDat$`-log10(P)` <- -log10(AutoClassDat$P)
+AutoClassDat$P_value <- sapply(AutoClassDat$P,pvalue_cutoff4)
+AutoClassDat$pvalue_size <- as.numeric(as.factor(AutoClassDat$P_value)) * -1
+
+AutoClassDat$P_fdr <- p.adjust(AutoClassDat$P,method="fdr")
+AutoClassDat$P_adj <- sapply(AutoClassDat$P_fdr,pvalue_cutoff4)
+AutoClassDat$padj_size <- as.numeric(as.factor(AutoClassDat$P_adj)) * -1
+
+#New
+afMFDat$interacting_pair <- factor(afMFDat$interacting_pair,levels=query_interactions)
+afMFDat$`-log10(P)` <- -log10(afMFDat$P)
+afMFDat$P_value <- sapply(afMFDat$P,pvalue_cutoff4)
+afMFDat$pvalue_size <- as.numeric(as.factor(afMFDat$P_value)) * -1
+
+afMFDat$P_fdr <- p.adjust(afMFDat$P,method="fdr")
+afMFDat$P_adj <- sapply(afMFDat$P_fdr,pvalue_cutoff4)
+afMFDat$padj_size <- as.numeric(as.factor(afMFDat$P_adj)) * -1
+
+#scRMD
+scRMDDat$interacting_pair <- factor(scRMDDat$interacting_pair,levels=query_interactions)
+scRMDDat$`-log10(P)` <- -log10(scRMDDat$P)
+scRMDDat$P_value <- sapply(scRMDDat$P,pvalue_cutoff4)
+scRMDDat$pvalue_size <- as.numeric(as.factor(scRMDDat$P_value)) * -1
+
+scRMDDat$P_fdr <- p.adjust(scRMDDat$P,method="fdr")
+scRMDDat$P_adj <- sapply(scRMDDat$P_fdr,pvalue_cutoff4)
+scRMDDat$padj_size <- as.numeric(as.factor(scRMDDat$P_adj)) * -1
+```
+
+
+plot(all)
+```{r fig.height=2.5, fig.width=5}
+tmp <- RawDat[grepl("\\|EVT",RawDat$Cell),]
+tmp$Cell <- factor(tmp$Cell)
+tmp1 <- RawDat[grepl("\\|Endo",RawDat$Cell),]
+tmp1$Cell <- factor(tmp1$Cell)
+tmp <- rbind(tmp,tmp1)
+tmp1 <- RawDat[grepl("\\|dS2",RawDat$Cell),]
+tmp1$Cell <- factor(tmp1$Cell)
+tmp <- rbind(tmp,tmp1)
+tmp1 <- RawDat[grepl("\\|dM2",RawDat$Cell),]
+tmp1$Cell <- factor(tmp1$Cell)
+tmp <- rbind(tmp,tmp1)
+tmp1 <- RawDat[grepl("\\|DC1",RawDat$Cell),]
+tmp1$Cell <- factor(tmp1$Cell)
+tmp <- rbind(tmp,tmp1)
+tmp_levels <- levels(tmp$Cell)
+
+tmp <- RawDat[grepl("\\|EVT|\\|Endo|\\|dS2|\\|dM2|\\|DC1",RawDat$Cell),]
+tmp$Cell <- factor(tmp$Cell,levels=tmp_levels)
+p1 <- ggballoonplot(tmp,x="Cell",y="interacting_pair",size="padj_size",fill="Mean",ggtheme=theme_bw(),size.range=c(5,7))+scale_fill_gradient2(low="blue",mid="white",high="red",midpoint=0)+guides(size=guide_legend("P-adj"))+ggtitle("Interactions(Raw)")+
+    geom_vline(xintercept=c(7.5,14.5,21.5,31.5))+
+    geom_hline(yintercept=c(6.5,9.5,11.5))+
+    scale_size_continuous(labels=c(">0.05","<0.05","<0.005"),range=c(1,5),breaks=c(-3,-2,-1))+
+    theme(axis.text.x=element_text(angle=90))
+
+tmp <- afMFDat[grepl("\\|EVT|\\|Endo|\\|dS2|\\|dM2|\\|DC1",afMFDat$Cell),]
+tmp$Cell <- factor(tmp$Cell,levels=tmp_levels)
+p2 <- ggballoonplot(tmp,x="Cell",y="interacting_pair",size="padj_size",fill="Mean",ggtheme=theme_bw(),size.range=c(5,7))+scale_fill_gradient2(low="blue",mid="white",high="red",midpoint=0)+guides(size=guide_legend("P-adj"))+ggtitle("Interactions(afMF)")+
+    geom_vline(xintercept=c(7.5,14.5,21.5,31.5))+
+    geom_hline(yintercept=c(6.5,9.5,11.5))+
+    scale_size_continuous(labels=c(">0.05","<0.05","<0.005"),range=c(1,5),breaks=c(-3,-2,-1))+
+    theme(axis.text.x=element_text(angle=90))
+
+tmp <- AlraDat[grepl("\\|EVT|\\|Endo|\\|dS2|\\|dM2|\\|DC1",AlraDat$Cell),]
+tmp$Cell <- factor(tmp$Cell,levels=tmp_levels)
+p3 <- ggballoonplot(tmp,x="Cell",y="interacting_pair",size="padj_size",fill="Mean",ggtheme=theme_bw(),size.range=c(5,7))+scale_fill_gradient2(low="blue",mid="white",high="red",midpoint=0)+guides(size=guide_legend("P-adj"))+ggtitle("Interactions(ALRA)")+
+    geom_vline(xintercept=c(7.5,14.5,21.5,31.5))+
+    geom_hline(yintercept=c(6.5,9.5,11.5))+
+    scale_size_continuous(labels=c(">0.05","<0.05","<0.005"),range=c(1,5),breaks=c(-3,-2,-1))+
+    theme(axis.text.x=element_text(angle=90))
+
+
+tmp <- AutoClassDat[grepl("\\|EVT|\\|Endo|\\|dS2|\\|dM2|\\|DC1",AutoClassDat$Cell),]
+tmp$Cell <- factor(tmp$Cell,levels=tmp_levels)
+p4 <- ggballoonplot(tmp,x="Cell",y="interacting_pair",size="padj_size",fill="Mean",ggtheme=theme_bw(),size.range=c(5,7))+scale_fill_gradient2(low="blue",mid="white",high="red",midpoint=0)+guides(size=guide_legend("P-adj"))+ggtitle("Interactions(AutoClass)")+
+    geom_vline(xintercept=c(7.5,14.5,21.5,31.5))+
+    geom_hline(yintercept=c(6.5,9.5,11.5))+
+    scale_size_continuous(labels=c(">0.05","<0.05","<0.005"),range=c(1,5),breaks=c(-3,-2,-1))+
+    theme(axis.text.x=element_text(angle=90))
+
+tmp <- DcaDat[grepl("\\|EVT|\\|Endo|\\|dS2|\\|dM2|\\|DC1",DcaDat$Cell),]
+tmp$Cell <- factor(tmp$Cell,levels=tmp_levels)
+p5 <- ggballoonplot(tmp,x="Cell",y="interacting_pair",size="padj_size",fill="Mean",ggtheme=theme_bw(),size.range=c(5,7))+scale_fill_gradient2(low="blue",mid="white",high="red",midpoint=0)+guides(size=guide_legend("P-adj"))+ggtitle("Interactions(DCA)")+
+    geom_vline(xintercept=c(7.5,14.5,21.5,31.5))+
+    geom_hline(yintercept=c(6.5,9.5,11.5))+
+    scale_size_continuous(labels=c(">0.05","<0.05","<0.005"),range=c(1,5),breaks=c(-3,-2,-1))+
+    theme(axis.text.x=element_text(angle=90))
+
+tmp <- MagicDat[grepl("\\|EVT|\\|Endo|\\|dS2|\\|dM2|\\|DC1",MagicDat$Cell),]
+tmp$Cell <- factor(tmp$Cell,levels=tmp_levels)
+p6 <- ggballoonplot(tmp,x="Cell",y="interacting_pair",size="padj_size",fill="Mean",ggtheme=theme_bw(),size.range=c(5,7))+scale_fill_gradient2(low="blue",mid="white",high="red",midpoint=0)+guides(size=guide_legend("P-adj"))+ggtitle("Interactions(MAGIC)")+
+    geom_vline(xintercept=c(7.5,14.5,21.5,31.5))+
+    geom_hline(yintercept=c(6.5,9.5,11.5))+
+    scale_size_continuous(labels=c(">0.05","<0.05","<0.005"),range=c(1,5),breaks=c(-3,-2,-1))+
+    theme(axis.text.x=element_text(angle=90))
+
+tmp <- MagiclogDat[grepl("\\|EVT|\\|Endo|\\|dS2|\\|dM2|\\|DC1",MagiclogDat$Cell),]
+tmp$Cell <- factor(tmp$Cell,levels=tmp_levels)
+p7 <- ggballoonplot(tmp,x="Cell",y="interacting_pair",size="padj_size",fill="Mean",ggtheme=theme_bw(),size.range=c(5,7))+scale_fill_gradient2(low="blue",mid="white",high="red",midpoint=0)+guides(size=guide_legend("P-adj"))+ggtitle("Interactions(MAGIClog)")+
+    geom_vline(xintercept=c(7.5,14.5,21.5,31.5))+
+    geom_hline(yintercept=c(6.5,9.5,11.5))+
+    scale_size_continuous(labels=c(">0.05","<0.05","<0.005"),range=c(1,5),breaks=c(-3,-2,-1))+
+    theme(axis.text.x=element_text(angle=90))
+
+tmp <- scRMDDat[grepl("\\|EVT|\\|Endo|\\|dS2|\\|dM2|\\|DC1",scRMDDat$Cell),]
+tmp$Cell <- factor(tmp$Cell,levels=tmp_levels)
+p8 <- ggballoonplot(tmp,x="Cell",y="interacting_pair",size="padj_size",fill="Mean",ggtheme=theme_bw(),size.range=c(5,7))+scale_fill_gradient2(low="blue",mid="white",high="red",midpoint=0)+guides(size=guide_legend("P-adj"))+ggtitle("Interactions(scRMD)")+
+    geom_vline(xintercept=c(7.5,14.5,21.5,31.5))+
+    geom_hline(yintercept=c(6.5,9.5,11.5))+
+    scale_size_continuous(labels=c(">0.05","<0.05","<0.005"),range=c(1,5),breaks=c(-3,-2,-1))+
+    theme(axis.text.x=element_text(angle=90))
+
+cpdb_int_hm <- ggarrange(p1,p2,p3,p4,p5,p6,p7,p8,nrow=4,ncol=2,labels="AUTO")
+```
+
+## number of significant interactions
+```{r}
+NumSig1 <- data.frame(fdr005=sum(RawDat$P_fdr<0.05),fdr001=sum(RawDat$P_fdr<0.05),fdr0005=sum(RawDat$P_fdr<0.005))
+NumSig2 <- data.frame(fdr005=sum(afMFDat$P_fdr<0.05),fdr001=sum(afMFDat$P_fdr<0.05),fdr0005=sum(afMFDat$P_fdr<0.005))
+NumSig3 <- data.frame(fdr005=sum(AlraDat$P_fdr<0.05),fdr001=sum(AlraDat$P_fdr<0.05),fdr0005=sum(AlraDat$P_fdr<0.005))
+NumSig4 <- data.frame(fdr005=sum(AutoClassDat$P_fdr<0.05),fdr001=sum(AutoClassDat$P_fdr<0.05),fdr0005=sum(AutoClassDat$P_fdr<0.005))
+NumSig5 <- data.frame(fdr005=sum(DcaDat$P_fdr<0.05),fdr001=sum(DcaDat$P_fdr<0.05),fdr0005=sum(DcaDat$P_fdr<0.005))
+NumSig6 <- data.frame(fdr005=sum(MagicDat$P_fdr<0.05),fdr001=sum(MagicDat$P_fdr<0.05),fdr0005=sum(MagicDat$P_fdr<0.005))
+NumSig7 <- data.frame(fdr005=sum(MagiclogDat$P_fdr<0.05),fdr001=sum(MagiclogDat$P_fdr<0.05),fdr0005=sum(MagiclogDat$P_fdr<0.005))
+NumSig8 <- data.frame(fdr005=sum(scRMDDat$P_fdr<0.05),fdr001=sum(scRMDDat$P_fdr<0.05),fdr0005=sum(scRMDDat$P_fdr<0.005))
+
+NumSig <- rbind(NumSig1,NumSig2,NumSig3,NumSig4,NumSig5,NumSig6,NumSig7,NumSig8)
+rownames(NumSig) <- c("Raw","afMF","ALRA","AutoClass","DCA","MAGIC","MAGIC_log","scRMD")
+NumSig
+```
+
+```{r}
+PCTSig1 <- data.frame(FDR0.05=sum(RawDat$P_fdr<0.05)/nrow(RawDat),FDR0.005=sum(RawDat$P_fdr<0.005)/nrow(RawDat))
+PCTSig2 <- data.frame(FDR0.05=sum(afMFDat$P_fdr<0.05)/nrow(RawDat),FDR0.005=sum(afMFDat$P_fdr<0.005)/nrow(RawDat))
+PCTSig3 <- data.frame(FDR0.05=sum(AlraDat$P_fdr<0.05)/nrow(RawDat),FDR0.005=sum(AlraDat$P_fdr<0.005)/nrow(RawDat))
+PCTSig4 <- data.frame(FDR0.05=sum(AutoClassDat$P_fdr<0.05)/nrow(RawDat),FDR0.005=sum(AutoClassDat$P_fdr<0.005)/nrow(RawDat))
+PCTSig5 <- data.frame(FDR0.05=sum(DcaDat$P_fdr<0.05)/nrow(RawDat),FDR0.005=sum(DcaDat$P_fdr<0.005)/nrow(RawDat))
+PCTSig6 <- data.frame(FDR0.05=sum(MagicDat$P_fdr<0.05)/nrow(RawDat),FDR0.005=sum(MagicDat$P_fdr<0.005)/nrow(RawDat))
+PCTSig7 <- data.frame(FDR0.05=sum(MagiclogDat$P_fdr<0.05)/nrow(RawDat),FDR0.005=sum(MagiclogDat$P_fdr<0.005)/nrow(RawDat))
+PCTSig8 <- data.frame(FDR0.05=sum(scRMDDat$P_fdr<0.05)/nrow(RawDat),FDR0.005=sum(scRMDDat$P_fdr<0.005)/nrow(RawDat))
+
+PCTSig <- rbind(PCTSig1,PCTSig2,PCTSig3,PCTSig4,PCTSig5,PCTSig6,PCTSig7,PCTSig8)
+rownames(PCTSig) <- c("Raw","afMF","ALRA","AutoClass","DCA","MAGIC","MAGIC_log","scRMD")
+PCTSig$methods <- rownames(PCTSig)
+PCTSig$methods <- factor(PCTSig$methods,levels=c("Raw","afMF","ALRA","AutoClass","DCA","MAGIC","MAGIC_log","scRMD"))
+PCTSig_melt <- data.table::melt(PCTSig,id.vars=c("methods"))
+colnames(PCTSig_melt)[2:3] <- c("Significant_levels","Pct")
+head(PCTSig_melt)
+```
+
+barplot
+```{r}
+cpdb_pctsig_bp <- ggbarplot(PCTSig_melt,x="Significant_levels",y="Pct",fill="methods",palette=selected_palette3,position=position_dodge(0.9),xlab="Method",ylab="Percentage,%")+ggtitle("Percentages of significant interactions under different significant levels")+theme(plot.title=element_text(size=16),legend.title=element_text(size=14),legend.text=element_text(size=13),axis.title=element_text(size=18),axis.text=element_text(size=16))
+cpdb_pctsig_bp
+```
+
+## overlaps with raw
+```{r}
+RawDat$pair_cell <- paste0(RawDat$interacting_pair,"-",RawDat$Cell)
+afMFDat$pair_cell <- paste0(afMFDat$interacting_pair,"-",afMFDat$Cell)
+AlraDat$pair_cell <- paste0(AlraDat$interacting_pair,"-",AlraDat$Cell)
+AutoClassDat$pair_cell <- paste0(AutoClassDat$interacting_pair,"-",AutoClassDat$Cell)
+DcaDat$pair_cell <- paste0(DcaDat$interacting_pair,"-",DcaDat$Cell)
+MagicDat$pair_cell <- paste0(MagicDat$interacting_pair,"-",MagicDat$Cell)
+MagiclogDat$pair_cell <- paste0(MagiclogDat$interacting_pair,"-",MagiclogDat$Cell)
+scRMDDat$pair_cell <- paste0(scRMDDat$interacting_pair,"-",scRMDDat$Cell)
+
+RawSigName <- RawDat[RawDat$P_fdr<0.05,]$pair_cell
+afMFSigName <- afMFDat[afMFDat$P_fdr<0.05,]$pair_cell
+AlraSigName <- AlraDat[AlraDat$P_fdr<0.05,]$pair_cell
+AutoClassSigName <- AutoClassDat[AutoClassDat$P_fdr<0.05,]$pair_cell
+DcaSigName <- DcaDat[DcaDat$P_fdr<0.05,]$pair_cell
+MagicSigName <- MagicDat[MagicDat$P_fdr<0.05,]$pair_cell
+MagiclogSigName <- MagiclogDat[MagiclogDat$P_fdr<0.05,]$pair_cell
+scRMDSigName <-scRMDDat[scRMDDat$P_fdr<0.05,]$pair_cell
+
+p1 <- ggvenn(list(Raw=RawSigName,afMF=afMFSigName))
+p2 <- ggvenn(list(Raw=RawSigName,ALRA=AlraSigName))
+p3 <- ggvenn(list(Raw=RawSigName,AutoClass=AutoClassSigName))
+p4 <- ggvenn(list(Raw=RawSigName,DCA=DcaSigName))
+p5 <- ggvenn(list(Raw=RawSigName,MAGIC=MagicSigName))
+p6 <- ggvenn(list(Raw=RawSigName,MAGIC_log=MagiclogSigName))
+p7 <- ggvenn(list(Raw=RawSigName,scRMD=scRMDSigName))
+
+cpdb_ovlp_vd <- ggarrange(p1,p2,p3,p4,p5,p6,p7,ncol=4,nrow=2)
+```
+
+# combine plots
+## main
+```{r fig.height=8.5, fig.width=12}
+p1 <- ggarrange(aucell_HM1_bp,aucell_HM2_bp,aucell_GO_bp,scenic_7reg_bp,nrow=4,ncol=1,labels=c("A","B","D","E"))
+p2 <- ggarrange(aucell_HM_umap,scenic_reg3ZafMF_hm,labels=c("C","F"),nrow=2,ncol=1,heights=c(3,1))
+ggarrange(p1,p2,ncol=2,nrow=1,widths=c(1.2,2))
+```
+
+## supp1
+```{r fig.height=4.5, fig.width=9}
+scenic_reg3Z_hm
+```
+
+## supp2
+```{r fig.width=6}
+scenic_reg3_vd
+```
+
+## supp3
+```{r fig.height=11, fig.width=11}
+cpdb_int_hm
+```
+
+## supp4
+```{r fig.height=5, fig.width=7.5}
+#p1 <- ggarrange(cpdb_impsig_bp,cpdb_pctsig_bp,ncol=2,nrow=1,labels="AUTO")
+p1 <- ggarrange(cpdb_pctsig_bp,ncol=1,nrow=1,labels="AUTO")
+p2 <- ggarrange(cpdb_ovlp_vd,labels=c("B"))
+ggarrange(p1,p2,nrow=2,ncol=1,heights=c(1.3,2))
+```
+
+

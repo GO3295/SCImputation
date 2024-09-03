@@ -1,0 +1,3490 @@
+---
+title: "Simulated Analysis"
+output: html_notebook
+---
+
+load library
+```{r message=FALSE, warning=FALSE}
+library(Seurat)
+library(ggplot2)
+library(SingleCellExperiment)
+library(scran)
+library(SeuratData)
+library(edgeR)
+library(limma)
+library(clusterProfiler)
+library(data.table)
+library(SingleCellExperiment)
+library(SummarizedExperiment)
+library(muscat)
+library(pROC)
+library(igraph)
+library(mclust)
+library(cluster)
+library(SCINA)
+library(caret)
+library(MAST)
+library(AUCell)
+library(HGNChelper)
+library(SeuratDisk)
+library(monocle3)
+library(ggpubr)
+library(slingshot)
+library(grDevices)
+library(RColorBrewer)
+library(randomForest)
+library(caTools)
+library(mltools)
+#library(stringr)
+library(reldist)
+library(aricode)
+library(TSCAN)
+library(reshape2)
+library(pheatmap)
+library(philentropy)
+library(rawr)
+library(splatter)
+library(MatrixCorrelation)
+library(dplyr,lib.loc="/share/pkg.7/r/4.2.1/install/lib64/R/library")
+library(scater)
+library(Hmisc)
+
+selected_palette <- c("aquamarine4","azure4","powderblue","burlywood","coral","cornflowerblue","cyan3","darkgoldenrod2","darkorange3","peachpuff","royalblue","khaki2","plum1","lightsalmon")
+selected_palette2 <- c("plum1","aquamarine4","azure4","powderblue","burlywood","coral","cornflowerblue","cyan3","darkgoldenrod2","darkorange3","peachpuff","royalblue","khaki2")
+```
+
+# Cell-cell similarity
+functions
+```{r}
+evalCellScc <- function(x,y){
+    tmp <- sapply(1:ncol(x), function(z) cor(x[,z],y[,z],method="spearman") )
+    tmp <- median(tmp)
+    return(tmp)
+}
+
+evalCellSccByCellTypes <- function(x,y,meta){
+    meta <- meta[colnames(x),]
+    tmp <- sapply(1:ncol(x), function(z) cor(x[,z],y[,z],method="spearman") )
+    tmp_res <- c()
+    for(ct in unique(meta[,"Group"])){
+        selectedCells <- which(meta[,"Group"]==ct)
+        tmp_res <- c(tmp_res,median(tmp[selectedCells]))
+    }
+    names(tmp_res) <- unique(meta[,"Group"])
+    return(tmp_res)
+}
+
+evalCellCluScc <- function(ds,celltype){
+    selectedCells <- metadat[metadat$Group==celltype,]$Cell
+    tmpTrue <- apply(true_datlog[,selectedCells],1,median)
+    tmp <- apply(ds[,selectedCells],2,function(x) cor(x,tmpTrue,method="spearman"))
+    return(tmp)
+}
+
+evalCellCluScc_Diff <- function(ds,celltype1,celltype2){
+    selectedCells1 <- metadat[metadat$Group==celltype1,]$Cell
+    selectedCells2 <- metadat[metadat$Group==celltype2,]$Cell
+    tmpTrue <- apply(true_datlog[,selectedCells2],1,median)
+    tmp <- apply(ds[,selectedCells1],2,function(x) cor(x,tmpTrue,method="spearman"))
+    return(tmp)
+}
+
+evalPBCluScc <- function(ds,celltype){
+    selectedCells <- metadat[metadat$Group==celltype,]$Cell
+    median_PB <- apply(ds[,selectedCells],1,median)
+    tmpTrue <- apply(true_datlog[,selectedCells],1,median)
+    tmp <- cor.test(median_PB,tmpTrue,method="spearman")
+    #tmp_p <- tmp$p.value
+    tmp_scc <- tmp$estimate
+    return(tmp_scc)
+}
+
+
+evalSCC_sc_true <- function(ds,celltype){
+    selectedCells <- metadat[metadat$Group==celltype,]$Cell
+    tmpTrue <- apply(true_datlog[,selectedCells],1,median)
+    
+    tmp_same <- apply(ds[,selectedCells],2,function(x) cor(x,tmpTrue,method="spearman"))
+    tmp_same[is.na(tmp_same)] <- 0
+    
+    #diff_status <- unique(metadat[metadat$Group!=celltype,"Group"])
+    NonCells <- metadat[metadat$Group!=celltype,]$Cell
+    tmpFalse <- apply(true_datlog[,NonCells],1,median)
+    tmp_diff <- apply(ds[,selectedCells],2,function(x) cor(x,tmpFalse,method="spearman"))
+    tmp_diff[is.na(tmp_diff)] <- 0
+    
+    tmp <- tmp_same-tmp_diff
+    return(tmp)
+}
+
+evalSCC_pb_true <- function(ds,celltype){
+    selectedCells <- metadat[metadat$Group==celltype,]$Cell
+    median_PB <- apply(ds[,selectedCells],1,median)
+    tmpTrue <- apply(true_datlog[,selectedCells],1,median)
+    
+    tmp_same <- cor(median_PB,tmpTrue,method="spearman")
+    tmp_same[is.na(tmp_same)] <- 0
+    
+    #diff_status <- unique(metadat[metadat[,col_name]!=status,col_name])
+    NonCells <- metadat[metadat$Group!=celltype,]$Cell
+    tmpFalse <- apply(true_datlog[,NonCells],1,median)
+    tmp_diff <- cor(median_PB,tmpFalse,method="spearman")
+    tmp_diff[is.na(tmp_diff)] <- 0
+    
+    tmp_scc <- tmp_same-tmp_diff
+    return(tmp_scc)
+}
+
+plotHeatmap <- function(sc,meta,dname="raw"){
+    #tmp <- sc[,order(meta$Group)]
+    #cormat <- cor(tmp)
+    tmpmeta <- meta[order(meta$Group),]
+    tmpmeta <- data.frame(cell_type=tmpmeta$Group,row.names=tmpmeta$Cell)
+    pheatmap(sc,cluster_cols=F,cluster_rows=F,show_colnames=F,show_rownames=F,annotation_col=tmpmeta,annotation_row=tmpmeta,main=dname)
+}
+
+calcCOR <- function(x,meta){
+    R1 <- x[,order(meta$Group)]
+    R1 <- cor(R1)
+    return(R1)
+}
+
+evalFCSCC <- function(ds,celltype1,celltype2,LFC_cutoff=0){
+    selectedCells1 <- metadat[metadat$Group==celltype1,]$Cell
+    median_PB1 <- apply(ds[,selectedCells1],1,median)
+    tmpTrue1 <- apply(true_datlog[,selectedCells1],1,median)
+    selectedCells2 <- metadat[metadat$Group==celltype2,]$Cell
+    median_PB2 <- apply(ds[,selectedCells2],1,median)
+    tmpTrue2 <- apply(true_datlog[,selectedCells2],1,median)
+    LFC_sc <- median_PB1-median_PB2
+    LFC_true <- tmpTrue1-tmpTrue2
+    
+    UsedGenes <- names(LFC_true[abs(LFC_true)>=LFC_cutoff])
+    tmp <- cor.test(LFC_sc[UsedGenes],LFC_true[UsedGenes],method="spearman")
+    tmp_scc <- tmp$estimate
+    tmp_p <- tmp$p.value
+    #return(list(scc=tmp_scc,p=tmp_p))
+    return(tmp_scc)
+}
+
+evalFCSCC2 <- function(ds,celltype1,celltype2,LFC_cutoff=0){
+    selectedCells1 <- metadat[metadat$Group==celltype1,]$Cell
+    median_PB1 <- apply(ds[,selectedCells1],1,median)
+    
+    selectedCells2 <- metadat[metadat$Group==celltype2,]$Cell
+    median_PB2 <- apply(ds[,selectedCells2],1,median)
+    
+    LFC_sc <- median_PB1-median_PB2
+    LFC_true <- gmetadat[rownames(ds),paste0("DEFac",celltype1)]-gmetadat[rownames(ds),paste0("DEFac",celltype2)]
+    
+    UsedGenes <- which(abs(LFC_true)>=LFC_cutoff)
+    tmp <- cor.test(LFC_sc[UsedGenes],LFC_true[UsedGenes],method="spearman")
+    tmp_scc <- tmp$estimate
+    tmp_scc[is.na(tmp_scc)] <- 0
+    tmp_p <- tmp$p.value
+    #return(list(scc=tmp_scc,p=tmp_p))
+    return(tmp_scc)
+}
+
+getPsig <- function(x){
+    if(x>0.1){
+        return(" ")
+    }else if(x<=0.0005){
+        return("***")
+    }else if(x<=0.005){
+        return("**")
+    }else if(x<=0.05){
+        return("*")
+    }else if(x<=0.1){
+        return(".")
+    }
+}
+```
+
+## mock dropout 90
+### preprocess
+```{r message=FALSE, warning=FALSE}
+##True data
+true_dat <- readRDS("rawcount_txt/simulated_data/rawRDS/Sim_Mock_G10kC1500_5UGroup_de0.5_dropout90.rds")
+true_datlog <- CreateSeuratObject(counts=true_dat@assays@data$TrueCounts,min.cells=0,min.features=0)
+true_datlog <- NormalizeData(true_datlog)
+true_datlog <- as.matrix(true_datlog@assays$RNA@data)
+
+##raw
+raw_dat <- true_dat@assays@data$counts
+##imputed
+MAGIC_dat <- fread("MAGIC/Sim_Mock_G10kC1500_5UGroup_de0.5_dropout90.tsv",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+MAGIC_dat <- as.matrix(MAGIC_dat,rownames=1)
+alra_dat <- fread("alra/Sim_Mock_G10kC1500_5UGroup_de0.5_dropout90_alra.txt",sep="\t",stringsAsFactors=FALSE)
+alra_dat <- as.matrix(alra_dat,rownames=1)
+dca_dat <- fread("dca/Sim_Mock_G10kC1500_5UGroup_de0.5_dropout90/mean.tsv",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+dca_dat <- as.matrix(dca_dat,rownames=1)
+MAGIClog_dat <- fread("MAGIC_log/Sim_Mock_G10kC1500_5UGroup_de0.5_dropout90.tsv",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+MAGIClog_dat <- as.matrix(MAGIClog_dat,rownames=1)
+afMF_dat <- fread("afMF/imputed_data/Sim_Mock_G10kC1500_5UGroup_de0.5_dropout90_sigma3_0_convergence_True.txt",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+afMF_dat <- as.matrix(afMF_dat,rownames=1)
+AutoClass_dat <- fread("AutoClass/Sim_Mock_G10kC1500_5UGroup_de0.5_dropout90_AC.txt",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+AutoClass_dat <- as.matrix(AutoClass_dat,rownames=1)
+ccImpute_dat <- fread("ccImpute/Sim_Mock_G10kC1500_5UGroup_de0.5_dropout90_cc.txt",sep="\t",stringsAsFactors=FALSE)
+ccImpute_dat <- as.matrix(ccImpute_dat,rownames=1)
+ks_dat <- fread("knn_smoothing/Sim_Mock_G10kC1500_5UGroup_de0.5_dropout90_ks.txt",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+ks_dat <- as.matrix(ks_dat,rownames=1)
+Iimpute_dat <- fread("I_Impute/Sim_Mock_G10kC1500_5UGroup_de0.5_dropout90_CImp.txt",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+Iimpute_dat <- as.matrix(Iimpute_dat,rownames=1)
+scRMDnorm_dat <- fread("scRMD/Sim_Mock_G10kC1500_5UGroup_de0.5_dropout90_scRMDlognorm.txt",sep="\t",stringsAsFactors=FALSE)
+scRMDnorm_dat <- as.matrix(scRMDnorm_dat,rownames=1)
+Bf_dat <- fread("Bfimpute/Sim_Mock_G10kC1500_5UGroup_de0.5_dropout90_Bf_specc.txt",sep="\t",stringsAsFactors=FALSE)
+Bf_dat <- as.matrix(Bf_dat,rownames=1)
+
+ExcludeGenes <- rownames(raw_dat)[!rownames(raw_dat)%in%rownames(dca_dat)]
+tmp <- matrix(rep(0,length(ExcludeGenes)*ncol(raw_dat)),nrow=length(ExcludeGenes),ncol=ncol(raw_dat))
+rownames(tmp) <- ExcludeGenes
+dca_dat <- as.matrix(rbind(dca_dat,tmp))
+dca_dat <- dca_dat[rownames(raw_dat),]
+
+metadat <- as.data.frame(colData(true_dat))
+gmetadat <- as.data.frame(rowData(true_dat))
+metadat$Group <- as.character(metadat$Group)
+```
+
+normalized/log2 data
+```{r}
+raw_dat <- CreateSeuratObject(counts=raw_dat,min.cells=0,min.features=0)
+raw_dat <- NormalizeData(raw_dat)
+raw_dat <- as.matrix(raw_dat@assays$RNA@data)
+
+dca_dat <- log2(dca_dat+min(dca_dat[dca_dat!=0]))
+
+ks_dat <- CreateSeuratObject(counts=ks_dat,min.cells=0,min.features=0)
+ks_dat <- NormalizeData(ks_dat)
+ks_dat <- as.matrix(ks_dat@assays$RNA@data)
+
+Iimpute_dat <- log2(Iimpute_dat+min(Iimpute_dat[Iimpute_dat!=0]))
+```
+
+combine normalized data
+```{r}
+dat <- list(raw=raw_dat,ALRA=alra_dat,AutoClass=AutoClass_dat,Bfimpute=Bf_dat,ccImpute=ccImpute_dat,DCA=dca_dat,I_Impute=Iimpute_dat,kNN_smoothing=ks_dat,MAGIC=MAGIC_dat,MAGIC_log=MAGIClog_dat,scRMD=scRMDnorm_dat,afMF=afMF_dat)
+rm(raw_dat)
+rm(alra_dat)
+rm(AutoClass_dat)
+rm(Bf_dat)
+rm(ccImpute_dat)
+rm(Iimpute_dat)
+rm(ks_dat)
+rm(dca_dat)
+rm(MAGIC_dat)
+rm(MAGIClog_dat)
+rm(scRMDnorm_dat)
+rm(afMF_dat)
+```
+
+### spearman correlation (cell-cell)
+```{r message=FALSE, warning=FALSE}
+#cell-cell
+res_scc <- as.data.frame(lapply(dat,evalCellScc,true_datlog))
+res_scc <- as.data.frame(t(res_scc))
+colnames(res_scc) <- c("cor_mock90")
+res_scc
+saveRDS(res_scc,"results/SC_SimDataEval/SC_True_CellCell_SCC_Mock90.rds")
+```
+
+### relative same-diff spearman correlation (cell-true cell cluster)
+```{r message=FALSE, warning=FALSE}
+#cell-true cell cluster
+res1 <- as.data.frame(lapply(dat,evalSCC_sc_true,"Group1"))
+res1 <- rbind(res1,apply(res1,2,median))
+res2 <- as.data.frame(lapply(dat,evalSCC_sc_true,"Group2"))
+res2 <- rbind(res2,apply(res2,2,median))
+res3 <- as.data.frame(lapply(dat,evalSCC_sc_true,"Group3"))
+res3 <- rbind(res3,apply(res3,2,median))
+res4 <- as.data.frame(lapply(dat,evalSCC_sc_true,"Group4"))
+res4 <- rbind(res4,apply(res4,2,median))
+res5 <- as.data.frame(lapply(dat,evalSCC_sc_true,"Group5"))
+res5 <- rbind(res5,apply(res5,2,median))
+
+res <- rbind(res1[nrow(res1),],res2[nrow(res2),],res3[nrow(res3),],res4[nrow(res4),],res5[nrow(res5),])
+res <- as.data.frame(t(res))
+colnames(res) <- c("Group1","Group2","Group3","Group4","Group5")
+apply(res,1,median)
+
+res_pct1 <- apply(res1[,-1],2,function(x) sum(x>=res1[,1])/nrow(res1))
+res_pct2 <- apply(res2[,-1],2,function(x) sum(x>=res2[,1])/nrow(res2))
+res_pct3 <- apply(res3[,-1],2,function(x) sum(x>=res3[,1])/nrow(res3))
+res_pct4 <- apply(res4[,-1],2,function(x) sum(x>=res4[,1])/nrow(res4))
+res_pct5 <- apply(res5[,-1],2,function(x) sum(x>=res5[,1])/nrow(res5))
+res_pct <- rbind(res_pct1,res_pct2,res_pct3,res_pct4,res_pct5)
+res_pct <- as.data.frame(t(res_pct))
+colnames(res_pct) <- c("Group1","Group2","Group3","Group4","Group5")
+
+res_all <- list(scc=res,pct=res_pct)
+saveRDS(res_all,"results/SC_SimDataEval/SC_True_CellCluster_SCC_SameMDiff_Mock90.rds")
+```
+
+### relative same-diff PB SCC
+spearman correlation
+```{r message=FALSE, warning=FALSE}
+res1 <- as.data.frame(lapply(dat,evalSCC_pb_true,"Group1"))
+res2 <- as.data.frame(lapply(dat,evalSCC_pb_true,"Group2"))
+res3 <- as.data.frame(lapply(dat,evalSCC_pb_true,"Group3"))
+res4 <- as.data.frame(lapply(dat,evalSCC_pb_true,"Group4"))
+res5 <- as.data.frame(lapply(dat,evalSCC_pb_true,"Group5"))
+
+res <- rbind(res1,res2,res3,res4,res5)
+res <- as.data.frame(t(res))
+colnames(res) <- c("Group1","Group2","Group3","Group4","Group5")
+res
+apply(res,1,median)
+
+res_all <- list(scc=res)
+saveRDS(res_all,"results/SC_SimDataEval/SC_True_PBCluster_SCC_SameMDiff_Mock90.rds")
+```
+
+### PB level fold change between cell type(with known Fac)
+spearman cor
+```{r message=FALSE, warning=FALSE}
+celltypes <- unique(metadat$Group)
+comb_celltype <- as.data.frame(combn(celltypes,2))
+res_md <- data.frame()
+PairGroups <- c()
+
+for(i in 1:ncol(comb_celltype)){
+    tmp <- as.data.frame(lapply(dat,evalFCSCC2,comb_celltype[1,i],comb_celltype[2,i]))
+    res_md <- rbind(res_md,tmp)
+    PairGroups <- c(PairGroups,paste0(comb_celltype[1,i],"_",comb_celltype[2,i]))
+}
+res_md <- as.data.frame(t(res_md))
+colnames(res_md) <- PairGroups
+rownames(res_md) <- names(dat)
+apply(res_md,1,median)
+
+res_all <- list(scc=res_md)
+saveRDS(res_all,"results/SC_SimDataEval/SC_True_FC2_SCC_Mock90.rds")
+```
+
+## summarize
+### cell-true cell
+read data
+```{r}
+tmp <- list.files("results/SC_SimDataEval/")
+tmp <- tmp[grep("CellCell_SCC",tmp)]
+
+res <- data.frame()
+for(x in tmp){
+    tmppath <- paste0("results/SC_SimDataEval/",x)
+    tmp1 <- readRDS(tmppath)
+    tmp1 <- t(tmp1)
+
+    res <- rbind(res,tmp1)
+}
+
+res <- as.data.frame(t(res))
+```
+
+process
+```{r}
+res$method <- rownames(res)
+colnames(res)[1] <- "SCC"
+head(res)
+```
+
+Bar plot
+```{r}
+rank1 <- res[order(res$SCC),]$method
+res$Method <- factor(res$method,levels=c("raw",res$method[-1][order(res$method[-1])]))
+res$method <- factor(res$method,levels=rank1)
+
+res$Type <- "Deep learning based"
+res[res$method%in%c("ccImpute","I_Impute","kNN_smoothing","MAGIC","MAGIC_log"),]$Type <- "Model or smoothing based"
+res[res$method%in%c("ALRA","Bfimpute","afMF","scRMD"),]$Type <- "Matrix based"
+res[res$method%in%c("raw"),]$Type <- "Raw"
+res$Type <- factor(res$Type,levels=c("Matrix based","Model or smoothing based","Deep learning based","Raw"))
+
+neg_md <- sum(res$SCC<res[res$method=="raw","SCC"])
+
+sim_celcell_scc_bp <- ggbarplot(res,x="method",y="SCC",fill="Type",xlab="Method")+ggtitle("Single Cell-True Cell Profiles SCC(Median)")+geom_hline(yintercept=res[res$method=="raw","SCC"],linetype="dashed")+geom_vline(xintercept=neg_md+0.5,linetype="dashed")+theme(plot.title=element_text(size=16),legend.title=element_text(size=15),legend.text=element_text(size=14),axis.title=element_text(size=18),axis.text.x=element_text(angle=90,size=15),axis.text.y=element_text(size=15),legend.position="right")+scale_fill_brewer(palette="Set2")
+sim_celcell_scc_bp
+```
+
+### relative same-diff SC SCC
+read data
+```{r}
+tmp <- list.files("results/SC_SimDataEval/")
+tmp <- tmp[grep("CellCluster",tmp)]
+tmp <- tmp[grep("Mock90",tmp)]
+tmp <- tmp[grep("SameMDiff",tmp)]
+
+res <- data.frame()
+for(x in tmp){
+    tmppath <- paste0("results/SC_SimDataEval/",x)
+    tmp1 <- readRDS(tmppath)
+    tmp1 <- t(tmp1$scc)
+    d_name <- strsplit(x,"SameMDiff_")[[1]][2]
+    d_name <- strsplit(d_name,"\\.")[[1]][1]
+    rownames(tmp1) <- paste0(d_name,"_",rownames(tmp1))
+    res <- rbind(res,tmp1)
+}
+
+#res <- as.data.frame(t(res))
+res
+```
+
+process data
+```{r}
+md_raw <- median(res$raw)
+
+res_diff <- as.data.frame(apply(res[,-1],2,function(x) x-res[,1] ))
+res_diff$data <- rownames(res_diff)
+res_diff_melt <- data.table::melt(res_diff,id.vars=c("data"))
+
+res_diff_melt$Type <- "Deep learning based"
+res_diff_melt[res_diff_melt$variable%in%c("ccImpute","I_Impute","kNN_smoothing","MAGIC","MAGIC_log"),]$Type <- "Model or smoothing based"
+res_diff_melt[res_diff_melt$variable%in%c("ALRA","Bfimpute","afMF","scRMD"),]$Type <- "Matrix based"
+res_diff_melt$Type <- factor(res_diff_melt$Type,levels=c("Matrix based","Model or smoothing based","Deep learning based"))
+
+
+head(res_diff_melt)
+
+#rank by cor coefficient diff
+mdv <- res_diff_melt %>% group_by(variable) %>% summarise(md=median(value))
+rank1 <- mdv[order(mdv$md),]$variable
+res_diff_melt$Method <- as.character(res_diff_melt$variable)
+res_diff_melt$variable <- factor(res_diff_melt$variable,levels=rank1)
+neg_md <- sum(mdv$md<=0)
+```
+
+#### bar
+process
+```{r}
+res_bp <- as.data.frame(t(res))
+res_bp <- as.data.frame(apply(res_bp,1,median))
+res_bp$method <- rownames(res_bp)
+colnames(res_bp)[1] <- "SCC"
+head(res_bp)
+```
+
+Bar plot
+```{r}
+rank1 <- res_bp[order(res_bp$SCC),]$method
+res_bp$Method <- factor(res_bp$method,levels=c("raw",res_bp$method[-1][order(res_bp$method[-1])]))
+res_bp$method <- factor(res_bp$method,levels=rank1)
+
+res_bp$Type <- "Deep learning based"
+res_bp[res_bp$method%in%c("ccImpute","I_Impute","kNN_smoothing","MAGIC","MAGIC_log"),]$Type <- "Model or smoothing based"
+res_bp[res_bp$method%in%c("ALRA","Bfimpute","afMF","scRMD"),]$Type <- "Matrix based"
+res_bp[res_bp$method%in%c("raw"),]$Type <- "Raw"
+res_bp$Type <- factor(res_bp$Type,levels=c("Matrix based","Model or smoothing based","Deep learning based","Raw"))
+
+neg_md <- sum(res_bp$SCC<res_bp[res_bp$method=="raw","SCC"])
+
+sim_scclu_smd_bp <- ggbarplot(res_bp,x="method",y="SCC",fill="Type",xlab="Method")+ggtitle("Single Cell-True Cell Cluster SCC Difference(Median)(Relative)")+geom_hline(yintercept=res_bp[res_bp$method=="raw","SCC"],linetype="dashed")+geom_vline(xintercept=neg_md+0.5,linetype="dashed")+theme(plot.title=element_text(size=16),legend.title=element_text(size=15),legend.text=element_text(size=14),axis.title=element_text(size=18),axis.text.x=element_text(angle=90,size=15),axis.text.y=element_text(size=15),legend.position="right")+scale_fill_brewer(palette="Set2")
+sim_scclu_smd_bp
+```
+
+### relative same-diff PB SCC
+read data
+```{r}
+tmp <- list.files("results/SC_SimDataEval/")
+tmp <- tmp[grep("PBCluster",tmp)]
+tmp <- tmp[grep("Mock90",tmp)]
+tmp <- tmp[grep("SameMDiff",tmp)]
+
+res <- data.frame()
+for(x in tmp){
+    tmppath <- paste0("results/SC_SimDataEval/",x)
+    tmp1 <- readRDS(tmppath)
+    tmp1 <- t(tmp1$scc)
+    d_name <- strsplit(x,"SameMDiff_")[[1]][2]
+    d_name <- strsplit(d_name,"\\.")[[1]][1]
+    rownames(tmp1) <- paste0(d_name,"_",rownames(tmp1))
+    res <- rbind(res,tmp1)
+}
+
+#res <- as.data.frame(t(res))
+res
+```
+
+process data
+```{r}
+md_raw <- median(res$raw)
+
+res_diff <- as.data.frame(apply(res[,-1],2,function(x) x-res[,1] ))
+res_diff$data <- rownames(res_diff)
+res_diff_melt <- data.table::melt(res_diff,id.vars=c("data"))
+head(res_diff_melt)
+
+#rank by cor coefficient diff
+mdv <- res_diff_melt %>% group_by(variable) %>% summarise(md=median(value))
+rank1 <- mdv[order(mdv$md),]$variable
+res_diff_melt$Method <- as.character(res_diff_melt$variable)
+res_diff_melt$variable <- factor(res_diff_melt$variable,levels=rank1)
+
+res_diff_melt$Type <- "Deep learning based"
+res_diff_melt[res_diff_melt$variable%in%c("ccImpute","I_Impute","kNN_smoothing","MAGIC","MAGIC_log"),]$Type <- "Model or smoothing based"
+res_diff_melt[res_diff_melt$variable%in%c("ALRA","Bfimpute","afMF","scRMD"),]$Type <- "Matrix based"
+res_diff_melt$Type <- factor(res_diff_melt$Type,levels=c("Matrix based","Model or smoothing based","Deep learning based"))
+
+neg_md <- sum(mdv$md<=0)
+```
+
+#### bar
+process
+```{r}
+res_bp <- as.data.frame(t(res))
+res_bp <- as.data.frame(apply(res_bp,1,median))
+res_bp$method <- rownames(res_bp)
+colnames(res_bp)[1] <- "SCC"
+head(res_bp)
+```
+
+Bar plot
+```{r}
+rank1 <- res_bp[order(res_bp$SCC),]$method
+res_bp$Method <- factor(res_bp$method,levels=c("raw",res_bp$method[-1][order(res_bp$method[-1])]))
+res_bp$method <- factor(res_bp$method,levels=rank1)
+neg_md <- sum(res_bp$SCC<res_bp[res_bp$method=="raw","SCC"])
+
+res_bp$Type <- "Deep learning based"
+res_bp[res_bp$method%in%c("ccImpute","I_Impute","kNN_smoothing","MAGIC","MAGIC_log"),]$Type <- "Model or smoothing based"
+res_bp[res_bp$method%in%c("ALRA","Bfimpute","afMF","scRMD"),]$Type <- "Matrix based"
+res_bp[res_bp$method%in%c("raw"),]$Type <- "Raw"
+res_bp$Type <- factor(res_bp$Type,levels=c("Matrix based","Model or smoothing based","Deep learning based","Raw"))
+
+sim_pbclu_smd_bp <- ggbarplot(res_bp,x="method",y="SCC",fill="Type",xlab="Method")+ggtitle("Imputed-True Pseudobulk SCC Difference(Median)(Relative)")+geom_hline(yintercept=res_bp[res_bp$method=="raw","SCC"],linetype="dashed")+geom_vline(xintercept=neg_md+0.5,linetype="dashed")+theme(plot.title=element_text(size=16),legend.title=element_text(size=15),legend.text=element_text(size=14),axis.title=element_text(size=18),axis.text.x=element_text(angle=90,size=15),axis.text.y=element_text(size=15),legend.position="right")+scale_fill_brewer(palette="Set2")
+sim_pbclu_smd_bp
+```
+
+### True and PB different status Fold Change Correlation
+read data
+```{r}
+tmp <- list.files("results/SC_SimDataEval/")
+tmp <- tmp[grep("FC2_SCC",tmp)]
+
+res <- data.frame()
+for(x in tmp){
+    tmppath <- paste0("results/SC_SimDataEval/",x)
+    dat <- readRDS(tmppath)
+    dat <- t(dat$scc)
+    d_name <- strsplit(x,"FC2_SCC_")[[1]][2]
+    d_name <- strsplit(d_name,"\\.")[[1]][1]
+    rownames(dat) <- paste0(d_name,"_",rownames(dat))
+    res <- rbind(res,dat)
+}
+res
+```
+
+process data
+```{r}
+md_raw <- median(res$raw)
+res_diff <- as.data.frame(apply(res[,-1],2,function(x) x-res[,1] ))
+res_diff$data <- rownames(res)
+res_melt <- data.table::melt(res_diff,id.vars=c("data"))
+head(res_melt)
+
+#rank by cor coefficient diff
+mdv <- res_melt %>% group_by(variable) %>% summarise(md=median(value))
+rank1 <- mdv[order(mdv$md),]$variable
+res_melt$Method <- as.character(res_melt$variable)
+res_melt$variable <- factor(res_melt$variable,levels=rank1)
+
+res_melt$Type <- "Deep learning based"
+res_melt[res_melt$variable%in%c("ccImpute","I_Impute","kNN_smoothing","MAGIC","MAGIC_log"),]$Type <- "Model or smoothing based"
+res_melt[res_melt$variable%in%c("ALRA","Bfimpute","afMF","scRMD"),]$Type <- "Matrix based"
+res_melt$Type <- factor(res_melt$Type,levels=c("Matrix based","Model or smoothing based","Deep learning based"))
+
+neg_md <- sum(mdv$md<=0)
+
+#performed tests
+pv <- apply(res[,-1],2,function(x) wilcox.test(res[,1],x,alternative="less",paired=TRUE)$p.value )
+pv_sig <- sapply(pv,getPsig)
+pv_sig <- pv_sig[rank1]
+```
+
+box plot
+```{r}
+sim_fc_scc_bp <- ggboxplot(res_melt,x="variable",y="value",fill="Type",ylab="SCC Difference",xlab="Method",title="Imputed-True Pseudobulk Fold Change SCC Difference")+geom_hline(yintercept=0,linetype="dashed")+geom_vline(xintercept=neg_md+0.5,linetype="dashed")+annotate(geom="text",x=c(1:length(pv_sig)),y=0.35,label=pv_sig,size=7)+annotate(geom="text",x=length(pv_sig)+2.2,y=0.02,label=paste0("Raw(Median=",round(md_raw,2),")"),size=4.5)+coord_cartesian(xlim=c(1,length(pv_sig)+3.2))+theme(plot.title=element_text(size=16),legend.title=element_text(size=15),legend.text=element_text(size=14),axis.title=element_text(size=18),axis.text.x=element_text(angle=90,size=15),axis.text.y=element_text(size=15))+scale_fill_brewer(palette="Set2")
+sim_fc_scc_bp
+```
+
+heatmap
+```{r}
+tmp_hm <- res_melt[,]
+colnames(tmp_hm)[3] <- "SCC_Difference"
+ggplot(tmp_hm,aes(variable,data,fill=SCC_Difference))+geom_tile()+theme(axis.text.x=element_text(angle=90))+scale_fill_gradient2(low="blue",mid="white",high="red",midpoint=0)+geom_vline(xintercept=neg_md+0.5,linetype="dashed")+xlab("Methods")+ylab("Datasets&CellTypes")+ggtitle("Imputed-True Pseudobulk Fold Change SCC Difference")
+```
+
+### pearson correlation cell-cell heatmap
+```{r fig.height=4, fig.width=5}
+true_dat_cor <- calcCOR(true_datlog,metadat)
+dat_cor <- lapply(dat,calcCOR,metadat)
+
+for(x in names(dat_cor)){
+    print(plotHeatmap(dat_cor[[x]],as.data.frame(metadat),x))
+}
+```
+
+
+# DE analysis
+functions
+```{r}
+performDE_sc <- function(ds,meta,label_col,status1,status2,method="rank_sum"){
+    
+    if(method=="rank_sum"){
+        selectedCells <- which(meta[,label_col]%in%c(status1,status2))
+        conditions <- factor(meta[selectedCells,label_col],levels=c(status1,status2))
+        tmp_ds <- ds[,selectedCells]
+        pvalues <- sapply(1:nrow(tmp_ds), function(i){
+            dat <- cbind.data.frame(gene=as.numeric(t(tmp_ds[i,])),conditions)
+            p <- wilcox.test(gene~conditions, dat)$p.value
+            return(p)
+        })
+        ## set NA to 1
+        pvalues <- ifelse(is.na(pvalues),1,pvalues)
+        ## set p=0 to min
+        pvalues[pvalues==0] <- min(pvalues[pvalues!=0])
+        fdr <- p.adjust(pvalues,method="fdr")
+        # Calculate the fold-change for each gene
+        conditionsLevel <- levels(conditions)
+        dataCon1 <- tmp_ds[,c(which(conditions==conditionsLevel[1]))]
+        dataCon2 <- tmp_ds[,c(which(conditions==conditionsLevel[2]))]
+        foldChanges <- rowMeans(dataCon2)-rowMeans(dataCon1)
+        outRst <- data.frame(logFC=foldChanges,P.Value=pvalues,FDR=fdr)
+        rownames(outRst) <- rownames(tmp_ds)
+        #outRst <- outRst[order(outRst[,"P.Value"],-abs(outRst[,"logFC"])),]
+        outRst$log10FDR <- log10(outRst$FDR)*(-1)
+        outRst$log10P <- log10(outRst$P.Value)*(-1)
+        outRst$signlogFDR <- sign(outRst$logFC)*outRst$log10FDR
+        outRst$signlogP <- sign(outRst$logFC)*outRst$log10P
+        
+        outRst <- outRst[order(outRst[,"signlogP"],abs(outRst[,"logFC"]),decreasing=TRUE),]
+        outRst$finalRank <- 1:nrow(outRst)
+        outRst <- outRst[rownames(ds),]
+        return(outRst)
+        
+    }else if(method=="MAST"){
+        tmp <- FromMatrix(ds,meta,data.frame(features=rownames(ds)),check_sanity=FALSE)
+        cdr2 <-colSums(assay(tmp)>0)
+        colData(tmp)$cngeneson <- scale(cdr2)
+
+        tmp <- tmp[,which(tmp@colData[,label_col]%in%c(status1,status2))]
+        cond <- factor(colData(tmp)[,label_col],levels=c(status1,status2))
+        colData(tmp)$cond <- cond
+        if(length(unique(cdr2))==1){
+            zlmCond <- zlm(~cond,tmp)
+        }else{
+            zlmCond <- zlm(~cond+cngeneson,tmp)
+        }
+        tmpterm <- paste0("cond",status2)
+        summaryCond <- summary(zlmCond,doLRT=tmpterm)
+        summaryDt <- as.data.frame(summaryCond$datatable)
+        pval <- summaryDt[summaryDt$component=="H"&summaryDt$contrast==tmpterm,c(1,4)]
+        lfc <- summaryDt[summaryDt$component=="logFC"&summaryDt$contrast==tmpterm,c(1,7)]
+        res <- merge(pval,lfc)
+        colnames(res) <- c("Gene","P.Value","logFC")
+        rownames(res) <- res$Gene
+        #res <- res[order(res[,"P.Value"],-abs(res[,"logFC"])),]
+        ## set NA to 1
+        res$P.Value <- ifelse(is.na(res$P.Value),1,res$P.Value)
+        ## set p=0 to min
+        res[res$P.Value==0,"P.Value"] <- min(res[res$P.Value!=0,"P.Value"])
+        res$FDR <- p.adjust(res$P.Value,method="fdr")
+        res$log10FDR <- log10(res$FDR)*(-1)
+        res$log10P <- log10(res$P.Value)*(-1)
+        res$signlogFDR <- sign(res$logFC)*res$log10FDR
+        res$signlogP <- sign(res$logFC)*res$log10P
+        
+        res <- res[order(res[,"signlogP"],abs(res[,"logFC"]),decreasing=TRUE),]
+        res$finalRank <- 1:nrow(res)
+        res <- res[rownames(ds),]
+        return(res)
+    }
+}
+
+getSCC <- function(sc,bulk){
+    res <- cor.test(sc,bulk,method="pearson")
+    #return(list(estimate=res$estimate,p=res$p.value))
+    return(res$estimate)
+}
+
+getSCC2 <- function(sc,bulk){
+    
+    res <- tryCatch(
+        {
+            res <- cor.test(sc,bulk,method="spearman")
+            #return(list(estimate=res$estimate,p=res$p.value))
+            return(res$estimate)
+        },
+        error=function(cond){
+            return(NA)
+        }
+    )
+    return(res)
+}
+
+getOverlappedDEGs <- function(scd,top_n,allgenes,bulk_degs){
+    names(scd) <- allgenes
+    top_degs <- names(scd[order(scd)])[1:top_n]
+    return(sum(top_degs%in%bulk_degs)/top_n)
+}
+
+getOverlappedDEGs2 <- function(scd,top_n,allgenes,bulk_degs){
+    names(scd) <- allgenes
+    top_degs <- names(scd[order(scd)])[1:top_n]
+    return(sum(top_degs%in%bulk_degs)/length(bulk_degs))
+}
+
+getJaccard <- function(scd,top_n,allgenes,bulk_degs){
+    names(scd) <- allgenes
+    top_degs <- names(scd[order(scd)])[1:top_n]
+    interS <- length(intersect(top_degs,bulk_degs))
+    unionS <- length(top_degs)+length(bulk_degs)-interS
+    return(interS/unionS)
+}
+
+
+getAllEval <- function(bulkds,scds){
+    # bulk_res1 <- performDE_bulk(bulkds,bulkconds,status1,status2)
+    # sc_res1 <- as.data.frame(lapply(scds,performDE_sc,scmeta,label_col,status1,status2))
+    sc_res1 <- scds[rownames(bulkds),]
+    bulk_res1 <- bulkds[,]
+    #correlation between rank
+    tmp1 <- sc_res1[,grep("finalRank",colnames(sc_res1))]
+    tmp1 <- apply(tmp1,2,getSCC,bulk_res1[,"finalRank"])
+    tmp1 <- as.data.frame(tmp1)
+    #0.05
+    #SelectedG <- rownames(bulk_res1[bulk_res1$P.Value<=0.05,])
+    SelectedG <- rownames(bulk_res1[order(bulk_res1$P.Value),])[1:1000]
+    tmp4 <- sc_res1[SelectedG,grep("finalRank",colnames(sc_res1))]
+    tmp4 <- apply(tmp4,2,getSCC,bulk_res1[SelectedG,"finalRank"])
+    tmp4 <- as.data.frame(tmp4)
+
+    tmp_p <- cbind(tmp1,tmp4)
+    colnames(tmp_p) <- c("all","0.05")
+    
+    #correlation between logFC
+    tmp1 <- sc_res1[,grep("logFC",colnames(sc_res1))]
+    tmp1 <- apply(tmp1,2,getSCC2,bulk_res1[,"logFC"])
+    tmp1 <- as.data.frame(tmp1)
+    #0.05
+    #SelectedG <- rownames(bulk_res1[bulk_res1$adj.P.Val<=0.05,])
+    SelectedG <- rownames(bulk_res1[order(bulk_res1$P.Value),])[1:1000]
+    tmp4 <- sc_res1[SelectedG,grep("logFC",colnames(sc_res1))]
+    tmp4 <- apply(tmp4,2,getSCC2,bulk_res1[SelectedG,"logFC"])
+    tmp4 <- as.data.frame(tmp4)
+    tmp_fc <- cbind(tmp1,tmp4)
+    colnames(tmp_fc) <- c("all","0.05")
+    
+    return(list(p=tmp_p,fc=tmp_fc))
+}
+
+getAllOverlap <- function(bulkds,scds,nbulkDEGs=100,nscDEGs=100*c(1:5)){
+    
+    sc_DEGs <- scds[,grep("P.Value",colnames(scds))]
+    bulk_DEGs <- rownames(bulkds[order(bulkds$P.Value),])
+
+    sc_DEGs1 <- lapply(nscDEGs,function(x) as.data.frame(apply(sc_DEGs,2,getOverlappedDEGs2,x,rownames(sc_DEGs),bulk_DEGs[1:nbulkDEGs])))
+    sc_DEGs1 <- as.data.frame(sc_DEGs1)
+    colnames(sc_DEGs1) <- paste0("scTOP",nscDEGs)
+    
+    sc_jaccard1 <- lapply(nscDEGs,function(x) as.data.frame(apply(sc_DEGs,2,getJaccard,x,rownames(sc_DEGs),bulk_DEGs[1:nbulkDEGs])))
+    sc_jaccard1 <- as.data.frame(sc_jaccard1)
+    colnames(sc_jaccard1) <- paste0("scTOP",nscDEGs)
+    
+    return(list(overlap=sc_DEGs1,jaccard=sc_jaccard1))
+}
+
+#limma trend for pre-normalized data
+performPBDE_sc_limma <- function(ds,meta,label_col,sample_col,cellt_col,status1,status2){
+    tmp <- SingleCellExperiment(ds,colData=meta,mainExpName="log2norm")
+    tmp <- prepSCE(tmp,kid=cellt_col,gid=label_col,sid=sample_col,drop=FALSE)
+    assayNames(tmp) <- "log2norm"
+    tmp <- aggregateData(tmp,assay="log2norm",fun="mean",by=c("cluster_id","sample_id"))
+    conds <- tmp$group_id
+
+    #limma
+    mm <- model.matrix(~0 + conds)
+    fit <- lmFit(tmp@assays@data[[1]],mm)
+    exp_tmp <- sprintf("conds%s-conds%s",status2,status1)
+    myargs <- list(exp_tmp,levels=colnames(coef(fit)))
+    contr  <- do.call(makeContrasts,myargs)
+    tmp <- contrasts.fit(fit,contr)
+    tmp <- eBayes(tmp,trend=TRUE)
+    top.table <- topTable(tmp,sort.by="P",n=Inf)
+    ## set NA to 1
+    top.table$P.Value <- ifelse(is.na(top.table$P.Value),1,top.table$P.Value)
+    ## set p=0 to min
+    top.table$P.Value[top.table$P.Value==0] <- min(top.table$P.Value[top.table$P.Value!=0])
+    top.table$log10FDR <- log10(top.table$adj.P.Val)*(-1)
+    top.table$log10P <- log10(top.table$P.Value)*(-1)
+    top.table$signlogFDR <- sign(top.table$logFC)*top.table$log10FDR
+    top.table$signlogP <- sign(top.table$logFC)*top.table$log10P
+    top.table <- top.table[order(top.table[,"signlogP"],abs(top.table[,"logFC"]),decreasing=TRUE),]
+    top.table$finalRank <- 1:nrow(top.table)
+    top.table <- top.table[rownames(ds),]
+    return(top.table)
+}
+
+getPsig <- function(x){
+    if(x>0.1){
+        return(" ")
+    }else if(x<=0.0005){
+        return("***")
+    }else if(x<=0.005){
+        return("**")
+    }else if(x<=0.05){
+        return("*")
+    }else if(x<=0.1){
+        return(".")
+    }
+}
+```
+
+## mock 90% dropout
+### preprocess
+```{r message=FALSE, warning=FALSE}
+##True data
+true_dat <- readRDS("rawcount_txt/simulated_data/rawRDS/Sim_Mock_G10kC1500_5UGroup_de0.5_dropout90.rds")
+true_datlog <- CreateSeuratObject(counts=true_dat@assays@data$TrueCounts,min.cells=0,min.features=0)
+true_datlog <- NormalizeData(true_datlog)
+true_datlog <- as.matrix(true_datlog@assays$RNA@data)
+
+##raw
+raw_dat <- true_dat@assays@data$counts
+##imputed
+MAGIC_dat <- fread("MAGIC/Sim_Mock_G10kC1500_5UGroup_de0.5_dropout90.tsv",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+MAGIC_dat <- as.matrix(MAGIC_dat,rownames=1)
+alra_dat <- fread("alra/Sim_Mock_G10kC1500_5UGroup_de0.5_dropout90_alra.txt",sep="\t",stringsAsFactors=FALSE)
+alra_dat <- as.matrix(alra_dat,rownames=1)
+dca_dat <- fread("dca/Sim_Mock_G10kC1500_5UGroup_de0.5_dropout90/mean.tsv",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+dca_dat <- as.matrix(dca_dat,rownames=1)
+MAGIClog_dat <- fread("MAGIC_log/Sim_Mock_G10kC1500_5UGroup_de0.5_dropout90.tsv",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+MAGIClog_dat <- as.matrix(MAGIClog_dat,rownames=1)
+afMF_dat <- fread("afMF/imputed_data/Sim_Mock_G10kC1500_5UGroup_de0.5_dropout90_sigma3_0_convergence_True.txt",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+afMF_dat <- as.matrix(afMF_dat,rownames=1)
+AutoClass_dat <- fread("AutoClass/Sim_Mock_G10kC1500_5UGroup_de0.5_dropout90_AC.txt",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+AutoClass_dat <- as.matrix(AutoClass_dat,rownames=1)
+ccImpute_dat <- fread("ccImpute/Sim_Mock_G10kC1500_5UGroup_de0.5_dropout90_cc.txt",sep="\t",stringsAsFactors=FALSE)
+ccImpute_dat <- as.matrix(ccImpute_dat,rownames=1)
+ks_dat <- fread("knn_smoothing/Sim_Mock_G10kC1500_5UGroup_de0.5_dropout90_ks.txt",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+ks_dat <- as.matrix(ks_dat,rownames=1)
+Iimpute_dat <- fread("I_Impute/Sim_Mock_G10kC1500_5UGroup_de0.5_dropout90_CImp.txt",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+Iimpute_dat <- as.matrix(Iimpute_dat,rownames=1)
+scRMDnorm_dat <- fread("scRMD/Sim_Mock_G10kC1500_5UGroup_de0.5_dropout90_scRMDlognorm.txt",sep="\t",stringsAsFactors=FALSE)
+scRMDnorm_dat <- as.matrix(scRMDnorm_dat,rownames=1)
+Bf_dat <- fread("Bfimpute/Sim_Mock_G10kC1500_5UGroup_de0.5_dropout90_Bf_specc.txt",sep="\t",stringsAsFactors=FALSE)
+Bf_dat <- as.matrix(Bf_dat,rownames=1)
+
+ExcludeGenes <- rownames(raw_dat)[!rownames(raw_dat)%in%rownames(dca_dat)]
+tmp <- matrix(rep(0,length(ExcludeGenes)*ncol(raw_dat)),nrow=length(ExcludeGenes),ncol=ncol(raw_dat))
+rownames(tmp) <- ExcludeGenes
+dca_dat <- as.matrix(rbind(dca_dat,tmp))
+dca_dat <- dca_dat[rownames(raw_dat),]
+
+metadat <- as.data.frame(colData(true_dat))
+gmetadat <- as.data.frame(rowData(true_dat))
+metadat$Group <- as.character(metadat$Group)
+```
+
+normalized/log2 data
+```{r}
+raw_dat <- CreateSeuratObject(counts=raw_dat,min.cells=0,min.features=0)
+raw_dat <- NormalizeData(raw_dat)
+raw_dat <- as.matrix(raw_dat@assays$RNA@data)
+
+dca_dat <- log2(dca_dat+min(dca_dat[dca_dat!=0]))
+
+ks_dat <- CreateSeuratObject(counts=ks_dat,min.cells=0,min.features=0)
+ks_dat <- NormalizeData(ks_dat)
+ks_dat <- as.matrix(ks_dat@assays$RNA@data)
+
+Iimpute_dat <- log2(Iimpute_dat+min(Iimpute_dat[Iimpute_dat!=0]))
+```
+
+combine normalized data
+```{r}
+dat <- list(raw=raw_dat,ALRA=alra_dat,AutoClass=AutoClass_dat,Bfimpute=Bf_dat,ccImpute=ccImpute_dat,DCA=dca_dat,I_Impute=Iimpute_dat,kNN_smoothing=ks_dat,MAGIC=MAGIC_dat,MAGIC_log=MAGIClog_dat,scRMD=scRMDnorm_dat,afMF=afMF_dat)
+rm(raw_dat)
+rm(alra_dat)
+rm(AutoClass_dat)
+rm(Bf_dat)
+rm(ccImpute_dat)
+rm(Iimpute_dat)
+rm(ks_dat)
+rm(dca_dat)
+rm(MAGIC_dat)
+rm(MAGIClog_dat)
+rm(scRMDnorm_dat)
+rm(afMF_dat)
+```
+
+### result rank sum
+```{r message=FALSE, warning=FALSE}
+status <- unique(metadat$Group)
+comb_status <- as.data.frame(combn(status,2))
+res <- list()
+
+#ncol(comb_status)
+for(i in 1:ncol(comb_status)){
+    DEG1 <- rownames(gmetadat[gmetadat[,paste0("DEFac",comb_status[1,i])]!=gmetadat[,paste0("DEFac",comb_status[2,i])],])
+    ES1 <- gmetadat[DEG1,paste0("DEFac",comb_status[2,i])]-gmetadat[DEG1,paste0("DEFac",comb_status[1,i])]
+    DEG1 <- data.frame(gene=DEG1,ES=ES1)
+    rownames(DEG1) <- DEG1$gene
+    DEG1 <- DEG1[order(DEG1$ES,decreasing=TRUE),]
+    
+    true_res <- performDE_sc(true_datlog,metadat,"Group",comb_status[1,i],comb_status[2,i])
+    sc_res <- as.data.frame(lapply(dat,performDE_sc,metadat,"Group",comb_status[1,i],comb_status[2,i]))
+    sc_res1 <- sc_res[rownames(true_res),]
+    sc_res2 <- sc_res[rownames(DEG1),]
+    PairGroups <- paste0(comb_status[1,i],"_",comb_status[2,i])
+    res[[paste0("true_",PairGroups)]] <- true_res
+    res[[paste0("sc_",PairGroups)]] <- sc_res1
+    res[[paste0("scdegs_",PairGroups)]] <- sc_res2
+    res[[paste0("degs_",PairGroups)]] <- DEG1
+}
+
+#writeout
+saveRDS(res,"results/SC_SimDataEval/TrueD_SC_SpearCor_DEresults_RST_Mock90.rds")
+```
+
+### result MAST
+```{r message=FALSE, warning=FALSE}
+status <- unique(metadat$Group)
+comb_status <- as.data.frame(combn(status,2))
+res <- list()
+
+#ncol(comb_status)
+for(i in 1:ncol(comb_status)){
+    DEG1 <- rownames(gmetadat[gmetadat[,paste0("DEFac",comb_status[1,i])]!=gmetadat[,paste0("DEFac",comb_status[2,i])],])
+    ES1 <- gmetadat[DEG1,paste0("DEFac",comb_status[2,i])]-gmetadat[DEG1,paste0("DEFac",comb_status[1,i])]
+    DEG1 <- data.frame(gene=DEG1,ES=ES1)
+    rownames(DEG1) <- DEG1$gene
+    DEG1 <- DEG1[order(DEG1$ES,decreasing=TRUE),]
+    
+    true_res <- performDE_sc(true_datlog,metadat,"Group",comb_status[1,i],comb_status[2,i],method="MAST")
+    sc_res <- as.data.frame(lapply(dat,performDE_sc,metadat,"Group",comb_status[1,i],comb_status[2,i],method="MAST"))
+    sc_res1 <- sc_res[rownames(true_res),]
+    sc_res2 <- sc_res[rownames(DEG1),]
+    PairGroups <- paste0(comb_status[1,i],"_",comb_status[2,i])
+    res[[paste0("true_",PairGroups)]] <- true_res
+    res[[paste0("sc_",PairGroups)]] <- sc_res1
+    res[[paste0("scdegs_",PairGroups)]] <- sc_res2
+    res[[paste0("degs_",PairGroups)]] <- DEG1
+}
+
+#writeout
+saveRDS(res,"results/SC_SimDataEval/TrueD_SC_SpearCor_DEresults_MAST_Mock90.rds")
+```
+
+## SplatPop 90% dropout
+### preprocess
+```{r message=FALSE, warning=FALSE}
+##True data
+true_dat <- readRDS("rawcount_txt/simulated_data/rawRDS/Sim_splatPop_G8kC2k_3UGroup_2cond_simscale15_de0.5_cde0.38_dropout90.rds")
+true_datlog <- CreateSeuratObject(counts=true_dat@assays@data$TrueCounts,min.cells=0,min.features=0)
+true_datlog <- NormalizeData(true_datlog)
+true_datlog <- as.matrix(true_datlog@assays$RNA@data)
+
+##raw
+raw_dat <- as.matrix(true_dat@assays@data$counts)
+##imputed
+MAGIC_dat <- fread("MAGIC/Sim_splatPop_G8kC2k_3UGroup_2cond_simscale15_de0.5_cde0.38_dropout90.tsv",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+MAGIC_dat <- as.matrix(MAGIC_dat,rownames=1)
+alra_dat <- fread("alra/Sim_splatPop_G8kC2k_3UGroup_2cond_simscale15_de0.5_cde0.38_dropout90_alra.txt",sep="\t",stringsAsFactors=FALSE)
+alra_dat <- as.matrix(alra_dat,rownames=1)
+dca_dat <- fread("dca/Sim_splatPop_G8kC2k_3UGroup_2cond_simscale15_de0.5_cde0.38_dropout90/mean.tsv",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+dca_dat <- as.matrix(dca_dat,rownames=1)
+MAGIClog_dat <- fread("MAGIC_log/Sim_splatPop_G8kC2k_3UGroup_2cond_simscale15_de0.5_cde0.38_dropout90.tsv",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+MAGIClog_dat <- as.matrix(MAGIClog_dat,rownames=1)
+afMF_dat <- fread("afMF/imputed_data/Sim_splatPop_G8kC2k_3UGroup_2cond_simscale15_de0.5_cde0.38_dropout90_sigma3_0_convergence_True.txt",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+afMF_dat <- as.matrix(afMF_dat,rownames=1)
+AutoClass_dat <- fread("AutoClass/Sim_splatPop_G8kC2k_3UGroup_2cond_simscale15_de0.5_cde0.38_dropout90_AC.txt",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+AutoClass_dat <- as.matrix(AutoClass_dat,rownames=1)
+ccImpute_dat <- fread("ccImpute/Sim_splatPop_G8kC2k_3UGroup_2cond_simscale15_de0.5_cde0.38_dropout90_cc.txt",sep="\t",stringsAsFactors=FALSE)
+ccImpute_dat <- as.matrix(ccImpute_dat,rownames=1)
+ks_dat <- fread("knn_smoothing/Sim_splatPop_G8kC2k_3UGroup_2cond_simscale15_de0.5_cde0.38_dropout90_ks.txt",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+ks_dat <- as.matrix(ks_dat,rownames=1)
+Iimpute_dat <- fread("I_Impute/Sim_splatPop_G8kC2k_3UGroup_2cond_simscale15_de0.5_cde0.38_dropout90_CImp.txt",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+Iimpute_dat <- as.matrix(Iimpute_dat,rownames=1)
+scRMDnorm_dat <- fread("scRMD/Sim_splatPop_G8kC2k_3UGroup_2cond_simscale15_de0.5_cde0.38_dropout90_scRMDlognorm.txt",sep="\t",stringsAsFactors=FALSE)
+scRMDnorm_dat <- as.matrix(scRMDnorm_dat,rownames=1)
+Bf_dat <- fread("Bfimpute/Sim_splatPop_G8kC2k_3UGroup_2cond_simscale15_de0.5_cde0.38_dropout90_Bf_specc.txt",sep="\t",stringsAsFactors=FALSE)
+Bf_dat <- as.matrix(Bf_dat,rownames=1)
+
+ExcludeGenes <- rownames(raw_dat)[!rownames(raw_dat)%in%rownames(dca_dat)]
+tmp <- matrix(rep(0,length(ExcludeGenes)*ncol(raw_dat)),nrow=length(ExcludeGenes),ncol=ncol(raw_dat))
+rownames(tmp) <- ExcludeGenes
+dca_dat <- as.matrix(rbind(dca_dat,tmp))
+dca_dat <- dca_dat[rownames(raw_dat),]
+
+metadat <- as.data.frame(colData(true_dat))
+gmetadat <- as.data.frame(rowData(true_dat))
+metadat$Group <- as.character(metadat$Group)
+metadat$Cell <- rownames(metadat)
+
+colnames(raw_dat) <- metadat$Cell
+colnames(MAGIC_dat) <- metadat$Cell
+colnames(alra_dat) <- metadat$Cell
+colnames(AutoClass_dat) <- metadat$Cell
+colnames(Bf_dat) <- metadat$Cell
+colnames(ccImpute_dat) <- metadat$Cell
+colnames(dca_dat) <- metadat$Cell
+colnames(Iimpute_dat) <- metadat$Cell
+colnames(ks_dat) <- metadat$Cell
+colnames(MAGIClog_dat) <- metadat$Cell
+colnames(afMF_dat) <- metadat$Cell
+colnames(scRMDnorm_dat) <- metadat$Cell
+colnames(true_datlog) <- metadat$Cell
+
+rownames(raw_dat) <- sub("_","-",rownames(raw_dat))
+rownames(MAGIC_dat) <- sub("_","-",rownames(MAGIC_dat))
+rownames(alra_dat) <- sub("_","-",rownames(alra_dat))
+rownames(AutoClass_dat) <- sub("_","-",rownames(AutoClass_dat))
+rownames(Bf_dat) <- sub("_","-",rownames(Bf_dat))
+rownames(ccImpute_dat) <- sub("_","-",rownames(ccImpute_dat))
+rownames(dca_dat) <- sub("_","-",rownames(dca_dat))
+rownames(Iimpute_dat) <- sub("_","-",rownames(Iimpute_dat))
+rownames(ks_dat) <- sub("_","-",rownames(ks_dat))
+rownames(MAGIClog_dat) <- sub("_","-",rownames(MAGIClog_dat))
+rownames(afMF_dat) <- sub("_","-",rownames(afMF_dat))
+rownames(scRMDnorm_dat) <- sub("_","-",rownames(scRMDnorm_dat))
+rownames(true_datlog) <- sub("_","-",rownames(true_datlog))
+
+rownames(gmetadat) <- sub("_","-",rownames(gmetadat))
+```
+
+normalized/log2 data
+```{r}
+raw_dat <- CreateSeuratObject(counts=raw_dat,min.cells=0,min.features=0)
+raw_dat <- NormalizeData(raw_dat)
+raw_dat <- as.matrix(raw_dat@assays$RNA@data)
+
+dca_dat <- log2(dca_dat+min(dca_dat[dca_dat!=0]))
+
+ks_dat <- CreateSeuratObject(counts=ks_dat,min.cells=0,min.features=0)
+ks_dat <- NormalizeData(ks_dat)
+ks_dat <- as.matrix(ks_dat@assays$RNA@data)
+
+Iimpute_dat <- log2(Iimpute_dat+min(Iimpute_dat[Iimpute_dat!=0]))
+```
+
+combine normalized data
+```{r}
+dat <- list(raw=raw_dat,ALRA=alra_dat,AutoClass=AutoClass_dat,Bfimpute=Bf_dat,ccImpute=ccImpute_dat,DCA=dca_dat,I_Impute=Iimpute_dat,kNN_smoothing=ks_dat,MAGIC=MAGIC_dat,MAGIC_log=MAGIClog_dat,scRMD=scRMDnorm_dat,afMF=afMF_dat)
+rm(raw_dat)
+rm(alra_dat)
+rm(AutoClass_dat)
+rm(Bf_dat)
+rm(ccImpute_dat)
+rm(Iimpute_dat)
+rm(ks_dat)
+rm(dca_dat)
+rm(MAGIC_dat)
+rm(MAGIClog_dat)
+rm(scRMDnorm_dat)
+rm(afMF_dat)
+```
+
+### Celltype result SC rank sum
+```{r message=FALSE, warning=FALSE}
+status <- unique(metadat$Group)
+comb_status <- as.data.frame(combn(status,2))
+res <- list()
+
+#ncol(comb_status)
+for(i in 1:ncol(comb_status)){
+    DEG1 <- rownames(gmetadat[gmetadat[,paste0("GroupDE.",comb_status[1,i])]!=gmetadat[,paste0("GroupDE.",comb_status[2,i])],])
+    ES1 <- gmetadat[DEG1,paste0("GroupDE.",comb_status[2,i])]-gmetadat[DEG1,paste0("GroupDE.",comb_status[1,i])]
+    DEG1 <- data.frame(gene=DEG1,ES=ES1)
+    rownames(DEG1) <- DEG1$gene
+    DEG1 <- DEG1[order(DEG1$ES,decreasing=TRUE),]
+    
+    true_res <- performDE_sc(true_datlog,metadat,"Group",comb_status[1,i],comb_status[2,i])
+    sc_res <- as.data.frame(lapply(dat,performDE_sc,metadat,"Group",comb_status[1,i],comb_status[2,i]))
+    sc_res1 <- sc_res[rownames(true_res),]
+    sc_res2 <- sc_res[rownames(DEG1),]
+    PairGroups <- paste0(comb_status[1,i],"_",comb_status[2,i])
+    res[[paste0("true_",PairGroups)]] <- true_res
+    res[[paste0("sc_",PairGroups)]] <- sc_res1
+    res[[paste0("scdegs_",PairGroups)]] <- sc_res2
+    res[[paste0("degs_",PairGroups)]] <- DEG1
+}
+
+#writeout
+saveRDS(res,"results/SC_SimDataEval/TrueD_SC_SpearCor_DEresults_CellTypes_RST_SplatPop90.rds")
+```
+
+### Celltype result SC MAST
+```{r message=FALSE, warning=FALSE}
+status <- unique(metadat$Group)
+comb_status <- as.data.frame(combn(status,2))
+res <- list()
+
+#ncol(comb_status)
+for(i in 1:ncol(comb_status)){
+    DEG1 <- rownames(gmetadat[gmetadat[,paste0("GroupDE.",comb_status[1,i])]!=gmetadat[,paste0("GroupDE.",comb_status[2,i])],])
+    ES1 <- gmetadat[DEG1,paste0("GroupDE.",comb_status[2,i])]-gmetadat[DEG1,paste0("GroupDE.",comb_status[1,i])]
+    DEG1 <- data.frame(gene=DEG1,ES=ES1)
+    rownames(DEG1) <- DEG1$gene
+    DEG1 <- DEG1[order(DEG1$ES,decreasing=TRUE),]
+    
+    true_res <- performDE_sc(true_datlog,metadat,"Group",comb_status[1,i],comb_status[2,i],method="MAST")
+    sc_res <- as.data.frame(lapply(dat,performDE_sc,metadat,"Group",comb_status[1,i],comb_status[2,i],method="MAST"))
+    sc_res1 <- sc_res[rownames(true_res),]
+    sc_res2 <- sc_res[rownames(DEG1),]
+    PairGroups <- paste0(comb_status[1,i],"_",comb_status[2,i])
+    res[[paste0("true_",PairGroups)]] <- true_res
+    res[[paste0("sc_",PairGroups)]] <- sc_res1
+    res[[paste0("scdegs_",PairGroups)]] <- sc_res2
+    res[[paste0("degs_",PairGroups)]] <- DEG1
+}
+
+#writeout
+saveRDS(res,"results/SC_SimDataEval/TrueD_SC_SpearCor_DEresults_CellTypes_MAST_SplatPop90.rds")
+```
+
+### Cond result SC rank sum
+```{r message=FALSE, warning=FALSE}
+status <- unique(metadat$Condition)
+comb_status <- as.data.frame(combn(status,2))
+celltypes <- unique(metadat$Group)
+res <- list()
+
+#ncol(comb_status)
+for(i in 1:ncol(comb_status)){
+    DEG1 <- rownames(gmetadat[gmetadat[,paste0("ConditionDE.",comb_status[1,i])]!=gmetadat[,paste0("ConditionDE.",comb_status[2,i])],])
+    ES1 <- gmetadat[DEG1,paste0("ConditionDE.",comb_status[2,i])]-gmetadat[DEG1,paste0("ConditionDE.",comb_status[1,i])]
+    DEG1 <- data.frame(gene=DEG1,ES=ES1)
+    rownames(DEG1) <- DEG1$gene
+    DEG1 <- DEG1[order(DEG1$ES,decreasing=TRUE),]
+    
+    for(ct in celltypes){
+        true_res <- performDE_sc(true_datlog[,metadat$Group==ct],metadat[metadat$Group==ct,],"Condition",comb_status[1,i],comb_status[2,i])
+        dat_tmp <- lapply(dat,function(x) x[,metadat$Group==ct] )
+        sc_res <- as.data.frame(lapply(dat_tmp,performDE_sc,metadat[metadat$Group==ct,],"Condition",comb_status[1,i],comb_status[2,i]))
+        sc_res1 <- sc_res[rownames(true_res),]
+        sc_res2 <- sc_res[rownames(DEG1),]
+        PairGroups <- paste0(comb_status[1,i],"_",comb_status[2,i])
+        res[[paste0(ct,"_true_",PairGroups)]] <- true_res
+        res[[paste0(ct,"_sc_",PairGroups)]] <- sc_res1
+        res[[paste0(ct,"_scdegs_",PairGroups)]] <- sc_res2
+        res[[paste0(ct,"_degs_",PairGroups)]] <- DEG1
+    }
+}
+
+#writeout
+saveRDS(res,"results/SC_SimDataEval/TrueD_SC_SpearCor_DEresults_Cond_RST_SplatPop90.rds")
+
+#change names
+tmp <- readRDS("results/SC_SimDataEval/TrueD_SC_SpearCor_DEresults_Cond_RST_SplatPop90.rds")
+names(tmp) <- c("true_Group1_Condition1_Condition2","sc_Group1_Condition1_Condition2","scdegs_Group1_Condition1_Condition2","degs_Group1_Condition1_Condition2",
+                "true_Group2_Condition1_Condition2","sc_Group2_Condition1_Condition2","scdegs_Group2_Condition1_Condition2","degs_Group2_Condition1_Condition2",
+                "true_Group3_Condition1_Condition2","sc_Group3_Condition1_Condition2","scdegs_Group3_Condition1_Condition2","degs_Group3_Condition1_Condition2")
+saveRDS(tmp,"results/SC_SimDataEval/TrueD_SC_SpearCor_DEresults_Cond_RST_SplatPop90.rds")
+
+```
+
+### Cond result SC MAST
+```{r message=FALSE, warning=FALSE}
+status <- unique(metadat$Condition)
+comb_status <- as.data.frame(combn(status,2))
+celltypes <- unique(metadat$Group)
+res <- list()
+
+#ncol(comb_status)
+for(i in 1:ncol(comb_status)){
+    DEG1 <- rownames(gmetadat[gmetadat[,paste0("ConditionDE.",comb_status[1,i])]!=gmetadat[,paste0("ConditionDE.",comb_status[2,i])],])
+    ES1 <- gmetadat[DEG1,paste0("ConditionDE.",comb_status[2,i])]-gmetadat[DEG1,paste0("ConditionDE.",comb_status[1,i])]
+    DEG1 <- data.frame(gene=DEG1,ES=ES1)
+    rownames(DEG1) <- DEG1$gene
+    DEG1 <- DEG1[order(DEG1$ES,decreasing=TRUE),]
+    
+    for(ct in celltypes){
+        true_res <- performDE_sc(true_datlog[,metadat$Group==ct],metadat[metadat$Group==ct,],"Condition",comb_status[1,i],comb_status[2,i],method="MAST")
+        dat_tmp <- lapply(dat,function(x) x[,metadat$Group==ct] )
+        sc_res <- as.data.frame(lapply(dat_tmp,performDE_sc,metadat[metadat$Group==ct,],"Condition",comb_status[1,i],comb_status[2,i],method="MAST"))
+        sc_res1 <- sc_res[rownames(true_res),]
+        sc_res2 <- sc_res[rownames(DEG1),]
+        PairGroups <- paste0(comb_status[1,i],"_",comb_status[2,i])
+        res[[paste0(ct,"_true_",PairGroups)]] <- true_res
+        res[[paste0(ct,"_sc_",PairGroups)]] <- sc_res1
+        res[[paste0(ct,"_scdegs_",PairGroups)]] <- sc_res2
+        res[[paste0(ct,"_degs_",PairGroups)]] <- DEG1
+    }
+}
+
+#writeout
+saveRDS(res,"results/SC_SimDataEval/TrueD_SC_SpearCor_DEresults_Cond_MAST_SplatPop90.rds")
+
+#change names
+tmp <- readRDS("results/SC_SimDataEval/TrueD_SC_SpearCor_DEresults_Cond_MAST_SplatPop90.rds")
+names(tmp) <- c("true_Group1_Condition1_Condition2","sc_Group1_Condition1_Condition2","scdegs_Group1_Condition1_Condition2","degs_Group1_Condition1_Condition2",
+                "true_Group2_Condition1_Condition2","sc_Group2_Condition1_Condition2","scdegs_Group2_Condition1_Condition2","degs_Group2_Condition1_Condition2",
+                "true_Group3_Condition1_Condition2","sc_Group3_Condition1_Condition2","scdegs_Group3_Condition1_Condition2","degs_Group3_Condition1_Condition2")
+saveRDS(tmp,"results/SC_SimDataEval/TrueD_SC_SpearCor_DEresults_Cond_MAST_SplatPop90.rds")
+
+```
+
+### Cond result PB limma
+```{r message=FALSE, warning=FALSE}
+status <- unique(metadat$Condition)
+comb_status <- as.data.frame(combn(status,2))
+celltypes <- unique(metadat$Group)
+res <- list()
+
+#ncol(comb_status)
+for(i in 1:ncol(comb_status)){
+    DEG1 <- rownames(gmetadat[gmetadat[,paste0("ConditionDE.",comb_status[1,i])]!=gmetadat[,paste0("ConditionDE.",comb_status[2,i])],])
+    ES1 <- gmetadat[DEG1,paste0("ConditionDE.",comb_status[2,i])]-gmetadat[DEG1,paste0("ConditionDE.",comb_status[1,i])]
+    DEG1 <- data.frame(gene=DEG1,ES=ES1)
+    rownames(DEG1) <- DEG1$gene
+    DEG1 <- DEG1[order(DEG1$ES,decreasing=TRUE),]
+    
+    
+    for(ct in celltypes){
+        true_res <- performPBDE_sc_limma(true_datlog[,metadat$Group==ct],metadat[metadat$Group==ct,],"Condition","Sample","Group",comb_status[1,i],comb_status[2,i])
+        dat_tmp <- lapply(dat,function(x) x[,metadat$Group==ct] )
+        sc_res <- as.data.frame(lapply(dat_tmp,performPBDE_sc_limma,metadat[metadat$Group==ct,],"Condition","Sample","Group",comb_status[1,i],comb_status[2,i]))
+        sc_res1 <- sc_res[rownames(true_res),]
+        sc_res2 <- sc_res[rownames(DEG1),]
+        PairGroups <- paste0(comb_status[1,i],"_",comb_status[2,i])
+        res[[paste0("true_",ct,"_",PairGroups)]] <- true_res
+        res[[paste0("sc_",ct,"_",PairGroups)]] <- sc_res1
+        res[[paste0("scdegs_",ct,"_",PairGroups)]] <- sc_res2
+        res[[paste0("degs_",ct,"_",PairGroups)]] <- DEG1
+    }
+}
+
+#writeout
+saveRDS(res,"results/SC_SimDataEval/True_PB_SpearCor_DEresults_Cond_PBlimma_SplatPop90.rds")
+```
+
+# DE summary
+## P/FC sc-true correlations
+### sc level RST
+```{r message=FALSE, warning=FALSE}
+#rank sum test
+DE_res <- list.files("results/SC_SimDataEval/")
+DE_res <- DE_res[grep("TrueD_SC_SpearCor_DEresults",DE_res)]
+DE_res <- DE_res[grep("RST",DE_res)]
+DE_res <- DE_res[grep("SplatPop90|Mock90",DE_res)]
+
+p_sig <- data.frame()
+es_sig <- data.frame()
+
+for(x in DE_res){
+    tmppath <- paste0("results/SC_SimDataEval/",x)
+    tmp <- readRDS(tmppath)
+    Compare_names <- unique(sapply(names(tmp),function(x) strsplit(x,"true|sc|scdegs|degs")[[1]][2] ))
+    d_name <- strsplit(x,"RST_|\\.")[[1]][2]
+    p1_sig <- data.frame()
+    es1_sig <- data.frame()
+    for(y in Compare_names){
+        trueres <- paste0("true",y)
+        scres <- paste0("sc",y)
+        truedegs <- paste0("degs",y)
+        truedegs <- tmp[[truedegs]]
+        tmpres <- getAllEval(tmp[[trueres]][truedegs$gene,],tmp[[scres]][truedegs$gene,])
+        method_names <- rownames(tmpres$p)
+        p1_sig <- rbind(p1_sig,tmpres$p$all)
+    
+        tmp_fc <- tmp[[scres]][truedegs$gene,][,grep("\\.logFC",colnames(tmp[[scres]][truedegs$gene,]))]
+        tmp_fc <- as.data.frame(lapply(tmp_fc,getSCC2,truedegs$ES))
+        es1_sig <- rbind(es1_sig,tmp_fc)
+}
+    method_names <- sapply(method_names,function(x) strsplit(x,"\\.")[[1]][1] )
+    rownames(p1_sig) <- paste0(d_name,Compare_names)
+    colnames(p1_sig) <- method_names
+    rownames(es1_sig) <- paste0(d_name,Compare_names)
+    colnames(es1_sig) <- method_names
+    
+    p_sig <- rbind(p_sig,p1_sig)
+    es_sig <- rbind(es_sig,es1_sig)
+}
+
+p_sig
+es_sig
+```
+
+process data
+```{r}
+#tmp_data <- rownames(p_all_res)
+md_raw <- median(p_sig$raw)
+p_all_res <- as.data.frame(apply(p_sig[,-1],2,function(x) x-p_sig[,1] ))
+p_all_res$group <- rownames(p_all_res)
+
+es_all_res <- as.data.frame(apply(es_sig[,-1],2,function(x) x-es_sig[,1] ))
+es_all_res$group <- rownames(fc_all_res)
+
+p_all_res_melt <- data.table::melt(p_all_res,id.vars=c("group"))
+
+p_all_res_melt$Type <- "Deep learning based"
+p_all_res_melt[p_all_res_melt$variable%in%c("ccImpute","I_Impute","kNN_smoothing","MAGIC","MAGIC_log"),]$Type <- "Model or smoothing based"
+p_all_res_melt[p_all_res_melt$variable%in%c("ALRA","Bfimpute","afMF","scRMD"),]$Type <- "Matrix based"
+p_all_res_melt$Type <- factor(p_all_res_melt$Type,levels=c("Matrix based","Model or smoothing based","Deep learning based"))
+
+es_all_res_melt <- data.table::melt(es_all_res,id.vars=c("group"))
+
+es_all_res_melt$Type <- "Deep learning based"
+es_all_res_melt[es_all_res_melt$variable%in%c("ccImpute","I_Impute","kNN_smoothing","MAGIC","MAGIC_log"),]$Type <- "Model or smoothing based"
+es_all_res_melt[es_all_res_melt$variable%in%c("ALRA","Bfimpute","afMF","scRMD"),]$Type <- "Matrix based"
+es_all_res_melt$Type <- factor(es_all_res_melt$Type,levels=c("Matrix based","Model or smoothing based","Deep learning based"))
+
+```
+
+Box plot
+p_all_res
+```{r}
+#rank
+mdv <- p_all_res_melt %>% group_by(variable) %>% summarise(md=median(value,na.rm=TRUE))
+rank1 <- mdv[order(mdv$md),]$variable
+p_all_res_melt$Method <- as.character(p_all_res_melt$variable)
+p_all_res_melt$variable <- factor(p_all_res_melt$variable,levels=rank1)
+p_all_res_melt$group <- factor(p_all_res_melt$group,levels=rownames(p_all_res))
+neg_md <- sum(mdv$md<=0)
+
+#performed tests
+pv <- apply(p_sig[,-1],2,function(x) wilcox.test(p_sig[,1],x,alternative="less",paired=TRUE)$p.value )
+pv_sig <- sapply(pv,getPsig)
+pv_sig <- pv_sig[as.character(rank1)]
+
+tmp_bp <- p_all_res_melt[,]
+tmp_bp$value <- ifelse(tmp_bp$value<(-0.1),-0.1,tmp_bp$value)
+
+sim_p_deg_scc_bp_rst <- ggboxplot(tmp_bp,x="variable",y="value",fill="Type")+geom_hline(yintercept=0,linetype="dashed")+geom_vline(xintercept=neg_md+0.5,linetype="dashed")+xlab("Method")+ylab("SCC Difference")+ggtitle("Ground truth-Simulated SC DEGs Sign(P) Rank SCC Difference(Rank Sum)")+annotate(geom="text",x=c(1:length(pv_sig)),y=0.05,label=pv_sig,size=7)+annotate(geom="text",x=length(pv_sig)+2.3,y=0.01,label=paste0("Raw(Median=",round(md_raw,2),")"),size=4.5)+coord_cartesian(xlim=c(1,length(pv_sig)+3.5))+theme(plot.title=element_text(size=16),legend.title=element_text(size=15),legend.text=element_text(size=14),axis.title=element_text(size=18),axis.text.x=element_text(angle=90,size=15),axis.text.y=element_text(size=15))+scale_fill_brewer(palette="Set2")
+sim_p_deg_scc_bp_rst
+```
+
+### sc level MAST
+```{r message=FALSE, warning=FALSE}
+DE_res <- list.files("results/SC_SimDataEval/")
+DE_res <- DE_res[grep("TrueD_SC_SpearCor_DEresults",DE_res)]
+DE_res <- DE_res[grep("MAST",DE_res)]
+DE_res <- DE_res[grep("SplatPop90|Mock90",DE_res)]
+
+p_sig <- data.frame()
+es_sig <- data.frame()
+
+for(x in DE_res){
+    tmppath <- paste0("results/SC_SimDataEval/",x)
+    tmp <- readRDS(tmppath)
+    Compare_names <- unique(sapply(names(tmp),function(x) strsplit(x,"true|sc|scdegs|degs")[[1]][2] ))
+    d_name <- strsplit(x,"MAST_|\\.")[[1]][2]
+    p1_sig <- data.frame()
+    es1_sig <- data.frame()
+    for(y in Compare_names){
+        trueres <- paste0("true",y)
+        scres <- paste0("sc",y)
+        truedegs <- paste0("degs",y)
+        truedegs <- tmp[[truedegs]]
+        tmpres <- getAllEval(tmp[[trueres]][truedegs$gene,],tmp[[scres]][truedegs$gene,])
+        method_names <- rownames(tmpres$p)
+        p1_sig <- rbind(p1_sig,tmpres$p$all)
+    
+        tmp_fc <- tmp[[scres]][truedegs$gene,][,grep("\\.logFC",colnames(tmp[[scres]][truedegs$gene,]))]
+        tmp_fc <- as.data.frame(lapply(tmp_fc,getSCC2,truedegs$ES))
+        es1_sig <- rbind(es1_sig,tmp_fc)
+}
+    method_names <- sapply(method_names,function(x) strsplit(x,"\\.")[[1]][1] )
+    rownames(p1_sig) <- paste0(d_name,Compare_names)
+    colnames(p1_sig) <- method_names
+    rownames(es1_sig) <- paste0(d_name,Compare_names)
+    colnames(es1_sig) <- method_names
+    
+    p_sig <- rbind(p_sig,p1_sig)
+    es_sig <- rbind(es_sig,es1_sig)
+}
+
+p_sig
+es_sig
+```
+
+process data
+```{r}
+md_raw <- median(p_sig$raw)
+p_all_res <- as.data.frame(apply(p_sig[,-1],2,function(x) x-p_sig[,1] ))
+p_all_res$group <- rownames(p_all_res)
+
+fc_all_res <- as.data.frame(apply(fc_sig[,-1],2,function(x) x-fc_sig[,1] ))
+fc_all_res$group <- rownames(fc_all_res)
+
+es_all_res <- as.data.frame(apply(es_sig[,-1],2,function(x) x-es_sig[,1] ))
+es_all_res$group <- rownames(fc_all_res)
+
+p_all_res_melt <- data.table::melt(p_all_res,id.vars=c("group"))
+
+p_all_res_melt$Type <- "Deep learning based"
+p_all_res_melt[p_all_res_melt$variable%in%c("ccImpute","I_Impute","kNN_smoothing","MAGIC","MAGIC_log"),]$Type <- "Model or smoothing based"
+p_all_res_melt[p_all_res_melt$variable%in%c("ALRA","Bfimpute","afMF","scRMD"),]$Type <- "Matrix based"
+p_all_res_melt$Type <- factor(p_all_res_melt$Type,levels=c("Matrix based","Model or smoothing based","Deep learning based"))
+
+es_all_res_melt <- data.table::melt(es_all_res,id.vars=c("group"))
+
+es_all_res_melt$Type <- "Deep learning based"
+es_all_res_melt[es_all_res_melt$variable%in%c("ccImpute","I_Impute","kNN_smoothing","MAGIC","MAGIC_log"),]$Type <- "Model or smoothing based"
+es_all_res_melt[es_all_res_melt$variable%in%c("ALRA","Bfimpute","afMF","scRMD"),]$Type <- "Matrix based"
+es_all_res_melt$Type <- factor(es_all_res_melt$Type,levels=c("Matrix based","Model or smoothing based","Deep learning based"))
+```
+
+Box plot
+p_all_res
+```{r}
+#rank
+mdv <- p_all_res_melt %>% group_by(variable) %>% summarise(md=median(value,na.rm=TRUE))
+rank1 <- mdv[order(mdv$md),]$variable
+p_all_res_melt$Method <- as.character(p_all_res_melt$variable)
+p_all_res_melt$variable <- factor(p_all_res_melt$variable,levels=rank1)
+p_all_res_melt$group <- factor(p_all_res_melt$group,levels=rownames(p_all_res))
+neg_md <- sum(mdv$md<=0)
+
+#performed tests
+pv <- apply(p_sig[,-1],2,function(x) wilcox.test(p_sig[,1],x,alternative="less",paired=TRUE)$p.value )
+pv_sig <- sapply(pv,getPsig)
+pv_sig <- pv_sig[as.character(rank1)]
+
+tmp_bp <- p_all_res_melt[,]
+tmp_bp$value <- ifelse(tmp_bp$value<(-0.2),-0.2,tmp_bp$value)
+
+sim_p_deg_scc_bp_mast <- ggboxplot(tmp_bp,x="variable",y="value",fill="Type")+geom_hline(yintercept=0,linetype="dashed")+geom_vline(xintercept=neg_md+0.5,linetype="dashed")+xlab("Method")+ylab("SCC Difference")+ggtitle("Ground truth-Simulated SC DEGs Sign(P) Rank SCC Difference(MAST)")+annotate(geom="text",x=c(1:length(pv_sig)),y=0.23,label=pv_sig,size=7)+annotate(geom="text",x=length(pv_sig)+2.3,y=0.03,label=paste0("Raw(Median=",round(md_raw,2),")"),size=4.5)+coord_cartesian(xlim=c(1,length(pv_sig)+3.5))+theme(plot.title=element_text(size=16),legend.title=element_text(size=15),legend.text=element_text(size=14),axis.title=element_text(size=18),axis.text.x=element_text(angle=90,size=15),axis.text.y=element_text(size=15))+scale_fill_brewer(palette="Set2")
+sim_p_deg_scc_bp_mast
+```
+
+es_all_res
+```{r}
+#rank
+md_raw <- median(es_sig$raw)
+mdv <- es_all_res_melt %>% group_by(variable) %>% summarise(md=median(value,na.rm=TRUE))
+rank1 <- mdv[order(mdv$md),]$variable
+es_all_res_melt$Method <- as.character(es_all_res_melt$variable)
+es_all_res_melt$variable <- factor(es_all_res_melt$variable,levels=rank1)
+es_all_res_melt$group <- factor(es_all_res_melt$group,levels=rownames(es_all_res))
+neg_md <- sum(mdv$md<=0)
+
+#performed tests
+pv <- apply(es_sig[,-1],2,function(x) wilcox.test(es_sig[,1],x,alternative="less",paired=TRUE)$p.value )
+pv_sig <- sapply(pv,getPsig)
+pv_sig <- pv_sig[as.character(rank1)]
+
+tmp_bp <- es_all_res_melt[,]
+tmp_bp$value <- ifelse(tmp_bp$value<(-0.1),-0.1,tmp_bp$value)
+
+sim_es_deg_scc_bp_mast <- ggboxplot(tmp_bp,x="variable",y="value",fill="Type")+geom_hline(yintercept=0,linetype="dashed")+geom_vline(xintercept=neg_md+0.5,linetype="dashed")+xlab("Method")+ylab("SCC Difference")+ggtitle("Ground truth-Simulated SC DEGs logFC SCC Difference(MAST)")+annotate(geom="text",x=c(1:length(pv_sig)),y=0.07,label=pv_sig,size=7)+annotate(geom="text",x=length(pv_sig)+2.3,y=0.01,label=paste0("Raw(Median=",round(md_raw,2),")"),size=4.5)+coord_cartesian(xlim=c(1,length(pv_sig)+3.5))+theme(plot.title=element_text(size=16),legend.title=element_text(size=15),legend.text=element_text(size=14),axis.title=element_text(size=18),axis.text.x=element_text(angle=90,size=15),axis.text.y=element_text(size=15))+scale_fill_brewer(palette="Set2")
+sim_es_deg_scc_bp_mast
+```
+
+heatmap
+```{r}
+tmp_hm <- es_all_res_melt[,]
+tmp_hm$value <- ifelse(tmp_hm$value<(-0.1),-0.1,tmp_hm$value)
+colnames(tmp_hm)[3] <- "SCC_Difference"
+ggplot(tmp_hm,aes(variable,group,fill=SCC_Difference))+geom_tile()+theme(axis.text.x=element_text(angle=90))+scale_fill_gradient2(low="blue",mid="white",high="red",midpoint=0)+geom_vline(xintercept=neg_md+0.5,linetype="dashed")+xlab("Method")+ggtitle("Ground truth-imputed SC DEGs logFC SCC Difference")
+```
+
+### PB level limma
+```{r message=FALSE, warning=FALSE}
+DE_res <- list.files("results/SC_SimDataEval/")
+DE_res <- DE_res[grep("True_PB_SpearCor_DEresults",DE_res)]
+DE_res <- DE_res[grep("PBlimma",DE_res)]
+DE_res <- DE_res[grep("SplatPop90",DE_res)]
+
+p_sig <- data.frame()
+es_sig <- data.frame()
+
+for(x in DE_res){
+    tmppath <- paste0("results/SC_SimDataEval/",x)
+    tmp <- readRDS(tmppath)
+    Compare_names <- unique(sapply(names(tmp),function(x) strsplit(x,"true|sc|scdegs|degs")[[1]][2] ))
+    d_name <- strsplit(x,"PBlimma_|\\.")[[1]][2]
+    p1_sig <- data.frame()
+    es1_sig <- data.frame()
+    for(y in Compare_names){
+        trueres <- paste0("true",y)
+        scres <- paste0("sc",y)
+        truedegs <- paste0("degs",y)
+        truedegs <- tmp[[truedegs]]
+        tmpres <- getAllEval(tmp[[trueres]][truedegs$gene,],tmp[[scres]][truedegs$gene,])
+        method_names <- rownames(tmpres$p)
+        p1_sig <- rbind(p1_sig,tmpres$p$all)
+    
+        tmp_fc <- tmp[[scres]][truedegs$gene,][,grep("\\.logFC",colnames(tmp[[scres]][truedegs$gene,]))]
+        tmp_fc <- as.data.frame(lapply(tmp_fc,getSCC2,truedegs$ES))
+        es1_sig <- rbind(es1_sig,tmp_fc)
+}
+    method_names <- sapply(method_names,function(x) strsplit(x,"\\.")[[1]][1] )
+    rownames(p1_sig) <- paste0(d_name,Compare_names)
+    colnames(p1_sig) <- method_names
+    rownames(es1_sig) <- paste0(d_name,Compare_names)
+    colnames(es1_sig) <- method_names
+    
+    p_sig <- rbind(p_sig,p1_sig)
+    es_sig <- rbind(es_sig,es1_sig)
+}
+
+p_sig
+#es_sig
+```
+
+process data
+```{r}
+md_raw <- median(p_sig$raw)
+p_all_res <- as.data.frame(apply(p_sig[,-1],2,function(x) x-p_sig[,1] ))
+p_all_res$group <- rownames(p_all_res)
+
+es_all_res <- as.data.frame(apply(es_sig[,-1],2,function(x) x-es_sig[,1] ))
+es_all_res$group <- rownames(fc_all_res)
+
+p_all_res_melt <- data.table::melt(p_all_res,id.vars=c("group"))
+
+p_all_res_melt$Type <- "Deep learning based"
+p_all_res_melt[p_all_res_melt$variable%in%c("ccImpute","I_Impute","kNN_smoothing","MAGIC","MAGIC_log"),]$Type <- "Model or smoothing based"
+p_all_res_melt[p_all_res_melt$variable%in%c("ALRA","Bfimpute","afMF","scRMD"),]$Type <- "Matrix based"
+p_all_res_melt$Type <- factor(p_all_res_melt$Type,levels=c("Matrix based","Model or smoothing based","Deep learning based"))
+
+es_all_res_melt <- data.table::melt(es_all_res,id.vars=c("group"))
+
+es_all_res_melt$Type <- "Deep learning based"
+es_all_res_melt[es_all_res_melt$variable%in%c("ccImpute","I_Impute","kNN_smoothing","MAGIC","MAGIC_log"),]$Type <- "Model or smoothing based"
+es_all_res_melt[es_all_res_melt$variable%in%c("ALRA","Bfimpute","afMF","scRMD"),]$Type <- "Matrix based"
+es_all_res_melt$Type <- factor(es_all_res_melt$Type,levels=c("Matrix based","Model or smoothing based","Deep learning based"))
+```
+
+Box plot
+p_all_res
+```{r}
+#rank
+mdv <- p_all_res_melt %>% group_by(variable) %>% summarise(md=median(value,na.rm=TRUE))
+rank1 <- mdv[order(mdv$md),]$variable
+p_all_res_melt$Method <- as.character(p_all_res_melt$variable)
+p_all_res_melt$variable <- factor(p_all_res_melt$variable,levels=rank1)
+p_all_res_melt$group <- factor(p_all_res_melt$group,levels=rownames(p_all_res))
+neg_md <- sum(mdv$md<=0)
+
+tmp_bar <- p_all_res[,]
+tmp_bar <- as.data.frame(apply(tmp_bar[,-ncol(tmp_bar)],2,median))
+tmp_bar$methods <- rownames(tmp_bar)
+tmp_bar$Method <- rownames(tmp_bar)
+colnames(tmp_bar)[1] <- "SCC_Difference"
+tmp_bar$methods <- factor(tmp_bar$methods,levels=rank1)
+
+tmp_bar$Type <- "Deep learning based"
+tmp_bar[tmp_bar$method%in%c("ccImpute","I_Impute","kNN_smoothing","MAGIC","MAGIC_log"),]$Type <- "Model or smoothing based"
+tmp_bar[tmp_bar$method%in%c("ALRA","Bfimpute","afMF","scRMD"),]$Type <- "Matrix based"
+tmp_bar$Type <- factor(tmp_bar$Type,levels=c("Matrix based","Model or smoothing based","Deep learning based","Raw"))
+
+sim_p_deg_scc_bp_limma <- ggbarplot(tmp_bar,x="methods",y="SCC_Difference",fill="Type")+xlab("Method")+ylab("SCC Difference")+geom_hline(yintercept=0,linetype="dashed")+geom_vline(xintercept=neg_md+0.5,linetype="dashed")+ggtitle("Ground truth-Simulated PB DEGs Sign(P) Rank SCC Difference(PB-limma)(Median)")+annotate(geom="text",x=ncol(p_all_res)+1.2,y=0.01,label=paste0("Raw(Median=",round(md_raw,2),")"),size=4.5)+coord_cartesian(xlim=c(1,ncol(p_all_res)+2))+theme(plot.title=element_text(size=16),legend.title=element_text(size=15),legend.text=element_text(size=14),axis.title=element_text(size=18),axis.text.x=element_text(angle=90,size=15),axis.text.y=element_text(size=15))+scale_fill_brewer(palette="Set2")
+sim_p_deg_scc_bp_limma
+```
+
+es_all_res
+```{r}
+#rank
+md_raw <- median(es_sig$raw)
+mdv <- es_all_res_melt %>% group_by(variable) %>% summarise(md=median(value,na.rm=TRUE))
+rank1 <- mdv[order(mdv$md),]$variable
+es_all_res_melt$Method <- as.character(es_all_res_melt$variable)
+es_all_res_melt$variable <- factor(es_all_res_melt$variable,levels=rank1)
+es_all_res_melt$group <- factor(es_all_res_melt$group,levels=rownames(es_all_res))
+neg_md <- sum(mdv$md<=0)
+
+tmp_bar <- es_all_res[,]
+tmp_bar <- as.data.frame(apply(tmp_bar[,-ncol(tmp_bar)],2,median))
+tmp_bar$methods <- rownames(tmp_bar)
+tmp_bar$Method <- rownames(tmp_bar)
+colnames(tmp_bar)[1] <- "SCC_Difference"
+tmp_bar$methods <- factor(tmp_bar$methods,levels=rank1)
+
+tmp_bar$Type <- "Deep learning based"
+tmp_bar[tmp_bar$method%in%c("ccImpute","I_Impute","kNN_smoothing","MAGIC","MAGIC_log"),]$Type <- "Model or smoothing based"
+tmp_bar[tmp_bar$method%in%c("ALRA","Bfimpute","afMF","scRMD"),]$Type <- "Matrix based"
+tmp_bar$Type <- factor(tmp_bar$Type,levels=c("Matrix based","Model or smoothing based","Deep learning based","Raw"))
+
+sim_es_deg_scc_bp_limma <- ggbarplot(tmp_bar,x="methods",y="SCC_Difference",fill="Type")+xlab("Method")+ylab("SCC Difference")+geom_hline(yintercept=0,linetype="dashed")+geom_vline(xintercept=neg_md+0.5,linetype="dashed")+ggtitle("Ground truth-Simulated PB DEGs logFC Rank SCC Difference(PB-limma)(Median)")+annotate(geom="text",x=ncol(p_all_res)+1.2,y=0.01,label=paste0("Raw(Median=",round(md_raw,2),")"),size=4.5)+coord_cartesian(xlim=c(1,ncol(es_all_res)+2))+theme(plot.title=element_text(size=16),legend.title=element_text(size=15),legend.text=element_text(size=14),axis.title=element_text(size=18),axis.text.x=element_text(angle=90,size=15),axis.text.y=element_text(size=15))+scale_fill_brewer(palette="Set2")
+sim_es_deg_scc_bp_limma
+```
+
+heatmap
+```{r fig.width=4}
+tmp_hm <- es_all_res_melt[,]
+#tmp_hm$value <- ifelse(tmp_hm$value<(-0.1),-0.1,tmp_hm$value)
+colnames(tmp_hm)[3] <- "SCC_Difference"
+ggplot(tmp_hm,aes(variable,group,fill=SCC_Difference))+geom_tile()+theme(axis.text.x=element_text(angle=90))+scale_fill_gradient2(low="blue",mid="white",high="red",midpoint=0)+geom_vline(xintercept=neg_md+0.5,linetype="dashed")+xlab("Method")+ggtitle("Ground truth-imputed Pseudobulk DEGs logFC SCC Difference")
+```
+
+## improve significance
+### sc level RST
+read data
+```{r message=FALSE, warning=FALSE}
+#rank sum test
+DE_res <- list.files("results/SC_SimDataEval/")
+DE_res <- DE_res[grep("TrueD_SC_SpearCor_DEresults",DE_res)]
+DE_res <- DE_res[grep("RST",DE_res)]
+DE_res <- DE_res[grep("SplatPop90|Mock90",DE_res)]
+
+p_all <- data.frame()
+fc_all <- data.frame()
+improve_sig <- data.frame()
+
+for(x in DE_res){
+    tmppath <- paste0("results/SC_SimDataEval/",x)
+    tmp <- readRDS(tmppath)
+    Compare_names <- unique(sapply(names(tmp),function(x) strsplit(x,"true|sc|scdegs|degs")[[1]][2] ))
+    d_name <- strsplit(x,"RST_|\\.")[[1]][2]
+    p1_all <- data.frame()
+    fc1_all <- data.frame()
+    improve_sig1 <- data.frame()
+    for(y in Compare_names){
+        trueres <- paste0("true",y)
+        scres <- paste0("sc",y)
+        truedegs <- paste0("degs",y)
+        selectedGenes <- tmp[[truedegs]]$gene
+        topgenesP_sc <- tmp[[scres]][selectedGenes,grep("P.Value",colnames(tmp[[scres]]))]
+        method_names <- colnames(topgenesP_sc)
+        topgenesFC_sc <- tmp[[scres]][selectedGenes,grep("logFC",colnames(tmp[[scres]]))]
+        
+        p1_all <- rbind(p1_all,topgenesP_sc)
+        fc1_all <- rbind(fc1_all,topgenesFC_sc)
+        
+        improve_sig_tmp <- apply(topgenesP_sc[,-1],2,function(x) x<=topgenesP_sc[,1])
+        same_dir_tmp <- apply(topgenesFC_sc[,-1],2,function(x) x*tmp[[truedegs]]$ES>0)
+        improve_sig_tmp <- improve_sig_tmp + same_dir_tmp
+        improve_sig_tmp <- apply(improve_sig_tmp,2,function(x) sum(x==2)/length(x))
+        
+        improve_sig1 <- rbind(improve_sig1,improve_sig_tmp)
+    }
+    method_names <- sapply(method_names,function(x) strsplit(x,"\\.")[[1]][1] )
+    Compare_names <- paste0(d_name,Compare_names)
+    rownames(p1_all) <- paste0(Compare_names,"_",rownames(p1_all))
+    colnames(p1_all) <- method_names
+    rownames(fc1_all) <- paste0(Compare_names,"_",rownames(fc1_all))
+    colnames(fc1_all) <- method_names
+    rownames(improve_sig1) <- Compare_names
+    colnames(improve_sig1) <- method_names[-1]
+    
+    p_all <- rbind(p_all,p1_all)
+    fc_all <- rbind(fc_all,fc1_all)
+    improve_sig <- rbind(improve_sig,improve_sig1)
+}
+```
+
+process data
+```{r}
+improve_sig$group <- rownames(improve_sig)
+p_all$group <- rownames(p_all)
+fc_all$group <- rownames(fc_all)
+improve_sig_melt <- data.table::melt(improve_sig,id.vars=c("group"))
+
+improve_sig_melt$Type <- "Deep learning based"
+improve_sig_melt[improve_sig_melt$variable%in%c("ccImpute","I_Impute","kNN_smoothing","MAGIC","MAGIC_log"),]$Type <- "Model or smoothing based"
+improve_sig_melt[improve_sig_melt$variable%in%c("ALRA","Bfimpute","afMF","scRMD"),]$Type <- "Matrix based"
+improve_sig_melt$Type <- factor(improve_sig_melt$Type,levels=c("Matrix based","Model or smoothing based","Deep learning based"))
+
+head(improve_sig_melt)
+```
+
+Box plot
+p_all_res
+```{r}
+#rank
+mdv <- improve_sig_melt %>% group_by(variable) %>% summarise(md=median(value,na.rm=TRUE))
+rank1 <- mdv[order(mdv$md),]$variable
+improve_sig_melt$Method <- as.character(improve_sig_melt$variable)
+improve_sig_melt$variable <- factor(improve_sig_melt$variable,levels=rank1)
+improve_sig_melt$group <- factor(improve_sig_melt$group,levels=rownames(improve_sig))
+neg_md <- sum(mdv$md<=0.5)
+
+#performed tests
+pv <- apply(p_all[,-c(1,ncol(p_all))],2,function(x) wilcox.test(p_all[,1],x,alternative="greater",paired=TRUE)$p.value )
+pv_sig <- sapply(pv,getPsig)
+pv_sig <- pv_sig[as.character(rank1)]
+
+sim_deg_improve_bp_rst <- ggboxplot(improve_sig_melt,x="variable",y="value",fill="Type")+geom_hline(yintercept=0.5,linetype="dashed")+geom_vline(xintercept=neg_md+0.5,linetype="dashed")+xlab("Method")+ylab("Improved,%")+ggtitle("% of DEGs with improved significance(Rank Sum)")+theme(plot.title=element_text(size=16),legend.title=element_text(size=15),legend.text=element_text(size=14),axis.title=element_text(size=18),axis.text.x=element_text(angle=90,size=15),axis.text.y=element_text(size=15))+scale_fill_brewer(palette="Set2")
+sim_deg_improve_bp_rst
+```
+
+### sc level MAST
+read data
+```{r message=FALSE, warning=FALSE}
+#rank sum test
+DE_res <- list.files("results/SC_SimDataEval/")
+DE_res <- DE_res[grep("TrueD_SC_SpearCor_DEresults",DE_res)]
+DE_res <- DE_res[grep("MAST",DE_res)]
+DE_res <- DE_res[grep("SplatPop90|Mock90",DE_res)]
+
+p_all <- data.frame()
+fc_all <- data.frame()
+improve_sig <- data.frame()
+
+for(x in DE_res){
+    tmppath <- paste0("results/SC_SimDataEval/",x)
+    tmp <- readRDS(tmppath)
+    Compare_names <- unique(sapply(names(tmp),function(x) strsplit(x,"true|sc|scdegs|degs")[[1]][2] ))
+    d_name <- strsplit(x,"MAST_|\\.")[[1]][2]
+    p1_all <- data.frame()
+    fc1_all <- data.frame()
+    improve_sig1 <- data.frame()
+    for(y in Compare_names){
+        trueres <- paste0("true",y)
+        scres <- paste0("sc",y)
+        truedegs <- paste0("degs",y)
+        selectedGenes <- tmp[[truedegs]]$gene
+        topgenesP_sc <- tmp[[scres]][selectedGenes,grep("P.Value",colnames(tmp[[scres]]))]
+        method_names <- colnames(topgenesP_sc)
+        topgenesFC_sc <- tmp[[scres]][selectedGenes,grep("logFC",colnames(tmp[[scres]]))]
+        
+        p1_all <- rbind(p1_all,topgenesP_sc)
+        fc1_all <- rbind(fc1_all,topgenesFC_sc)
+        
+        improve_sig_tmp <- apply(topgenesP_sc[,-1],2,function(x) x<=topgenesP_sc[,1])
+        same_dir_tmp <- apply(topgenesFC_sc[,-1],2,function(x) x*tmp[[truedegs]]$ES>0)
+        improve_sig_tmp <- improve_sig_tmp + same_dir_tmp
+        improve_sig_tmp <- apply(improve_sig_tmp,2,function(x) sum(x==2,na.rm=TRUE)/length(x))
+        
+        improve_sig1 <- rbind(improve_sig1,improve_sig_tmp)
+    }
+    method_names <- sapply(method_names,function(x) strsplit(x,"\\.")[[1]][1] )
+    Compare_names <- paste0(d_name,Compare_names)
+    rownames(p1_all) <- paste0(Compare_names,"_",rownames(p1_all))
+    colnames(p1_all) <- method_names
+    rownames(fc1_all) <- paste0(Compare_names,"_",rownames(fc1_all))
+    colnames(fc1_all) <- method_names
+    rownames(improve_sig1) <- Compare_names
+    colnames(improve_sig1) <- method_names[-1]
+    
+    p_all <- rbind(p_all,p1_all)
+    fc_all <- rbind(fc_all,fc1_all)
+    improve_sig <- rbind(improve_sig,improve_sig1)
+}
+```
+
+process data
+```{r}
+improve_sig$group <- rownames(improve_sig)
+p_all$group <- rownames(p_all)
+fc_all$group <- rownames(fc_all)
+improve_sig_melt <- data.table::melt(improve_sig,id.vars=c("group"))
+
+improve_sig_melt$Type <- "Deep learning based"
+improve_sig_melt[improve_sig_melt$variable%in%c("ccImpute","I_Impute","kNN_smoothing","MAGIC","MAGIC_log"),]$Type <- "Model or smoothing based"
+improve_sig_melt[improve_sig_melt$variable%in%c("ALRA","Bfimpute","afMF","scRMD"),]$Type <- "Matrix based"
+improve_sig_melt$Type <- factor(improve_sig_melt$Type,levels=c("Matrix based","Model or smoothing based","Deep learning based"))
+
+head(improve_sig_melt)
+```
+
+Box plot
+p_all_res
+```{r}
+#rank
+mdv <- improve_sig_melt %>% group_by(variable) %>% summarise(md=median(value,na.rm=TRUE))
+rank1 <- mdv[order(mdv$md),]$variable
+improve_sig_melt$Method <- as.character(improve_sig_melt$variable)
+improve_sig_melt$variable <- factor(improve_sig_melt$variable,levels=rank1)
+improve_sig_melt$group <- factor(improve_sig_melt$group,levels=rownames(improve_sig))
+neg_md <- sum(mdv$md<=0.5)
+
+#performed tests
+pv <- apply(p_all[,-c(1,ncol(p_all))],2,function(x) wilcox.test(p_all[,1],x,alternative="greater",paired=TRUE)$p.value )
+pv_sig <- sapply(pv,getPsig)
+pv_sig <- pv_sig[as.character(rank1)]
+
+sim_deg_improve_bp_mast <- ggboxplot(improve_sig_melt,x="variable",y="value",fill="Type")+geom_hline(yintercept=0.5,linetype="dashed")+geom_vline(xintercept=neg_md+0.5,linetype="dashed")+xlab("Method")+ylab("Improved,%")+ggtitle("% of DEGs with improved significance(MAST)")+theme(plot.title=element_text(size=16),legend.title=element_text(size=15),legend.text=element_text(size=14),axis.title=element_text(size=18),axis.text.x=element_text(angle=90,size=15),axis.text.y=element_text(size=15))+scale_fill_brewer(palette="Set2")
+sim_deg_improve_bp_mast
+```
+
+heatmap
+```{r}
+tmp_hm <- improve_sig_melt[,]
+#tmp_hm$value <- ifelse(tmp_hm$value<(-0.2),-0.2,tmp_hm$value)
+colnames(tmp_hm)[3] <- "improved_significance"
+ggplot(tmp_hm,aes(variable,group,fill=improved_significance))+geom_tile()+theme(axis.text.x=element_text(angle=90))+scale_fill_gradient2(low="blue",mid="white",high="red",midpoint=0.5)+geom_vline(xintercept=neg_md+0.5,linetype="dashed")+xlab("Method")+ggtitle("Percentage of DEGs with improved significance")
+```
+
+### PB level limma
+read data
+```{r message=FALSE, warning=FALSE}
+#rank sum test
+DE_res <- list.files("results/SC_SimDataEval/")
+DE_res <- DE_res[grep("True_PB_SpearCor_DEresults",DE_res)]
+DE_res <- DE_res[grep("PBlimma",DE_res)]
+DE_res <- DE_res[grep("SplatPop90",DE_res)]
+
+p_all <- data.frame()
+fc_all <- data.frame()
+improve_sig <- data.frame()
+
+for(x in DE_res){
+    tmppath <- paste0("results/SC_SimDataEval/",x)
+    tmp <- readRDS(tmppath)
+    Compare_names <- unique(sapply(names(tmp),function(x) strsplit(x,"true|sc|scdegs|degs")[[1]][2] ))
+    d_name <- strsplit(x,"PBlimma_|\\.")[[1]][2]
+    p1_all <- data.frame()
+    fc1_all <- data.frame()
+    improve_sig1 <- data.frame()
+    for(y in Compare_names){
+        trueres <- paste0("true",y)
+        scres <- paste0("sc",y)
+        truedegs <- paste0("degs",y)
+        selectedGenes <- tmp[[truedegs]]$gene
+        topgenesP_sc <- tmp[[scres]][selectedGenes,grep("P.Value",colnames(tmp[[scres]]))]
+        method_names <- colnames(topgenesP_sc)
+        topgenesFC_sc <- tmp[[scres]][selectedGenes,grep("logFC",colnames(tmp[[scres]]))]
+        
+        p1_all <- rbind(p1_all,topgenesP_sc)
+        fc1_all <- rbind(fc1_all,topgenesFC_sc)
+        
+        improve_sig_tmp <- apply(topgenesP_sc[,-1],2,function(x) x<=topgenesP_sc[,1])
+        same_dir_tmp <- apply(topgenesFC_sc[,-1],2,function(x) x*tmp[[truedegs]]$ES>0)
+        improve_sig_tmp <- improve_sig_tmp + same_dir_tmp
+        improve_sig_tmp <- apply(improve_sig_tmp,2,function(x) sum(x==2)/length(x))
+        
+        improve_sig1 <- rbind(improve_sig1,improve_sig_tmp)
+    }
+    method_names <- sapply(method_names,function(x) strsplit(x,"\\.")[[1]][1] )
+    Compare_names <- paste0(d_name,Compare_names)
+    rownames(p1_all) <- paste0(Compare_names,"_",rownames(p1_all))
+    colnames(p1_all) <- method_names
+    rownames(fc1_all) <- paste0(Compare_names,"_",rownames(fc1_all))
+    colnames(fc1_all) <- method_names
+    rownames(improve_sig1) <- Compare_names
+    colnames(improve_sig1) <- method_names[-1]
+    
+    p_all <- rbind(p_all,p1_all)
+    fc_all <- rbind(fc_all,fc1_all)
+    improve_sig <- rbind(improve_sig,improve_sig1)
+}
+```
+
+process data
+```{r}
+improve_sig$group <- rownames(improve_sig)
+p_all$group <- rownames(p_all)
+fc_all$group <- rownames(fc_all)
+improve_sig_melt <- data.table::melt(improve_sig,id.vars=c("group"))
+
+improve_sig_melt$Type <- "Deep learning based"
+improve_sig_melt[improve_sig_melt$variable%in%c("ccImpute","I_Impute","kNN_smoothing","MAGIC","MAGIC_log"),]$Type <- "Model or smoothing based"
+improve_sig_melt[improve_sig_melt$variable%in%c("ALRA","Bfimpute","afMF","scRMD"),]$Type <- "Matrix based"
+improve_sig_melt$Type <- factor(improve_sig_melt$Type,levels=c("Matrix based","Model or smoothing based","Deep learning based"))
+
+head(improve_sig_melt)
+```
+
+Box plot
+p_all_res
+```{r}
+#rank
+mdv <- improve_sig_melt %>% group_by(variable) %>% summarise(md=median(value,na.rm=TRUE))
+rank1 <- mdv[order(mdv$md),]$variable
+improve_sig_melt$Method <- as.character(improve_sig_melt$variable)
+improve_sig_melt$variable <- factor(improve_sig_melt$variable,levels=rank1)
+improve_sig_melt$group <- factor(improve_sig_melt$group,levels=rownames(improve_sig))
+neg_md <- sum(mdv$md<=0.5)
+
+#performed tests
+pv <- apply(p_all[,-c(1,ncol(p_all))],2,function(x) wilcox.test(p_all[,1],x,alternative="greater",paired=TRUE)$p.value )
+pv_sig <- sapply(pv,getPsig)
+pv_sig <- pv_sig[as.character(rank1)]
+
+tmp_bar <- improve_sig[,]
+tmp_bar <- as.data.frame(apply(tmp_bar[,-ncol(tmp_bar)],2,median))
+tmp_bar$methods <- rownames(tmp_bar)
+tmp_bar$Method <- rownames(tmp_bar)
+colnames(tmp_bar)[1] <- "SCC_Difference"
+tmp_bar$methods <- factor(tmp_bar$methods,levels=rank1)
+
+tmp_bar$Type <- "Deep learning based"
+tmp_bar[tmp_bar$method%in%c("ccImpute","I_Impute","kNN_smoothing","MAGIC","MAGIC_log"),]$Type <- "Model or smoothing based"
+tmp_bar[tmp_bar$method%in%c("ALRA","Bfimpute","afMF","scRMD"),]$Type <- "Matrix based"
+tmp_bar$Type <- factor(tmp_bar$Type,levels=c("Matrix based","Model or smoothing based","Deep learning based","Raw"))
+
+sim_deg_improve_bp_limma <- ggbarplot(tmp_bar,x="methods",y="SCC_Difference",fill="Type")+geom_hline(yintercept=0.5,linetype="dashed")+geom_vline(xintercept=neg_md+0.5,linetype="dashed")+xlab("Method")+ylab("Improved,%")+ggtitle("% of DEGs with improved significance(PB-limma)(Median)")+theme(plot.title=element_text(size=16),legend.title=element_text(size=15),legend.text=element_text(size=14),axis.title=element_text(size=18),axis.text.x=element_text(angle=90,size=15),axis.text.y=element_text(size=15))+scale_fill_brewer(palette="Set2")
+sim_deg_improve_bp_limma
+```
+
+## AUC biomarker predictive performance
+### read data1
+```{r message=FALSE, warning=FALSE}
+##True data
+true_dat <- readRDS("rawcount_txt/simulated_data/rawRDS/Sim_Mock_G10kC1500_5UGroup_de0.5_dropout90.rds")
+true_datlog <- CreateSeuratObject(counts=true_dat@assays@data$TrueCounts,min.cells=0,min.features=0)
+true_datlog <- NormalizeData(true_datlog)
+true_datlog <- as.matrix(true_datlog@assays$RNA@data)
+
+##raw
+raw_dat <- true_dat@assays@data$counts
+##imputed
+MAGIC_dat <- fread("MAGIC/Sim_Mock_G10kC1500_5UGroup_de0.5_dropout90.tsv",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+MAGIC_dat <- as.matrix(MAGIC_dat,rownames=1)
+alra_dat <- fread("alra/Sim_Mock_G10kC1500_5UGroup_de0.5_dropout90_alra.txt",sep="\t",stringsAsFactors=FALSE)
+alra_dat <- as.matrix(alra_dat,rownames=1)
+dca_dat <- fread("dca/Sim_Mock_G10kC1500_5UGroup_de0.5_dropout90/mean.tsv",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+dca_dat <- as.matrix(dca_dat,rownames=1)
+MAGIClog_dat <- fread("MAGIC_log/Sim_Mock_G10kC1500_5UGroup_de0.5_dropout90.tsv",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+MAGIClog_dat <- as.matrix(MAGIClog_dat,rownames=1)
+afMF_dat <- fread("afMF/imputed_data/Sim_Mock_G10kC1500_5UGroup_de0.5_dropout90_sigma3_0_convergence_True.txt",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+afMF_dat <- as.matrix(afMF_dat,rownames=1)
+AutoClass_dat <- fread("AutoClass/Sim_Mock_G10kC1500_5UGroup_de0.5_dropout90_AC.txt",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+AutoClass_dat <- as.matrix(AutoClass_dat,rownames=1)
+ccImpute_dat <- fread("ccImpute/Sim_Mock_G10kC1500_5UGroup_de0.5_dropout90_cc.txt",sep="\t",stringsAsFactors=FALSE)
+ccImpute_dat <- as.matrix(ccImpute_dat,rownames=1)
+ks_dat <- fread("knn_smoothing/Sim_Mock_G10kC1500_5UGroup_de0.5_dropout90_ks.txt",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+ks_dat <- as.matrix(ks_dat,rownames=1)
+Iimpute_dat <- fread("I_Impute/Sim_Mock_G10kC1500_5UGroup_de0.5_dropout90_CImp.txt",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+Iimpute_dat <- as.matrix(Iimpute_dat,rownames=1)
+scRMDnorm_dat <- fread("scRMD/Sim_Mock_G10kC1500_5UGroup_de0.5_dropout90_scRMDlognorm.txt",sep="\t",stringsAsFactors=FALSE)
+scRMDnorm_dat <- as.matrix(scRMDnorm_dat,rownames=1)
+Bf_dat <- fread("Bfimpute/Sim_Mock_G10kC1500_5UGroup_de0.5_dropout90_Bf_specc.txt",sep="\t",stringsAsFactors=FALSE)
+Bf_dat <- as.matrix(Bf_dat,rownames=1)
+
+ExcludeGenes <- rownames(raw_dat)[!rownames(raw_dat)%in%rownames(dca_dat)]
+tmp <- matrix(rep(0,length(ExcludeGenes)*ncol(raw_dat)),nrow=length(ExcludeGenes),ncol=ncol(raw_dat))
+rownames(tmp) <- ExcludeGenes
+dca_dat <- as.matrix(rbind(dca_dat,tmp))
+dca_dat <- dca_dat[rownames(raw_dat),]
+
+metadat1 <- as.data.frame(colData(true_dat))
+gmetadat1 <- as.data.frame(rowData(true_dat))
+metadat1$Group <- as.character(metadat1$Group)
+```
+
+normalized/log2 data
+```{r}
+raw_dat <- CreateSeuratObject(counts=raw_dat,min.cells=0,min.features=0)
+raw_dat <- NormalizeData(raw_dat)
+raw_dat <- as.matrix(raw_dat@assays$RNA@data)
+
+dca_dat <- log2(dca_dat+min(dca_dat[dca_dat!=0]))
+
+ks_dat <- CreateSeuratObject(counts=ks_dat,min.cells=0,min.features=0)
+ks_dat <- NormalizeData(ks_dat)
+ks_dat <- as.matrix(ks_dat@assays$RNA@data)
+
+Iimpute_dat <- log2(Iimpute_dat+min(Iimpute_dat[Iimpute_dat!=0]))
+```
+
+combine normalized data
+```{r}
+dat1 <- list(raw=raw_dat,ALRA=alra_dat,AutoClass=AutoClass_dat,Bfimpute=Bf_dat,ccImpute=ccImpute_dat,DCA=dca_dat,I_Impute=Iimpute_dat,kNN_smoothing=ks_dat,MAGIC=MAGIC_dat,MAGIC_log=MAGIClog_dat,scRMD=scRMDnorm_dat,afMF=afMF_dat)
+rm(raw_dat)
+rm(alra_dat)
+rm(AutoClass_dat)
+rm(Bf_dat)
+rm(ccImpute_dat)
+rm(Iimpute_dat)
+rm(ks_dat)
+rm(dca_dat)
+rm(MAGIC_dat)
+rm(MAGIClog_dat)
+rm(scRMDnorm_dat)
+rm(afMF_dat)
+```
+
+### read data2
+```{r message=FALSE, warning=FALSE}
+##True data
+true_dat <- readRDS("rawcount_txt/simulated_data/rawRDS/Sim_splatPop_G8kC2k_3UGroup_2cond_simscale15_de0.5_cde0.38_dropout90.rds")
+true_datlog <- CreateSeuratObject(counts=true_dat@assays@data$TrueCounts,min.cells=0,min.features=0)
+true_datlog <- NormalizeData(true_datlog)
+true_datlog <- as.matrix(true_datlog@assays$RNA@data)
+
+##raw
+raw_dat <- as.matrix(true_dat@assays@data$counts)
+##imputed
+MAGIC_dat <- fread("MAGIC/Sim_splatPop_G8kC2k_3UGroup_2cond_simscale15_de0.5_cde0.38_dropout90.tsv",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+MAGIC_dat <- as.matrix(MAGIC_dat,rownames=1)
+alra_dat <- fread("alra/Sim_splatPop_G8kC2k_3UGroup_2cond_simscale15_de0.5_cde0.38_dropout90_alra.txt",sep="\t",stringsAsFactors=FALSE)
+alra_dat <- as.matrix(alra_dat,rownames=1)
+dca_dat <- fread("dca/Sim_splatPop_G8kC2k_3UGroup_2cond_simscale15_de0.5_cde0.38_dropout90/mean.tsv",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+dca_dat <- as.matrix(dca_dat,rownames=1)
+MAGIClog_dat <- fread("MAGIC_log/Sim_splatPop_G8kC2k_3UGroup_2cond_simscale15_de0.5_cde0.38_dropout90.tsv",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+MAGIClog_dat <- as.matrix(MAGIClog_dat,rownames=1)
+afMF_dat <- fread("afMF/imputed_data/Sim_splatPop_G8kC2k_3UGroup_2cond_simscale15_de0.5_cde0.38_dropout90_sigma3_0_convergence_True.txt",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+afMF_dat <- as.matrix(afMF_dat,rownames=1)
+AutoClass_dat <- fread("AutoClass/Sim_splatPop_G8kC2k_3UGroup_2cond_simscale15_de0.5_cde0.38_dropout90_AC.txt",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+AutoClass_dat <- as.matrix(AutoClass_dat,rownames=1)
+ccImpute_dat <- fread("ccImpute/Sim_splatPop_G8kC2k_3UGroup_2cond_simscale15_de0.5_cde0.38_dropout90_cc.txt",sep="\t",stringsAsFactors=FALSE)
+ccImpute_dat <- as.matrix(ccImpute_dat,rownames=1)
+ks_dat <- fread("knn_smoothing/Sim_splatPop_G8kC2k_3UGroup_2cond_simscale15_de0.5_cde0.38_dropout90_ks.txt",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+ks_dat <- as.matrix(ks_dat,rownames=1)
+Iimpute_dat <- fread("I_Impute/Sim_splatPop_G8kC2k_3UGroup_2cond_simscale15_de0.5_cde0.38_dropout90_CImp.txt",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+Iimpute_dat <- as.matrix(Iimpute_dat,rownames=1)
+scRMDnorm_dat <- fread("scRMD/Sim_splatPop_G8kC2k_3UGroup_2cond_simscale15_de0.5_cde0.38_dropout90_scRMDlognorm.txt",sep="\t",stringsAsFactors=FALSE)
+scRMDnorm_dat <- as.matrix(scRMDnorm_dat,rownames=1)
+Bf_dat <- fread("Bfimpute/Sim_splatPop_G8kC2k_3UGroup_2cond_simscale15_de0.5_cde0.38_dropout90_Bf_specc.txt",sep="\t",stringsAsFactors=FALSE)
+Bf_dat <- as.matrix(Bf_dat,rownames=1)
+
+ExcludeGenes <- rownames(raw_dat)[!rownames(raw_dat)%in%rownames(dca_dat)]
+tmp <- matrix(rep(0,length(ExcludeGenes)*ncol(raw_dat)),nrow=length(ExcludeGenes),ncol=ncol(raw_dat))
+rownames(tmp) <- ExcludeGenes
+dca_dat <- as.matrix(rbind(dca_dat,tmp))
+dca_dat <- dca_dat[rownames(raw_dat),]
+
+metadat2 <- as.data.frame(colData(true_dat))
+gmetadat2 <- as.data.frame(rowData(true_dat))
+metadat2$Group <- as.character(metadat2$Group)
+metadat2$Cell <- rownames(metadat2)
+
+colnames(raw_dat) <- metadat2$Cell
+colnames(MAGIC_dat) <- metadat2$Cell
+colnames(alra_dat) <- metadat2$Cell
+colnames(AutoClass_dat) <- metadat2$Cell
+colnames(Bf_dat) <- metadat2$Cell
+colnames(ccImpute_dat) <- metadat2$Cell
+colnames(dca_dat) <- metadat2$Cell
+colnames(Iimpute_dat) <- metadat2$Cell
+colnames(ks_dat) <- metadat2$Cell
+colnames(MAGIClog_dat) <- metadat2$Cell
+colnames(afMF_dat) <- metadat2$Cell
+colnames(scRMDnorm_dat) <- metadat2$Cell
+colnames(true_datlog) <- metadat2$Cell
+
+rownames(raw_dat) <- sub("_","-",rownames(raw_dat))
+rownames(MAGIC_dat) <- sub("_","-",rownames(MAGIC_dat))
+rownames(alra_dat) <- sub("_","-",rownames(alra_dat))
+rownames(AutoClass_dat) <- sub("_","-",rownames(AutoClass_dat))
+rownames(Bf_dat) <- sub("_","-",rownames(Bf_dat))
+rownames(ccImpute_dat) <- sub("_","-",rownames(ccImpute_dat))
+rownames(dca_dat) <- sub("_","-",rownames(dca_dat))
+rownames(Iimpute_dat) <- sub("_","-",rownames(Iimpute_dat))
+rownames(ks_dat) <- sub("_","-",rownames(ks_dat))
+rownames(MAGIClog_dat) <- sub("_","-",rownames(MAGIClog_dat))
+rownames(afMF_dat) <- sub("_","-",rownames(afMF_dat))
+rownames(scRMDnorm_dat) <- sub("_","-",rownames(scRMDnorm_dat))
+rownames(true_datlog) <- sub("_","-",rownames(true_datlog))
+
+rownames(gmetadat2) <- sub("_","-",rownames(gmetadat2))
+```
+
+normalized/log2 data
+```{r}
+raw_dat <- CreateSeuratObject(counts=raw_dat,min.cells=0,min.features=0)
+raw_dat <- NormalizeData(raw_dat)
+raw_dat <- as.matrix(raw_dat@assays$RNA@data)
+
+dca_dat <- log2(dca_dat+min(dca_dat[dca_dat!=0]))
+
+ks_dat <- CreateSeuratObject(counts=ks_dat,min.cells=0,min.features=0)
+ks_dat <- NormalizeData(ks_dat)
+ks_dat <- as.matrix(ks_dat@assays$RNA@data)
+
+Iimpute_dat <- log2(Iimpute_dat+min(Iimpute_dat[Iimpute_dat!=0]))
+```
+
+combine normalized data
+```{r}
+dat2 <- list(raw=raw_dat,ALRA=alra_dat,AutoClass=AutoClass_dat,Bfimpute=Bf_dat,ccImpute=ccImpute_dat,DCA=dca_dat,I_Impute=Iimpute_dat,kNN_smoothing=ks_dat,MAGIC=MAGIC_dat,MAGIC_log=MAGIClog_dat,scRMD=scRMDnorm_dat,afMF=afMF_dat)
+rm(raw_dat)
+rm(alra_dat)
+rm(AutoClass_dat)
+rm(Bf_dat)
+rm(ccImpute_dat)
+rm(Iimpute_dat)
+rm(ks_dat)
+rm(dca_dat)
+rm(MAGIC_dat)
+rm(MAGIClog_dat)
+rm(scRMDnorm_dat)
+rm(afMF_dat)
+```
+
+### process
+```{r}
+getAUC <- function(x,outcome){
+    tmp <- auc(outcome,x)
+    tmp <- attr(tmp,"roc")$auc
+    return(tmp)
+}
+```
+
+```{r message=FALSE, warning=FALSE}
+DEres <- readRDS("results/SC_SimDataEval/TrueD_SC_SpearCor_DEresults_RST_Mock90.rds")
+metadat1$Group <- as.character(metadat1$Group)
+
+celltypes <- as.character(unique(metadat1$Group))
+comb_celltype <- as.data.frame(combn(celltypes,2))
+auc_res1 <- data.frame()
+for(cb in 1:ncol(comb_celltype)){
+    DEGs <- names(DEres)[grepl(comb_celltype[1,cb],names(DEres))]
+    DEGs <- DEGs[grepl(comb_celltype[2,cb],DEGs)]
+    DEGs <- DEGs[grepl("^degs",DEGs)]
+    DEGs <- DEres[[DEGs]]$gene
+    selectedGenes <- DEGs[c(1:10,(length(DEGs)-9):length(DEGs))]
+    selectedCells <- metadat1[metadat1$Group%in%c(comb_celltype[1,cb],comb_celltype[2,cb]),"Cell"]
+    dat_AUC <- lapply(dat1,function(x) t(x[selectedGenes,selectedCells]))
+    pred_perform <- as.data.frame(lapply(dat_AUC,function(x) 
+        apply(x,2,getAUC,metadat1[selectedCells,"Group"])))
+    rownames(pred_perform) <- 
+        paste0(rownames(pred_perform),"_",comb_celltype[1,cb],"_",comb_celltype[2,cb],"_Mock90")
+    auc_res1 <- rbind(auc_res1,pred_perform)
+}
+
+
+DEres <- readRDS("results/SC_SimDataEval/TrueD_SC_SpearCor_DEresults_CellTypes_RST_SplatPop90.rds")
+metadat2$Group <- as.character(metadat2$Group)
+
+celltypes <- as.character(unique(metadat2$Group))
+comb_celltype <- as.data.frame(combn(celltypes,2))
+auc_res2 <- data.frame()
+for(cb in 1:ncol(comb_celltype)){
+    DEGs <- names(DEres)[grepl(comb_celltype[1,cb],names(DEres))]
+    DEGs <- DEGs[grepl(comb_celltype[2,cb],DEGs)]
+    DEGs <- DEGs[grepl("^degs",DEGs)]
+    DEGs <- DEres[[DEGs]]$gene
+    selectedGenes <- DEGs[c(1:10,(length(DEGs)-9):length(DEGs))]
+    selectedCells <- metadat2[metadat2$Group%in%c(comb_celltype[1,cb],comb_celltype[2,cb]),"Cell"]
+    dat_AUC <- lapply(dat2,function(x) t(x[selectedGenes,selectedCells]))
+    pred_perform <- as.data.frame(lapply(dat_AUC,function(x) 
+        apply(x,2,getAUC,metadat2[selectedCells,"Group"])))
+    rownames(pred_perform) <- 
+        paste0(rownames(pred_perform),"_",comb_celltype[1,cb],"_",comb_celltype[2,cb],"_SplatPop90")
+    auc_res2 <- rbind(auc_res2,pred_perform)
+}
+
+DEres <- readRDS("results/SC_SimDataEval/TrueD_SC_SpearCor_DEresults_Cond_RST_SplatPop90.rds")
+metadat2$Condition <- as.character(metadat2$Condition)
+
+status <- as.character(unique(metadat2$Condition))
+comb_status <- as.data.frame(combn(status,2))
+auc_res3 <- data.frame()
+for(cb in celltypes){
+    DEGs <- names(DEres)[grepl(cb,names(DEres))]
+    #DEGs <- DEGs[grepl(comb_celltype[2,cb],DEGs)]
+    DEGs <- DEGs[grepl("^degs",DEGs)]
+    DEGs <- DEres[[DEGs]]$gene
+    selectedGenes <- DEGs[c(1:10,(length(DEGs)-9):length(DEGs))]
+    selectedCells <- metadat2[metadat2$Group%in%c(cb),"Cell"]
+    dat_AUC <- lapply(dat2,function(x) t(x[selectedGenes,selectedCells]))
+    pred_perform <- as.data.frame(lapply(dat_AUC,function(x) 
+        apply(x,2,getAUC,metadat2[selectedCells,"Condition"])))
+    rownames(pred_perform) <- 
+        paste0(rownames(pred_perform),"_",cb,"_",comb_status[1,cb],"_",comb_status[2,cb],"_SplatPop90")
+    auc_res3 <- rbind(auc_res3,pred_perform)
+}
+
+#merge
+auc_res2 <- auc_res2[,colnames(auc_res1)]
+auc_res3 <- auc_res3[,colnames(auc_res1)]
+auc_res <- rbind(auc_res1,auc_res2,auc_res3)
+#auc_res <- auc_res1
+```
+
+process data
+```{r}
+md_raw <- median(auc_res$raw)
+auc_res_diff <- as.data.frame(apply(auc_res[,-1],2,function(x) x-auc_res[,1] ))
+auc_res_diff$group <- rownames(auc_res_diff)
+auc_res_diff <- data.table::melt(auc_res_diff,id.vars=c("group"))
+
+auc_res_diff$Type <- "Deep learning based"
+auc_res_diff[auc_res_diff$variable%in%c("ccImpute","I_Impute","kNN_smoothing","MAGIC","MAGIC_log"),]$Type <- "Model or smoothing based"
+auc_res_diff[auc_res_diff$variable%in%c("ALRA","Bfimpute","afMF","scRMD"),]$Type <- "Matrix based"
+auc_res_diff$Type <- factor(auc_res_diff$Type,levels=c("Matrix based","Model or smoothing based","Deep learning based"))
+
+head(auc_res_diff)
+```
+
+Box plot(all)
+auc_res_diff
+```{r}
+mdv <- auc_res_diff %>% group_by(variable) %>% summarise(md=median(value,na.rm=TRUE))
+rank1 <- mdv[order(mdv$md),]$variable
+auc_res_diff$Method <- as.character(auc_res_diff$variable)
+auc_res_diff$variable <- factor(auc_res_diff$variable,levels=rank1)
+neg_md <- sum(mdv$md<=0)
+
+#performed tests
+pv <- apply(auc_res[,-1],2,function(x) wilcox.test(auc_res[,1],x,alternative="less",paired=TRUE)$p.value )
+pv_sig <- sapply(pv,getPsig)
+pv_sig <- pv_sig[as.character(rank1)]
+
+tmp_title <- paste0("Biomarker(n=",nrow(auc_res),") Predictive Performance-AUC Difference")
+
+sim_auc_deg_bp <- ggboxplot(auc_res_diff,x="variable",y="value",fill="Type")+geom_hline(yintercept=0,linetype="dashed")+geom_vline(xintercept=neg_md+0.5,linetype="dashed")+xlab("Method")+ylab("AUC Difference")+ggtitle(tmp_title)+annotate(geom="text",x=length(pv_sig)+2,y=0.05,label=paste0("Raw(Median=",round(md_raw,2),")"),size=4.5)+coord_cartesian(xlim=c(1,length(pv_sig)+3))+annotate(geom="text",x=c(1:length(pv_sig)),y=0.75,label=pv_sig,size=7)+theme(plot.title=element_text(size=16),legend.title=element_text(size=15),legend.text=element_text(size=14),axis.title=element_text(size=18),axis.text.x=element_text(angle=90,size=15),axis.text.y=element_text(size=15))+scale_fill_brewer(palette="Set2")
+sim_auc_deg_bp
+```
+
+
+## classification
+function
+```{r}
+evalAcc <- function(rf,label){
+    acc <- sum(rf$test$predicted==label)/length(label)
+    return(acc)
+}
+
+evalmedianF1 <- function(rf,label){
+    tmp <- confusionMatrix(factor(label,levels=levels(rf$test$predicted)),rf$test$predicted,mode="everything")
+    tmp <- median(tmp$byClass[,"F1"],na.rm=TRUE)
+    return(tmp)
+}
+
+evalProb <- function(rf){
+    maxprob <- apply(rf$test$votes,1,max)
+    return(maxprob)
+}
+
+evalF1 <- function(rf,label){
+    tmp <- confusionMatrix(factor(label,levels=levels(rf$test$predicted)),rf$test$predicted,mode="everything")
+    tmp <- tmp$byClass[,"F1"]
+    return(tmp)
+}
+
+evalF1TwoClass <- function(rf,label){
+    tmp <- confusionMatrix(factor(label,levels=levels(rf$test$predicted)),rf$test$predicted,mode="everything")
+    tmp <- tmp$byClass["F1"]
+    return(tmp)
+}
+
+trainModel <- function(x,selectedG,meta,labelcol,splitsp){
+    tmp <- x
+    tmp <- tmp[,selectedG]
+    tmp$label <- meta[,labelcol]
+    colnames(tmp) <- stringr::str_replace(colnames(tmp),"-","_")
+    trainset <- subset(tmp,splitsp==TRUE)
+    testset <- subset(tmp,splitsp==FALSE)
+    rf <- randomForest(x=trainset[,1:(ncol(trainset)-1)],y=as.factor(trainset$label),xtest=testset[,1:(ncol(testset)-1)],ytest=as.factor(testset$label))
+    return(list(rf=rf,label=testset$label))
+}
+
+```
+
+process data
+```{r message=FALSE, warning=FALSE}
+#mock90
+tmp1 <- rownames(gmetadat1[order(abs(gmetadat1$DEFacGroup1),decreasing=TRUE),])[1:10]
+tmp2 <- rownames(gmetadat1[order(abs(gmetadat1$DEFacGroup2),decreasing=TRUE),])[1:10]
+tmp3 <- rownames(gmetadat1[order(abs(gmetadat1$DEFacGroup3),decreasing=TRUE),])[1:10]
+tmp4 <- rownames(gmetadat1[order(abs(gmetadat1$DEFacGroup4),decreasing=TRUE),])[1:10]
+tmp5 <- rownames(gmetadat1[order(abs(gmetadat1$DEFacGroup5),decreasing=TRUE),])[1:10]
+
+selectedGenes <- unique(c(tmp1,tmp2,tmp3,tmp4,tmp5))
+
+dat_c <- lapply(dat1,function(x) as.data.frame(t(x)))
+set.seed(1)
+splitsample <- sample.split(metadat1$Group,SplitRatio=0.7)
+
+class_res <- lapply(dat_c,trainModel,selectedGenes,metadat1,"Group",splitsample)
+
+##accracy
+res_acc1 <- as.data.frame(lapply(class_res,function(x) evalAcc(x$rf,x$label) ))
+res_acc1 <- as.data.frame(t(res_acc1))
+
+#cell type probablibility
+res_prob1 <- as.data.frame(lapply(class_res,function(x) evalProb(x$rf) ))
+res_truect1 <- as.data.frame(lapply(class_res,function(x) x$rf$test$predicted==x$label))
+res_truect1 <- as.data.frame(apply(res_truect1[,-1],2,function(x) x*res_truect1[,1])) ##both raw and imputed are true label
+rownames(res_truect1) <- rownames(res_prob1)
+
+#SplatPop90 celltypes
+tmp1 <- rownames(gmetadat2[order(abs(gmetadat2$GroupDE.Group1),decreasing=TRUE),])[1:10]
+tmp2 <- rownames(gmetadat2[order(abs(gmetadat2$GroupDE.Group2),decreasing=TRUE),])[1:10]
+tmp3 <- rownames(gmetadat2[order(abs(gmetadat2$GroupDE.Group3),decreasing=TRUE),])[1:10]
+
+selectedGenes <- unique(c(tmp1,tmp2,tmp3))
+
+dat_c <- lapply(dat2,function(x) as.data.frame(t(x)))
+set.seed(1)
+splitsample <- sample.split(metadat2$Group,SplitRatio=0.7)
+
+class_res <- lapply(dat_c,trainModel,selectedGenes,metadat2,"Group",splitsample)
+
+##accracy
+res_acc2 <- as.data.frame(lapply(class_res,function(x) evalAcc(x$rf,x$label) ))
+res_acc2 <- as.data.frame(t(res_acc2))
+
+#cell type probablibility
+res_prob2 <- as.data.frame(lapply(class_res,function(x) evalProb(x$rf) ))
+res_truect2 <- as.data.frame(lapply(class_res,function(x) x$rf$test$predicted==x$label))
+res_truect2 <- as.data.frame(apply(res_truect2[,-1],2,function(x) x*res_truect2[,1])) ##both raw and imputed are true label
+rownames(res_truect2) <- rownames(res_prob2)
+
+#SplatPop90 cond
+tmp1 <- rownames(gmetadat2[order(abs(gmetadat2$ConditionDE.Condition1),decreasing=TRUE),])[1:10]
+tmp2 <- rownames(gmetadat2[order(abs(gmetadat2$ConditionDE.Condition2),decreasing=TRUE),])[1:10]
+
+selectedGenes <- unique(c(tmp1,tmp2))
+
+dat_c <- lapply(dat2,function(x) as.data.frame(t(x)))
+set.seed(1)
+splitsample <- sample.split(metadat2$Condition,SplitRatio=0.7)
+
+class_res <- lapply(dat_c,trainModel,selectedGenes,metadat2,"Condition",splitsample)
+
+##accracy
+res_acc3 <- as.data.frame(lapply(class_res,function(x) evalAcc(x$rf,x$label) ))
+res_acc3 <- as.data.frame(t(res_acc3))
+
+#cell type probablibility
+res_prob3 <- as.data.frame(lapply(class_res,function(x) evalProb(x$rf) ))
+res_truect3 <- as.data.frame(lapply(class_res,function(x) x$rf$test$predicted==x$label))
+res_truect3 <- as.data.frame(apply(res_truect3[,-1],2,function(x) x*res_truect3[,1])) ##both raw and imputed are true label
+rownames(res_truect3) <- rownames(res_prob3)
+
+#merge
+res_acc2 <- res_acc2[rownames(res_acc1),]
+res_acc3 <- res_acc3[rownames(res_acc1),]
+res_acc <- cbind(res_acc1,res_acc2,res_acc3)
+
+res_prob2 <- res_prob2[,colnames(res_prob1)]
+res_prob3 <- res_prob3[,colnames(res_prob1)]
+res_prob <- rbind(res_prob1,res_prob2,res_prob3)
+
+res_truect2 <- res_truect2[,colnames(res_truect1)]
+res_truect3 <- res_truect3[,colnames(res_truect1)]
+res_truect <- rbind(res_truect1,res_truect2,res_truect3)
+
+res_hprob <- apply(res_prob[,-1],2,function(x) x>res_prob[,1])
+res_hprob <- res_hprob*res_truect
+res_hprob <- sapply(c(1:(length(dat1)-1)),function(i) 
+    sum(res_hprob[,i],na.rm=TRUE)/sum(res_truect[,i],na.rm=TRUE))
+#res_hprob1 <- apply(res_hprob1,2,function(x) sum(x)/nrow(res_hprob1))
+
+res_eprob <- apply(res_prob[,-1],2,function(x) x==res_prob[,1])
+res_eprob <- res_eprob*res_truect
+res_eprob <- sapply(c(1:(length(dat1)-1)),function(i) 
+    sum(res_eprob[,i],na.rm=TRUE)/sum(res_truect[,i],na.rm=TRUE))
+#lower ct max prob
+res_lprob <- 1-res_hprob-res_eprob
+
+res_allprob <- data.frame(higher=res_hprob,equal=res_eprob,lower=res_lprob)
+rownames(res_allprob) <- colnames(res_prob[,-1])
+```
+
+process
+```{r}
+res_acc_mean <- as.data.frame(apply(res_acc,1,mean,na.rm=TRUE))
+res_acc_mean$method <- rownames(res_acc_mean)
+colnames(res_acc_mean)[1] <- "mean_acc"
+head(res_acc_mean)
+
+res_allprob$method <- rownames(res_allprob)
+res_allprob_melt <- data.table::melt(res_allprob,id.vars=c("method"))
+
+head(res_allprob_melt)
+```
+
+Bar plot for accuracy
+res_acc_mean
+```{r}
+rank1 <- res_acc_mean[order(res_acc_mean$mean_acc),]$method
+res_acc_mean$Method <- factor(res_acc_mean$method,levels=c("raw",res_acc_mean$method[-1][order(res_acc_mean$method[-1])]))
+res_acc_mean$method <- factor(res_acc_mean$method,levels=rank1)
+
+res_acc_mean$Type <- "Deep learning based"
+res_acc_mean[res_acc_mean$method%in%c("ccImpute","I_Impute","kNN_smoothing","MAGIC","MAGIC_log"),]$Type <- "Model or smoothing based"
+res_acc_mean[res_acc_mean$method%in%c("ALRA","Bfimpute","afMF","scRMD"),]$Type <- "Matrix based"
+res_acc_mean[res_acc_mean$method%in%c("raw"),]$Type <- "Raw"
+res_acc_mean$Type <- factor(res_acc_mean$Type,levels=c("Matrix based","Model or smoothing based","Deep learning based","Raw"))
+
+sim_class_acc_bp <- ggbarplot(res_acc_mean,x="method",y="mean_acc",fill="Type",ylab="Accuracy",xlab="Method")+coord_cartesian(ylim=c(min(res_acc_mean$mean_acc),1))+ggtitle("Cell type/Conditions Classification Accuracy(Random Forest)")+theme(plot.title=element_text(size=16),legend.title=element_text(size=15),legend.text=element_text(size=14),axis.title=element_text(size=18),axis.text.x=element_text(angle=90,size=15),axis.text.y=element_text(size=15),legend.position="right")+scale_fill_brewer(palette="Set2")
+sim_class_acc_bp
+```
+
+stacked bar plot for prob
+res_allprob_melt
+```{r fig.width=4}
+rank1 <- res_allprob[order(res_allprob$higher),]$method
+res_allprob_melt$method <- factor(res_allprob_melt$method,levels=rank1)
+
+sim_class_prob_bp <- ggplot(res_allprob_melt,aes_string(x="method",y="value",fill="variable"))+geom_bar(stat="identity")+ggtitle("Random Forest True Prediction Probability")+ylab("% of probability group")+coord_cartesian(ylim=c(0,1))+guides(fill=guide_legend(title="Probability"))+scale_fill_manual(values=c("darkorange","goldenrod1","dodgerblue"))+xlab("Method")+theme(plot.title=element_text(size=16),legend.title=element_text(size=15),legend.text=element_text(size=14),axis.title=element_text(size=18),axis.text.x=element_text(angle=90,size=15),axis.text.y=element_text(size=15))
+sim_class_prob_bp
+```
+
+# Cell type annotation
+annotation evaluation
+```{r}
+evalCellTypeAcc <- function(x,metad){
+    acc <- sum(x$cell_labels==metad$Group)/nrow(metad)
+    return(acc)
+}
+
+evalEachCellTypeAcc <- function(x,metad){
+    celltypes <- unique(metad$Group)
+    predCT <- c()
+    for(y in celltypes){
+        tmp_ct <- which(metad$Group==y)
+        tmp_x <- x$cell_labels[tmp_ct]
+        acc <- sum(tmp_x==metad[tmp_ct,"Group"])/nrow(metad[tmp_ct,])
+        predCT <- c(predCT,acc)
+    }
+    return(predCT)
+}
+
+evalCellTypeProb <- function(x,metad){
+    maxprob <- apply(x$probabilities,2,max)
+    return(maxprob)
+}
+
+evalCellTypemedianF1 <- function(x,metad){
+    tmp <- confusionMatrix(factor(x$cell_labels,levels=levels(metad$Group)),metad$Group,mode="everything")
+    tmp <- median(tmp$byClass[,"F1"],na.rm=TRUE)
+    return(tmp)
+}
+
+evalCellTypeF1 <- function(x,metad){
+    tmp <- confusionMatrix(factor(x$cell_labels,levels=levels(metad$Group)),metad$Group,mode="everything")
+    tmp <- tmp$byClass[,"F1"]
+    return(tmp)
+}
+
+evalUnknownRate <- function(x){
+    tmp <- sum(x$cell_labels=="unknown")/length(x$cell_labels)
+    return(tmp)
+}
+
+getPsig <- function(x){
+    if(x>0.1){
+        return(" ")
+    }else if(x<=0.0005){
+        return("***")
+    }else if(x<=0.005){
+        return("**")
+    }else if(x<=0.05){
+        return("*")
+    }else if(x<=0.1){
+        return(".")
+    }
+}
+```
+
+## mock90
+### preprocess
+```{r message=FALSE, warning=FALSE}
+##True data
+true_dat <- readRDS("rawcount_txt/simulated_data/rawRDS/Sim_Mock_G10kC1500_5UGroup_de0.5_dropout90.rds")
+true_datlog <- CreateSeuratObject(counts=true_dat@assays@data$TrueCounts,min.cells=0,min.features=0)
+true_datlog <- NormalizeData(true_datlog)
+true_datlog <- as.matrix(true_datlog@assays$RNA@data)
+
+##raw
+raw_dat <- true_dat@assays@data$counts
+##imputed
+MAGIC_dat <- fread("MAGIC/Sim_Mock_G10kC1500_5UGroup_de0.5_dropout90.tsv",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+MAGIC_dat <- as.matrix(MAGIC_dat,rownames=1)
+alra_dat <- fread("alra/Sim_Mock_G10kC1500_5UGroup_de0.5_dropout90_alra.txt",sep="\t",stringsAsFactors=FALSE)
+alra_dat <- as.matrix(alra_dat,rownames=1)
+dca_dat <- fread("dca/Sim_Mock_G10kC1500_5UGroup_de0.5_dropout90/mean.tsv",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+dca_dat <- as.matrix(dca_dat,rownames=1)
+MAGIClog_dat <- fread("MAGIC_log/Sim_Mock_G10kC1500_5UGroup_de0.5_dropout90.tsv",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+MAGIClog_dat <- as.matrix(MAGIClog_dat,rownames=1)
+afMF_dat <- fread("afMF/imputed_data/Sim_Mock_G10kC1500_5UGroup_de0.5_dropout90_sigma3_0_convergence_True.txt",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+afMF_dat <- as.matrix(afMF_dat,rownames=1)
+AutoClass_dat <- fread("AutoClass/Sim_Mock_G10kC1500_5UGroup_de0.5_dropout90_AC.txt",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+AutoClass_dat <- as.matrix(AutoClass_dat,rownames=1)
+ccImpute_dat <- fread("ccImpute/Sim_Mock_G10kC1500_5UGroup_de0.5_dropout90_cc.txt",sep="\t",stringsAsFactors=FALSE)
+ccImpute_dat <- as.matrix(ccImpute_dat,rownames=1)
+ks_dat <- fread("knn_smoothing/Sim_Mock_G10kC1500_5UGroup_de0.5_dropout90_ks.txt",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+ks_dat <- as.matrix(ks_dat,rownames=1)
+Iimpute_dat <- fread("I_Impute/Sim_Mock_G10kC1500_5UGroup_de0.5_dropout90_CImp.txt",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+Iimpute_dat <- as.matrix(Iimpute_dat,rownames=1)
+scRMDnorm_dat <- fread("scRMD/Sim_Mock_G10kC1500_5UGroup_de0.5_dropout90_scRMDlognorm.txt",sep="\t",stringsAsFactors=FALSE)
+scRMDnorm_dat <- as.matrix(scRMDnorm_dat,rownames=1)
+Bf_dat <- fread("Bfimpute/Sim_Mock_G10kC1500_5UGroup_de0.5_dropout90_Bf_specc.txt",sep="\t",stringsAsFactors=FALSE)
+Bf_dat <- as.matrix(Bf_dat,rownames=1)
+
+ExcludeGenes <- rownames(raw_dat)[!rownames(raw_dat)%in%rownames(dca_dat)]
+tmp <- matrix(rep(0,length(ExcludeGenes)*ncol(raw_dat)),nrow=length(ExcludeGenes),ncol=ncol(raw_dat))
+rownames(tmp) <- ExcludeGenes
+dca_dat <- as.matrix(rbind(dca_dat,tmp))
+dca_dat <- dca_dat[rownames(raw_dat),]
+
+metadat <- as.data.frame(colData(true_dat))
+gmetadat <- as.data.frame(rowData(true_dat))
+#metadat$Group <- as.character(metadat$Group)
+```
+
+normalized/log2 data
+```{r}
+raw_dat <- CreateSeuratObject(counts=raw_dat,min.cells=0,min.features=0)
+raw_dat <- NormalizeData(raw_dat)
+raw_dat <- as.matrix(raw_dat@assays$RNA@data)
+
+dca_dat <- log2(dca_dat+min(dca_dat[dca_dat!=0]))
+
+ks_dat <- CreateSeuratObject(counts=ks_dat,min.cells=0,min.features=0)
+ks_dat <- NormalizeData(ks_dat)
+ks_dat <- as.matrix(ks_dat@assays$RNA@data)
+
+Iimpute_dat <- log2(Iimpute_dat+min(Iimpute_dat[Iimpute_dat!=0]))
+```
+
+combine normalized data
+```{r}
+dat <- list(raw=raw_dat,ALRA=alra_dat,AutoClass=AutoClass_dat,Bfimpute=Bf_dat,ccImpute=ccImpute_dat,DCA=dca_dat,I_Impute=Iimpute_dat,kNN_smoothing=ks_dat,MAGIC=MAGIC_dat,MAGIC_log=MAGIClog_dat,scRMD=scRMDnorm_dat,afMF=afMF_dat)
+rm(raw_dat)
+rm(alra_dat)
+rm(AutoClass_dat)
+rm(Bf_dat)
+rm(ccImpute_dat)
+rm(Iimpute_dat)
+rm(ks_dat)
+rm(dca_dat)
+rm(MAGIC_dat)
+rm(MAGIClog_dat)
+rm(scRMDnorm_dat)
+rm(afMF_dat)
+```
+
+
+read marker files
+```{r}
+#positive marker only
+tmp1 <- gmetadat[gmetadat$DEFacGroup1>1&gmetadat$DEFacGroup2<=1&gmetadat$DEFacGroup3<=1&gmetadat$DEFacGroup4<=1&gmetadat$DEFacGroup5<=1,]
+tmp1 <- rownames(tmp1[order(tmp1$DEFacGroup1,decreasing=TRUE),])[1:10]
+tmp2 <- gmetadat[gmetadat$DEFacGroup2>1&gmetadat$DEFacGroup1<=1&gmetadat$DEFacGroup3<=1&gmetadat$DEFacGroup4<=1&gmetadat$DEFacGroup5<=1,]
+tmp2 <- rownames(tmp2[order(tmp2$DEFacGroup2,decreasing=TRUE),])[1:10]
+tmp3 <- gmetadat[gmetadat$DEFacGroup3>1&gmetadat$DEFacGroup2<=1&gmetadat$DEFacGroup1<=1&gmetadat$DEFacGroup4<=1&gmetadat$DEFacGroup5<=1,]
+tmp3 <- rownames(tmp3[order(tmp3$DEFacGroup3,decreasing=TRUE),])[1:10]
+tmp4 <- gmetadat[gmetadat$DEFacGroup4>1&gmetadat$DEFacGroup2<=1&gmetadat$DEFacGroup3<=1&gmetadat$DEFacGroup1<=1&gmetadat$DEFacGroup5<=1,]
+tmp4 <- rownames(tmp4[order(tmp4$DEFacGroup4,decreasing=TRUE),])[1:10]
+tmp5 <- gmetadat[gmetadat$DEFacGroup5>1&gmetadat$DEFacGroup2<=1&gmetadat$DEFacGroup3<=1&gmetadat$DEFacGroup4<=1&gmetadat$DEFacGroup1<=1,]
+tmp5 <- rownames(tmp5[order(tmp5$DEFacGroup5,decreasing=TRUE),])[1:10]
+
+marker_list1 <- list(Group1=tmp1,Group2=tmp2,Group3=tmp3,Group4=tmp4,Group5=tmp5)
+metadat$Group_f <- factor(metadat$Group,levels=c("Group1","Group2","Group3","Group4","Group5"))
+```
+
+### SCINA
+run annotation(SCINA)
+```{r}
+res <- lapply(dat,SCINA,marker_list1)
+```
+
+evaluation
+```{r}
+##accracy
+res_acc1 <- as.data.frame(lapply(res,evalCellTypeAcc,metadat))
+res_acc1 <- as.data.frame(t(res_acc1))
+res_acc1
+
+res_acc2 <- as.data.frame(lapply(res,evalEachCellTypeAcc,metadat))
+res_acc2 <- as.data.frame(t(res_acc2))
+res_acc2
+
+#F1
+res_mf1 <- as.data.frame(lapply(res,evalCellTypemedianF1,metadat))
+res_mf1 <- as.data.frame(t(res_mf1))
+res_mf1
+
+res_f1 <- as.data.frame(lapply(res,evalCellTypeF1,metadat))
+res_f1 <- as.data.frame(t(res_f1))
+res_f1
+
+#cell type probablibility
+res_prob1 <- as.data.frame(lapply(res,evalCellTypeProb,metadat))
+res_truect <- as.data.frame(lapply(res,function(x) x$cell_labels==metadat$Group))
+res_truect2 <- apply(res_truect[,-1],2,function(x) x*res_truect[,1]) ##both raw and imputed are true label
+
+res_hprob1 <- apply(res_prob1[,-1],2,function(x) x>res_prob1[,1])
+res_hprob1 <- res_hprob1*res_truect2
+res_hprob1 <- sapply(c(1:(length(dat)-1)),function(i) sum(res_hprob1[,i])/sum(res_truect2[,i]))
+#res_hprob1 <- apply(res_hprob1,2,function(x) sum(x)/nrow(res_hprob1))
+
+res_eprob1 <- apply(res_prob1[,-1],2,function(x) x==res_prob1[,1])
+res_eprob1 <- res_eprob1*res_truect2
+res_eprob1 <- sapply(c(1:(length(dat)-1)),function(i) sum(res_eprob1[,i])/sum(res_truect2[,i]))
+
+#lower ct max prob
+res_lprob1 <- 1-res_hprob1-res_eprob1
+
+res_allprob <- data.frame(higher=res_hprob1,equal=res_eprob1,lower=res_lprob1)
+rownames(res_allprob) <- colnames(res_prob1[,-1])
+res_allprob
+
+#unknown rate
+res_ur <- as.data.frame(lapply(res,evalUnknownRate))
+res_ur <- as.data.frame(t(res_ur))
+res_ur
+```
+
+save
+```{r}
+res_all <- list(all_acc=res_acc1,ct_acc=res_acc2,m_f1=res_mf1,ct_f1=res_f1,prob=res_allprob,ur=res_ur,meta=metadat)
+saveRDS(res_all,"results/SC_SimDataEval/SCINA_Mock90.rds")
+```
+
+## SplatPop
+### preprocess
+```{r message=FALSE, warning=FALSE}
+##True data
+true_dat <- readRDS("rawcount_txt/simulated_data/rawRDS/Sim_splatPop_G8kC2k_3UGroup_2cond_simscale15_de0.5_cde0.38_dropout90.rds")
+true_datlog <- CreateSeuratObject(counts=true_dat@assays@data$TrueCounts,min.cells=0,min.features=0)
+true_datlog <- NormalizeData(true_datlog)
+true_datlog <- as.matrix(true_datlog@assays$RNA@data)
+
+##raw
+raw_dat <- as.matrix(true_dat@assays@data$counts)
+##imputed
+MAGIC_dat <- fread("MAGIC/Sim_splatPop_G8kC2k_3UGroup_2cond_simscale15_de0.5_cde0.38_dropout90.tsv",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+MAGIC_dat <- as.matrix(MAGIC_dat,rownames=1)
+alra_dat <- fread("alra/Sim_splatPop_G8kC2k_3UGroup_2cond_simscale15_de0.5_cde0.38_dropout90_alra.txt",sep="\t",stringsAsFactors=FALSE)
+alra_dat <- as.matrix(alra_dat,rownames=1)
+dca_dat <- fread("dca/Sim_splatPop_G8kC2k_3UGroup_2cond_simscale15_de0.5_cde0.38_dropout90/mean.tsv",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+dca_dat <- as.matrix(dca_dat,rownames=1)
+MAGIClog_dat <- fread("MAGIC_log/Sim_splatPop_G8kC2k_3UGroup_2cond_simscale15_de0.5_cde0.38_dropout90.tsv",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+MAGIClog_dat <- as.matrix(MAGIClog_dat,rownames=1)
+afMF_dat <- fread("afMF/imputed_data/Sim_splatPop_G8kC2k_3UGroup_2cond_simscale15_de0.5_cde0.38_dropout90_sigma3_0_convergence_True.txt",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+afMF_dat <- as.matrix(afMF_dat,rownames=1)
+AutoClass_dat <- fread("AutoClass/Sim_splatPop_G8kC2k_3UGroup_2cond_simscale15_de0.5_cde0.38_dropout90_AC.txt",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+AutoClass_dat <- as.matrix(AutoClass_dat,rownames=1)
+ccImpute_dat <- fread("ccImpute/Sim_splatPop_G8kC2k_3UGroup_2cond_simscale15_de0.5_cde0.38_dropout90_cc.txt",sep="\t",stringsAsFactors=FALSE)
+ccImpute_dat <- as.matrix(ccImpute_dat,rownames=1)
+ks_dat <- fread("knn_smoothing/Sim_splatPop_G8kC2k_3UGroup_2cond_simscale15_de0.5_cde0.38_dropout90_ks.txt",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+ks_dat <- as.matrix(ks_dat,rownames=1)
+Iimpute_dat <- fread("I_Impute/Sim_splatPop_G8kC2k_3UGroup_2cond_simscale15_de0.5_cde0.38_dropout90_CImp.txt",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+Iimpute_dat <- as.matrix(Iimpute_dat,rownames=1)
+scRMDnorm_dat <- fread("scRMD/Sim_splatPop_G8kC2k_3UGroup_2cond_simscale15_de0.5_cde0.38_dropout90_scRMDlognorm.txt",sep="\t",stringsAsFactors=FALSE)
+scRMDnorm_dat <- as.matrix(scRMDnorm_dat,rownames=1)
+Bf_dat <- fread("Bfimpute/Sim_splatPop_G8kC2k_3UGroup_2cond_simscale15_de0.5_cde0.38_dropout90_Bf_specc.txt",sep="\t",stringsAsFactors=FALSE)
+Bf_dat <- as.matrix(Bf_dat,rownames=1)
+
+ExcludeGenes <- rownames(raw_dat)[!rownames(raw_dat)%in%rownames(dca_dat)]
+tmp <- matrix(rep(0,length(ExcludeGenes)*ncol(raw_dat)),nrow=length(ExcludeGenes),ncol=ncol(raw_dat))
+rownames(tmp) <- ExcludeGenes
+dca_dat <- as.matrix(rbind(dca_dat,tmp))
+dca_dat <- dca_dat[rownames(raw_dat),]
+
+metadat <- as.data.frame(colData(true_dat))
+gmetadat <- as.data.frame(rowData(true_dat))
+metadat$Group <- as.factor(metadat$Group)
+metadat$Cell <- rownames(metadat)
+
+colnames(raw_dat) <- metadat$Cell
+colnames(MAGIC_dat) <- metadat$Cell
+colnames(alra_dat) <- metadat$Cell
+colnames(AutoClass_dat) <- metadat$Cell
+colnames(Bf_dat) <- metadat$Cell
+colnames(ccImpute_dat) <- metadat$Cell
+colnames(dca_dat) <- metadat$Cell
+colnames(Iimpute_dat) <- metadat$Cell
+colnames(ks_dat) <- metadat$Cell
+colnames(MAGIClog_dat) <- metadat$Cell
+colnames(afMF_dat) <- metadat$Cell
+colnames(scRMDnorm_dat) <- metadat$Cell
+colnames(true_datlog) <- metadat$Cell
+
+rownames(raw_dat) <- sub("_","-",rownames(raw_dat))
+rownames(MAGIC_dat) <- sub("_","-",rownames(MAGIC_dat))
+rownames(alra_dat) <- sub("_","-",rownames(alra_dat))
+rownames(AutoClass_dat) <- sub("_","-",rownames(AutoClass_dat))
+rownames(Bf_dat) <- sub("_","-",rownames(Bf_dat))
+rownames(ccImpute_dat) <- sub("_","-",rownames(ccImpute_dat))
+rownames(dca_dat) <- sub("_","-",rownames(dca_dat))
+rownames(Iimpute_dat) <- sub("_","-",rownames(Iimpute_dat))
+rownames(ks_dat) <- sub("_","-",rownames(ks_dat))
+rownames(MAGIClog_dat) <- sub("_","-",rownames(MAGIClog_dat))
+rownames(afMF_dat) <- sub("_","-",rownames(afMF_dat))
+rownames(scRMDnorm_dat) <- sub("_","-",rownames(scRMDnorm_dat))
+rownames(true_datlog) <- sub("_","-",rownames(true_datlog))
+
+rownames(gmetadat) <- sub("_","-",rownames(gmetadat))
+```
+
+normalized/log2 data
+```{r}
+raw_dat <- CreateSeuratObject(counts=raw_dat,min.cells=0,min.features=0)
+raw_dat <- NormalizeData(raw_dat)
+raw_dat <- as.matrix(raw_dat@assays$RNA@data)
+
+dca_dat <- log2(dca_dat+min(dca_dat[dca_dat!=0]))
+
+ks_dat <- CreateSeuratObject(counts=ks_dat,min.cells=0,min.features=0)
+ks_dat <- NormalizeData(ks_dat)
+ks_dat <- as.matrix(ks_dat@assays$RNA@data)
+
+Iimpute_dat <- log2(Iimpute_dat+min(Iimpute_dat[Iimpute_dat!=0]))
+```
+
+combine normalized data
+```{r}
+dat <- list(raw=raw_dat,ALRA=alra_dat,AutoClass=AutoClass_dat,Bfimpute=Bf_dat,ccImpute=ccImpute_dat,DCA=dca_dat,I_Impute=Iimpute_dat,kNN_smoothing=ks_dat,MAGIC=MAGIC_dat,MAGIC_log=MAGIClog_dat,scRMD=scRMDnorm_dat,afMF=afMF_dat)
+rm(raw_dat)
+rm(alra_dat)
+rm(AutoClass_dat)
+rm(Bf_dat)
+rm(ccImpute_dat)
+rm(Iimpute_dat)
+rm(ks_dat)
+rm(dca_dat)
+rm(MAGIC_dat)
+rm(MAGIClog_dat)
+rm(scRMDnorm_dat)
+rm(afMF_dat)
+```
+
+read marker files
+```{r}
+#positive marker only
+tmp1 <- gmetadat[gmetadat$GroupDE.Group1>1&gmetadat$GroupDE.Group2<=1&gmetadat$GroupDE.Group3<=1,]
+tmp1 <- rownames(tmp1[order(tmp1$GroupDE.Group1,decreasing=TRUE),])[1:10]
+tmp2 <- gmetadat[gmetadat$GroupDE.Group2>1&gmetadat$GroupDE.Group1<=1&gmetadat$GroupDE.Group3<=1,]
+tmp2 <- rownames(tmp2[order(tmp2$GroupDE.Group2,decreasing=TRUE),])[1:10]
+tmp3 <- gmetadat[gmetadat$GroupDE.Group3>1&gmetadat$GroupDE.Group1<=1&gmetadat$GroupDE.Group2<=1,]
+tmp3 <- rownames(tmp3[order(tmp3$GroupDE.Group3,decreasing=TRUE),])[1:10]
+
+marker_list1 <- list(Group1=tmp1,Group2=tmp2,Group3=tmp3)
+metadat$Group_f <- factor(metadat$Group,levels=c("Group1","Group2","Group3"))
+```
+
+
+### SCINA
+run annotation(SCINA)
+```{r}
+res <- lapply(dat,SCINA,marker_list1)
+```
+
+evaluation
+```{r}
+##accracy
+res_acc1 <- as.data.frame(lapply(res,evalCellTypeAcc,metadat))
+res_acc1 <- as.data.frame(t(res_acc1))
+res_acc1
+
+res_acc2 <- as.data.frame(lapply(res,evalEachCellTypeAcc,metadat))
+res_acc2 <- as.data.frame(t(res_acc2))
+res_acc2
+
+#F1
+res_mf1 <- as.data.frame(lapply(res,evalCellTypemedianF1,metadat))
+res_mf1 <- as.data.frame(t(res_mf1))
+res_mf1
+
+res_f1 <- as.data.frame(lapply(res,evalCellTypeF1,metadat))
+res_f1 <- as.data.frame(t(res_f1))
+res_f1
+
+#cell type probablibility
+res_prob1 <- as.data.frame(lapply(res,evalCellTypeProb,metadat))
+res_truect <- as.data.frame(lapply(res,function(x) x$cell_labels==metadat$Group))
+res_truect2 <- apply(res_truect[,-1],2,function(x) x*res_truect[,1]) ##both raw and imputed are true label
+
+res_hprob1 <- apply(res_prob1[,-1],2,function(x) x>res_prob1[,1])
+res_hprob1 <- res_hprob1*res_truect2
+res_hprob1 <- sapply(c(1:(length(dat)-1)),function(i) sum(res_hprob1[,i])/sum(res_truect2[,i]))
+#res_hprob1 <- apply(res_hprob1,2,function(x) sum(x)/nrow(res_hprob1))
+
+res_eprob1 <- apply(res_prob1[,-1],2,function(x) x==res_prob1[,1])
+res_eprob1 <- res_eprob1*res_truect2
+res_eprob1 <- sapply(c(1:(length(dat)-1)),function(i) sum(res_eprob1[,i])/sum(res_truect2[,i]))
+
+#lower ct max prob
+res_lprob1 <- 1-res_hprob1-res_eprob1
+
+res_allprob <- data.frame(higher=res_hprob1,equal=res_eprob1,lower=res_lprob1)
+rownames(res_allprob) <- colnames(res_prob1[,-1])
+res_allprob
+
+#unknown rate
+res_ur <- as.data.frame(lapply(res,evalUnknownRate))
+res_ur <- as.data.frame(t(res_ur))
+res_ur
+```
+
+save
+```{r}
+res_all <- list(all_acc=res_acc1,ct_acc=res_acc2,m_f1=res_mf1,ct_f1=res_f1,prob=res_allprob,ur=res_ur,meta=metadat)
+saveRDS(res_all,"results/SC_SimDataEval/SCINA_SplatPop90.rds")
+```
+
+
+## summarize and visualization
+### SCINA
+```{r}
+res1 <- readRDS("results/SC_SimDataEval/SCINA_Mock90.rds")
+res2 <- readRDS("results/SC_SimDataEval/SCINA_SplatPop90.rds")
+```
+
+#### all accuracy
+```{r}
+metadat1 <- res1$meta
+metadat2 <- res2$meta
+acc_all1 <- res1$all_acc
+acc_all2 <- res2$all_acc
+#combine
+acc_all1$V1 <- acc_all1*nrow(metadat1)
+acc_all2$V1 <- acc_all2*nrow(metadat2)
+acc_all <- data.frame(acc=(acc_all1$V1+acc_all2$V1)/(nrow(metadat1)+nrow(metadat2)))
+colnames(acc_all) <- "Accuracy"
+acc_all$Method <- rownames(acc_all)
+acc_all
+```
+
+barplot
+```{r}
+acc_all$method <- factor(acc_all$Method,levels=c("raw",acc_all$Method[-1][order(acc_all$Method[-1])]))
+acc_all$Method <- factor(acc_all$Method,levels=acc_all[order(acc_all$Accuracy),"Method"])
+neg_md <- sum(acc_all$Accuracy<acc_all[acc_all$Method=="raw","Accuracy"])
+
+acc_all$Type <- "Deep learning based"
+acc_all[acc_all$method%in%c("ccImpute","I_Impute","kNN_smoothing","MAGIC","MAGIC_log"),]$Type <- "Model or smoothing based"
+acc_all[acc_all$method%in%c("ALRA","Bfimpute","afMF","scRMD"),]$Type <- "Matrix based"
+acc_all[acc_all$method%in%c("raw"),]$Type <- "Raw"
+acc_all$Type <- factor(acc_all$Type,levels=c("Matrix based","Model or smoothing based","Deep learning based","Raw"))
+
+tmp_bar <- acc_all[,]
+
+ACTA_acc_bp <- ggbarplot(tmp_bar,x="Method",y="Accuracy",fill="Type",position=position_dodge(0.9),xlab="Method",ylab="Annotation Accuracy")+ggtitle("Automatic Cell Type Annotation Accuracy(SCINA)")+geom_hline(yintercept=acc_all[acc_all$Method=="raw","Accuracy"],linetype="dashed")+geom_vline(xintercept=neg_md+0.5,linetype="dashed")+coord_cartesian(ylim=c(0.5,1))+geom_hline(yintercept=0,linetype="dashed")+theme(plot.title=element_text(size=16),legend.title=element_text(size=15),legend.text=element_text(size=14),axis.title=element_text(size=18),axis.text.x=element_text(angle=90,size=15),axis.text.y=element_text(size=15),legend.position="right")+scale_fill_brewer(palette="Set2")
+ACTA_acc_bp
+```
+
+### cell type accuracy
+```{r}
+metadat1 <- res1$meta
+metadat2 <- res2$meta
+acc1 <- res1$ct_acc
+acc2 <- res2$ct_acc
+colnames(acc1) <- sapply(colnames(res1$ct_f1),function(x) strsplit(x,"Class: ")[[1]][2])
+colnames(acc2) <- sapply(colnames(res2$ct_f1),function(x) strsplit(x,"Class: ")[[1]][2])
+acc <- cbind(acc1,acc2)
+acc <- as.data.frame(t(acc))
+rownames(acc) <- c("Mock90_Group1","Mock90_Group2","Mock90_Group3","Mock90_Group4","Mock90_Group5","SplatPop90_Group1","SplatPop90_Group2","SplatPop90_Group3")
+acc_diff <- as.data.frame(apply(acc[,-1],2,function(x) x-acc[,1] ))
+
+#cell type counts
+CTcounts1 <- table(metadat1$Group)[colnames(acc1)]
+CTcounts2 <- table(metadat2$Group)[colnames(acc2)]
+CTcounts <- c(CTcounts1,CTcounts2)
+
+acc$CellType <- paste0(rownames(acc),"(",CTcounts,")")
+acc_melt <- data.table::melt(acc,id.vars=c("CellType"))
+
+acc_diff$CellType <- paste0(rownames(acc_diff),"(",CTcounts,")")
+acc_diff_melt <- data.table::melt(acc_diff,id.vars=c("CellType"))
+```
+
+further processing
+```{r}
+#rank by cor coefficient diff
+md_raw <- median(acc$raw)
+mdv <- acc_diff_melt %>% group_by(variable) %>% summarise(md=median(value,na.rm=TRUE))
+rank1 <- mdv[order(mdv$md),]$variable
+acc_diff_melt$Method <- as.character(acc_diff_melt$variable)
+acc_diff_melt$variable <- factor(acc_diff_melt$variable,levels=rank1)
+#acc_melt$variable <- factor(acc_melt$variable,levels=c("raw",rank1))
+neg_md <- sum(mdv$md<=0)
+
+#performed tests
+pv <- apply(acc[,-c(1,ncol(acc))],2,function(x) wilcox.test(acc[,1],x,alternative="less",paired=TRUE)$p.value )
+pv_sig <- sapply(pv,getPsig)
+pv_sig <- pv_sig[rank1]
+```
+
+heatmap
+```{r}
+tmp_hm <- acc_diff_melt[,]
+colnames(tmp_hm)[3] <- "Accuracy_Difference"
+#tmp_hm[tmp_hm$Accuracy_Difference<=(-0.2),]$Accuracy_Difference <- -0.2
+ACTA_accdiff_hm <- ggplot(tmp_hm,aes(variable,CellType,fill=Accuracy_Difference))+geom_tile()+scale_fill_gradient2(low="blue",mid="white",high="red",midpoint=0)+geom_vline(xintercept=neg_md+0.5,linetype="dashed")+xlab("Method")+ylab("Cell Types")+ggtitle("Automatic Cell Type Annotation Accuracy Difference(SCINA)")+theme(plot.title=element_text(size=16),legend.title=element_text(size=15),legend.text=element_text(size=14),axis.title=element_text(size=18),axis.text.x=element_text(angle=90,size=15),axis.text.y=element_text(size=12))
+ACTA_accdiff_hm
+```
+
+### predicted probabilities
+```{r}
+res_allprob1 <- res1$prob
+res_allprob2 <- res2$prob
+metadat1 <- res1$meta
+metadat2 <- res2$meta
+
+res_allprob1 <- res_allprob1*nrow(metadat1)
+res_allprob2 <- res_allprob2*nrow(metadat2)
+res_allprob <- (res_allprob1+res_allprob2)/(nrow(metadat1)+nrow(metadat2))
+
+res_allprob$Method <- rownames(res_allprob)
+res_allprob_melt <- data.table::melt(res_allprob,id.vars=c("Method"))
+head(res_allprob_melt)
+```
+
+stacked bar plot for prob
+res_allprob_melt
+```{r}
+rank1 <- res_allprob[order(res_allprob$higher),]$Method
+res_allprob_melt$Method <- factor(res_allprob_melt$Method,levels=rank1)
+
+ACTA_prob_bp <- ggplot(res_allprob_melt,aes_string(x="Method",y="value",fill="variable"))+geom_bar(stat="identity")+ggtitle("True Cell Type Prediction Probability(SCINA)")+ylab("% of Prob Group")+coord_cartesian(ylim=c(0,1))+guides(fill=guide_legend(title="Probability"))+scale_fill_manual(values=c("darkorange","goldenrod1","dodgerblue"))+xlab("Method")+theme(plot.title=element_text(size=16),legend.title=element_text(size=15),legend.text=element_text(size=14),axis.title=element_text(size=18),axis.text.x=element_text(angle=90,size=15),axis.text.y=element_text(size=15))
+ACTA_prob_bp
+```
+
+### unknown rate
+```{r}
+uknown_rate <- res1$ur
+colnames(uknown_rate) <- "Unknown_rate"
+uknown_rate$Method <- rownames(uknown_rate)
+uknown_rate
+```
+
+barplot
+```{r}
+uknown_rate$method <- factor(uknown_rate$Method,levels=c("raw",uknown_rate$Method[-1][order(uknown_rate$Method[-1])]))
+uknown_rate$Method <- factor(uknown_rate$Method,levels=uknown_rate[order(uknown_rate$Unknown_rate),"Method"])
+neg_md <- sum(uknown_rate$Unknown_rate<uknown_rate[uknown_rate$Method=="raw","Unknown_rate"])
+
+uknown_rate$Type <- "Deep learning based"
+uknown_rate[uknown_rate$method%in%c("ccImpute","I_Impute","kNN_smoothing","MAGIC","MAGIC_log"),]$Type <- "Model or smoothing based"
+uknown_rate[uknown_rate$method%in%c("ALRA","Bfimpute","afMF","scRMD"),]$Type <- "Matrix based"
+uknown_rate[uknown_rate$method%in%c("raw"),]$Type <- "Raw"
+uknown_rate$Type <- factor(uknown_rate$Type,levels=c("Matrix based","Model or smoothing based","Deep learning based","Raw"))
+
+tmp_bar <- uknown_rate[,]
+
+ACTA_ur_bp <- ggbarplot(tmp_bar,x="Method",y="Unknown_rate",fill="Type",position=position_dodge(0.9),xlab="Method",ylab="Unknown Rate")+ggtitle("Automatic Cell Type Annotation Unknown Rate(SCINA)")+geom_hline(yintercept=uknown_rate[uknown_rate$Method=="raw","Unknown_rate"],linetype="dashed")+geom_vline(xintercept=neg_md+0.5,linetype="dashed")+geom_hline(yintercept=0,linetype="dashed")+theme(plot.title=element_text(size=16),legend.title=element_text(size=15),legend.text=element_text(size=14),axis.title=element_text(size=18),axis.text.x=element_text(angle=90,size=15),axis.text.y=element_text(size=15),legend.position="right")+scale_fill_brewer(palette="Set2")
+ACTA_ur_bp
+```
+
+# Clustering
+clustering functions
+```{r message=FALSE, warning=FALSE}
+getCluster <- function(x,meta,reso=0.01,npc=10,cent=4,scale_data=FALSE){
+    tmp <- CreateSeuratObject(counts=x,meta.data=meta,min.cells=0,min.features=0)
+    tmp <- FindVariableFeatures(tmp,nfeatures=3000,verbose=FALSE)
+    if(scale_data){
+        tmp <- ScaleData(tmp,verbose=FALSE)
+    }else{
+        tmp[["RNA"]]@scale.data <- as.matrix(tmp[["RNA"]]@counts[VariableFeatures(tmp),])
+    }
+    tmp <- RunPCA(tmp,verbose=FALSE)
+    tmp$kmeans <- kmeans(tmp@reductions$pca@cell.embeddings[,1:npc],centers=cent)$cluster
+    tmp <- FindNeighbors(tmp,dims=1:npc,verbose=FALSE)
+    tmp <- FindClusters(tmp,resolution=reso,verbose=FALSE)
+    tmpgraph <- buildSNNGraph(tmp@reductions$pca@cell.embeddings[,1:npc],transposed=T,k=10,d=NA)
+    res <- cluster_louvain(tmpgraph)$membership
+    cc <- aggregate(tmp@reductions$pca@cell.embeddings[,1:npc],list(res),mean)
+    cc <- as.matrix(cc[,-1])
+    hclu <- hclust(dist(cc))
+    clu <- cutree(hclu,cent)
+    clu <- clu[res]      
+    tmp$lv_clu <- clu
+    #tmp <- tmp@meta.data
+    tmp <- RunUMAP(tmp,dims=1:npc,verbose=FALSE)
+    return(tmp)
+}
+
+evalClustering <- function(x,npc=10,method="lv_clu"){
+    
+    acc <- -mean(sapply(unique(x@meta.data[,method]),function(i){
+        p <- table(x@meta.data[x@meta.data[,method]==i,"Group"])/sum(x@meta.data[,method]==i)
+        sum(p*log(p),na.rm=TRUE)
+    }))
+
+    pur <- -mean(sapply(unique(x$Group),function(sct){
+        p <- table(x@meta.data[x$Group==sct,method])/sum(x$Group==sct)
+        sum(p*log(p),na.rm=TRUE)
+    }))
+
+    ARI <- adjustedRandIndex(x$Group,x@meta.data[,method])
+    
+    NMI_value <- NMI(x@meta.data[,method],x$Group)
+    #NMI_value <- NMI(x$lv_clu,x$celltype,variant="sum")
+    
+    df <- c(acc,pur,ARI,NMI_value)
+    names(df) <- c("acc","pur","ARI","NMI")
+    return(df)
+}
+```
+
+## Mock90
+### preprocess
+```{r message=FALSE, warning=FALSE}
+##True data
+true_dat <- readRDS("rawcount_txt/simulated_data/rawRDS/Sim_Mock_G10kC1500_5UGroup_de0.5_dropout90.rds")
+true_datlog <- CreateSeuratObject(counts=true_dat@assays@data$TrueCounts,min.cells=0,min.features=0)
+true_datlog <- NormalizeData(true_datlog)
+true_datlog <- as.matrix(true_datlog@assays$RNA@data)
+
+##raw
+raw_dat <- true_dat@assays@data$counts
+##imputed
+MAGIC_dat <- fread("MAGIC/Sim_Mock_G10kC1500_5UGroup_de0.5_dropout90.tsv",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+MAGIC_dat <- as.matrix(MAGIC_dat,rownames=1)
+alra_dat <- fread("alra/Sim_Mock_G10kC1500_5UGroup_de0.5_dropout90_alra.txt",sep="\t",stringsAsFactors=FALSE)
+alra_dat <- as.matrix(alra_dat,rownames=1)
+dca_dat <- fread("dca/Sim_Mock_G10kC1500_5UGroup_de0.5_dropout90/mean.tsv",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+dca_dat <- as.matrix(dca_dat,rownames=1)
+MAGIClog_dat <- fread("MAGIC_log/Sim_Mock_G10kC1500_5UGroup_de0.5_dropout90.tsv",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+MAGIClog_dat <- as.matrix(MAGIClog_dat,rownames=1)
+afMF_dat <- fread("afMF/imputed_data/Sim_Mock_G10kC1500_5UGroup_de0.5_dropout90_sigma3_0_convergence_True.txt",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+afMF_dat <- as.matrix(afMF_dat,rownames=1)
+AutoClass_dat <- fread("AutoClass/Sim_Mock_G10kC1500_5UGroup_de0.5_dropout90_AC.txt",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+AutoClass_dat <- as.matrix(AutoClass_dat,rownames=1)
+ccImpute_dat <- fread("ccImpute/Sim_Mock_G10kC1500_5UGroup_de0.5_dropout90_cc.txt",sep="\t",stringsAsFactors=FALSE)
+ccImpute_dat <- as.matrix(ccImpute_dat,rownames=1)
+ks_dat <- fread("knn_smoothing/Sim_Mock_G10kC1500_5UGroup_de0.5_dropout90_ks.txt",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+ks_dat <- as.matrix(ks_dat,rownames=1)
+Iimpute_dat <- fread("I_Impute/Sim_Mock_G10kC1500_5UGroup_de0.5_dropout90_CImp.txt",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+Iimpute_dat <- as.matrix(Iimpute_dat,rownames=1)
+scRMDnorm_dat <- fread("scRMD/Sim_Mock_G10kC1500_5UGroup_de0.5_dropout90_scRMDlognorm.txt",sep="\t",stringsAsFactors=FALSE)
+scRMDnorm_dat <- as.matrix(scRMDnorm_dat,rownames=1)
+Bf_dat <- fread("Bfimpute/Sim_Mock_G10kC1500_5UGroup_de0.5_dropout90_Bf_specc.txt",sep="\t",stringsAsFactors=FALSE)
+Bf_dat <- as.matrix(Bf_dat,rownames=1)
+
+ExcludeGenes <- rownames(raw_dat)[!rownames(raw_dat)%in%rownames(dca_dat)]
+tmp <- matrix(rep(0,length(ExcludeGenes)*ncol(raw_dat)),nrow=length(ExcludeGenes),ncol=ncol(raw_dat))
+rownames(tmp) <- ExcludeGenes
+dca_dat <- as.matrix(rbind(dca_dat,tmp))
+dca_dat <- dca_dat[rownames(raw_dat),]
+
+metadat <- as.data.frame(colData(true_dat))
+gmetadat <- as.data.frame(rowData(true_dat))
+metadat$Group <- as.character(metadat$Group)
+```
+
+normalized/log2 data
+```{r}
+raw_dat <- CreateSeuratObject(counts=raw_dat,min.cells=0,min.features=0)
+raw_dat <- NormalizeData(raw_dat)
+raw_dat <- as.matrix(raw_dat@assays$RNA@data)
+
+dca_dat <- log2(dca_dat+min(dca_dat[dca_dat!=0]))
+
+ks_dat <- CreateSeuratObject(counts=ks_dat,min.cells=0,min.features=0)
+ks_dat <- NormalizeData(ks_dat)
+ks_dat <- as.matrix(ks_dat@assays$RNA@data)
+
+Iimpute_dat <- log2(Iimpute_dat+min(Iimpute_dat[Iimpute_dat!=0]))
+```
+
+combine normalized data
+```{r}
+dat <- list(raw=raw_dat,ALRA=alra_dat,AutoClass=AutoClass_dat,Bfimpute=Bf_dat,ccImpute=ccImpute_dat,DCA=dca_dat,I_Impute=Iimpute_dat,kNN_smoothing=ks_dat,MAGIC=MAGIC_dat,MAGIC_log=MAGIClog_dat,scRMD=scRMDnorm_dat,afMF=afMF_dat,true=true_datlog)
+rm(raw_dat)
+rm(alra_dat)
+rm(AutoClass_dat)
+rm(Bf_dat)
+rm(ccImpute_dat)
+rm(Iimpute_dat)
+rm(ks_dat)
+rm(dca_dat)
+rm(MAGIC_dat)
+rm(MAGIClog_dat)
+rm(scRMDnorm_dat)
+rm(afMF_dat)
+```
+
+
+### analysis
+cluster
+```{r message=FALSE, warning=FALSE}
+datCluster <- lapply(dat,getCluster,metadat,cent=5,scale_data=TRUE)
+```
+
+evaluate lv
+```{r}
+res3_lv <- as.data.frame(lapply(datCluster,evalClustering))
+as.data.frame(t(res3_lv))
+```
+
+evaluate km
+```{r}
+res3_km <- as.data.frame(lapply(datCluster,evalClustering,method="kmeans"))
+as.data.frame(t(res3_km))
+```
+
+writeout/read
+```{r}
+#writeout
+all_res <- list(lv=res3_lv,km=res3_km)
+saveRDS(all_res,"results/SC_SimDataEval/SC_Clustering_EvalRes_Sim_Mock90.rds")
+```
+
+UMAP cell type
+```{r}
+p_Scale <- list()
+for(x in names(datCluster)){
+    p <- DimPlot(datCluster[[x]],reduction="umap",group.by="Group")+ggtitle(x)+scale_color_manual(values=selected_palette2)
+    print(p)
+    p_Scale[[x]] <- p
+}
+```
+
+PCA cell type
+```{r}
+p_Scale_pca <- list()
+for(x in names(datCluster)){
+    p <- DimPlot(datCluster[[x]],reduction="pca",group.by="Group")+ggtitle(x)+scale_color_manual(values=selected_palette2)
+    print(p)
+    p_Scale_pca[[x]] <- p
+}
+```
+
+### combine umap/pca plots
+combine plots UMAP scale
+```{r fig.height=7.2, fig.width=12}
+p_Scale <- p_Scale[c("raw","true","afMF","ALRA","AutoClass","Bfimpute","ccImpute","DCA","I_Impute","kNN_smoothing","MAGIC_log","scRMD")]
+ggarrange(plotlist=p_Scale,ncol=4,nrow=3)
+```
+
+combine plots PCA scale
+```{r fig.height=7.2, fig.width=12}
+p_Scale_pca <- p_Scale_pca[c("raw","true","AutoClass","DCA","afMF","ALRA","ccImpute","I_Impute","Bfimpute","scRMD","kNN_smoothing","MAGIC_log")]
+ggarrange(plotlist=p_Scale_pca,ncol=4,nrow=3)
+```
+
+
+## Sim_splatPop_G8kC2k_3UGroup_2cond_simscale15_de0.5_cde0.38_dropout90
+### Preprocess
+cell level
+read data
+```{r message=FALSE, warning=FALSE}
+##True data
+true_dat <- readRDS("rawcount_txt/simulated_data/rawRDS/Sim_splatPop_G8kC2k_3UGroup_2cond_simscale15_de0.5_cde0.38_dropout90.rds")
+true_datlog <- CreateSeuratObject(counts=true_dat@assays@data$TrueCounts,min.cells=0,min.features=0)
+true_datlog <- NormalizeData(true_datlog)
+true_datlog <- as.matrix(true_datlog@assays$RNA@data)
+
+##raw
+raw_dat <- as.matrix(true_dat@assays@data$counts)
+##imputed
+MAGIC_dat <- fread("MAGIC/Sim_splatPop_G8kC2k_3UGroup_2cond_simscale15_de0.5_cde0.38_dropout90.tsv",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+MAGIC_dat <- as.matrix(MAGIC_dat,rownames=1)
+alra_dat <- fread("alra/Sim_splatPop_G8kC2k_3UGroup_2cond_simscale15_de0.5_cde0.38_dropout90_alra.txt",sep="\t",stringsAsFactors=FALSE)
+alra_dat <- as.matrix(alra_dat,rownames=1)
+dca_dat <- fread("dca/Sim_splatPop_G8kC2k_3UGroup_2cond_simscale15_de0.5_cde0.38_dropout90/mean.tsv",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+dca_dat <- as.matrix(dca_dat,rownames=1)
+MAGIClog_dat <- fread("MAGIC_log/Sim_splatPop_G8kC2k_3UGroup_2cond_simscale15_de0.5_cde0.38_dropout90.tsv",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+MAGIClog_dat <- as.matrix(MAGIClog_dat,rownames=1)
+afMF_dat <- fread("afMF/imputed_data/Sim_splatPop_G8kC2k_3UGroup_2cond_simscale15_de0.5_cde0.38_dropout90_sigma3_0_convergence_True.txt",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+afMF_dat <- as.matrix(afMF_dat,rownames=1)
+AutoClass_dat <- fread("AutoClass/Sim_splatPop_G8kC2k_3UGroup_2cond_simscale15_de0.5_cde0.38_dropout90_AC.txt",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+AutoClass_dat <- as.matrix(AutoClass_dat,rownames=1)
+ccImpute_dat <- fread("ccImpute/Sim_splatPop_G8kC2k_3UGroup_2cond_simscale15_de0.5_cde0.38_dropout90_cc.txt",sep="\t",stringsAsFactors=FALSE)
+ccImpute_dat <- as.matrix(ccImpute_dat,rownames=1)
+ks_dat <- fread("knn_smoothing/Sim_splatPop_G8kC2k_3UGroup_2cond_simscale15_de0.5_cde0.38_dropout90_ks.txt",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+ks_dat <- as.matrix(ks_dat,rownames=1)
+Iimpute_dat <- fread("I_Impute/Sim_splatPop_G8kC2k_3UGroup_2cond_simscale15_de0.5_cde0.38_dropout90_CImp.txt",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+Iimpute_dat <- as.matrix(Iimpute_dat,rownames=1)
+scRMDnorm_dat <- fread("scRMD/Sim_splatPop_G8kC2k_3UGroup_2cond_simscale15_de0.5_cde0.38_dropout90_scRMDlognorm.txt",sep="\t",stringsAsFactors=FALSE)
+scRMDnorm_dat <- as.matrix(scRMDnorm_dat,rownames=1)
+Bf_dat <- fread("Bfimpute/Sim_splatPop_G8kC2k_3UGroup_2cond_simscale15_de0.5_cde0.38_dropout90_Bf_specc.txt",sep="\t",stringsAsFactors=FALSE)
+Bf_dat <- as.matrix(Bf_dat,rownames=1)
+
+ExcludeGenes <- rownames(raw_dat)[!rownames(raw_dat)%in%rownames(dca_dat)]
+tmp <- matrix(rep(0,length(ExcludeGenes)*ncol(raw_dat)),nrow=length(ExcludeGenes),ncol=ncol(raw_dat))
+rownames(tmp) <- ExcludeGenes
+dca_dat <- as.matrix(rbind(dca_dat,tmp))
+dca_dat <- dca_dat[rownames(raw_dat),]
+
+metadat <- readRDS("rawcount_txt/simulated_data/rawRDS/Sim_splatPop_G8kC2k_3UGroup_2cond_simscale15_de0.5_cde0.38_dropout90.rds")
+metadat <- as.data.frame(colData(metadat))
+metadat$cell <- rownames(metadat)
+metadat$celltype <- metadat$Group
+
+metadat$G_C <- NA
+metadat[metadat$Group=="Group1"&metadat$Condition=="Condition1",]$G_C <- "G1C1"
+metadat[metadat$Group=="Group1"&metadat$Condition=="Condition2",]$G_C <- "G1C2"
+metadat[metadat$Group=="Group2"&metadat$Condition=="Condition1",]$G_C <- "G2C1"
+metadat[metadat$Group=="Group2"&metadat$Condition=="Condition2",]$G_C <- "G2C2"
+metadat[metadat$Group=="Group3"&metadat$Condition=="Condition1",]$G_C <- "G3C1"
+metadat[metadat$Group=="Group3"&metadat$Condition=="Condition2",]$G_C <- "G3C2"
+
+gmetadat <- as.data.frame(rowData(true_dat))
+metadat$Group <- as.character(metadat$Group)
+metadat$Cell <- rownames(metadat)
+
+colnames(raw_dat) <- metadat$Cell
+colnames(MAGIC_dat) <- metadat$Cell
+colnames(alra_dat) <- metadat$Cell
+colnames(AutoClass_dat) <- metadat$Cell
+colnames(Bf_dat) <- metadat$Cell
+colnames(ccImpute_dat) <- metadat$Cell
+colnames(dca_dat) <- metadat$Cell
+colnames(Iimpute_dat) <- metadat$Cell
+colnames(ks_dat) <- metadat$Cell
+colnames(MAGIClog_dat) <- metadat$Cell
+colnames(afMF_dat) <- metadat$Cell
+colnames(scRMDnorm_dat) <- metadat$Cell
+colnames(true_datlog) <- metadat$Cell
+
+rownames(raw_dat) <- sub("_","-",rownames(raw_dat))
+rownames(MAGIC_dat) <- sub("_","-",rownames(MAGIC_dat))
+rownames(alra_dat) <- sub("_","-",rownames(alra_dat))
+rownames(AutoClass_dat) <- sub("_","-",rownames(AutoClass_dat))
+rownames(Bf_dat) <- sub("_","-",rownames(Bf_dat))
+rownames(ccImpute_dat) <- sub("_","-",rownames(ccImpute_dat))
+rownames(dca_dat) <- sub("_","-",rownames(dca_dat))
+rownames(Iimpute_dat) <- sub("_","-",rownames(Iimpute_dat))
+rownames(ks_dat) <- sub("_","-",rownames(ks_dat))
+rownames(MAGIClog_dat) <- sub("_","-",rownames(MAGIClog_dat))
+rownames(afMF_dat) <- sub("_","-",rownames(afMF_dat))
+rownames(scRMDnorm_dat) <- sub("_","-",rownames(scRMDnorm_dat))
+rownames(true_datlog) <- sub("_","-",rownames(true_datlog))
+
+rownames(gmetadat) <- sub("_","-",rownames(gmetadat))
+```
+
+normalized/log2 data
+```{r}
+raw_dat <- CreateSeuratObject(counts=raw_dat,min.cells=0,min.features=0)
+raw_dat <- NormalizeData(raw_dat)
+raw_dat <- as.matrix(raw_dat@assays$RNA@data)
+
+dca_dat <- log2(dca_dat+min(dca_dat[dca_dat!=0]))
+
+ks_dat <- CreateSeuratObject(counts=ks_dat,min.cells=0,min.features=0)
+ks_dat <- NormalizeData(ks_dat)
+ks_dat <- as.matrix(ks_dat@assays$RNA@data)
+
+Iimpute_dat <- log2(Iimpute_dat+min(Iimpute_dat[Iimpute_dat!=0]))
+```
+
+combine normalized data
+```{r}
+dat <- list(raw=raw_dat,ALRA=alra_dat,AutoClass=AutoClass_dat,Bfimpute=Bf_dat,ccImpute=ccImpute_dat,DCA=dca_dat,I_Impute=Iimpute_dat,kNN_smoothing=ks_dat,MAGIC=MAGIC_dat,MAGIC_log=MAGIClog_dat,scRMD=scRMDnorm_dat,afMF=afMF_dat,true=true_datlog)
+rm(raw_dat)
+rm(alra_dat)
+rm(AutoClass_dat)
+rm(Bf_dat)
+rm(ccImpute_dat)
+rm(Iimpute_dat)
+rm(ks_dat)
+rm(dca_dat)
+rm(MAGIC_dat)
+rm(MAGIClog_dat)
+rm(scRMDnorm_dat)
+rm(afMF_dat)
+```
+
+### analysis
+cluster(3 groups)
+```{r message=FALSE, warning=FALSE}
+datCluster <- lapply(dat,getCluster,metadat,cent=3,scale_data=TRUE)
+```
+
+evaluate lv
+```{r}
+res9_lv_3g <- as.data.frame(lapply(datCluster,evalClustering))
+as.data.frame(t(res9_lv_3g))
+```
+
+evaluate km
+```{r}
+res9_km_3g <- as.data.frame(lapply(datCluster,evalClustering,method="kmeans"))
+as.data.frame(t(res9_km_3g))
+```
+
+cluster(6 groups)
+```{r message=FALSE, warning=FALSE}
+datCluster <- lapply(dat,getCluster,metadat,cent=6,scale_data=TRUE)
+```
+
+```{r}
+evalClustering_tmp <- function(x,npc=10,method="lv_clu"){
+    
+    acc <- -mean(sapply(unique(x@meta.data[,method]),function(i){
+        p <- table(x@meta.data[x@meta.data[,method]==i,"G_C"])/sum(x@meta.data[,method]==i)
+        sum(p*log(p),na.rm=TRUE)
+    }))
+
+    pur <- -mean(sapply(unique(x$G_C),function(sct){
+        p <- table(x@meta.data[x$G_C==sct,method])/sum(x$G_C==sct)
+        sum(p*log(p),na.rm=TRUE)
+    }))
+
+    ARI <- adjustedRandIndex(x$G_C,x@meta.data[,method])
+    
+    NMI_value <- NMI(x@meta.data[,method],x$G_C)
+    #NMI_value <- NMI(x$lv_clu,x$celltype,variant="sum")
+    
+    df <- c(acc,pur,ARI,NMI_value)
+    names(df) <- c("acc","pur","ARI","NMI")
+    return(df)
+}
+```
+
+evaluate lv
+```{r}
+res9_lv_6g <- as.data.frame(lapply(datCluster,evalClustering_tmp))
+as.data.frame(t(res9_lv_6g))
+```
+
+evaluate km
+```{r}
+res9_km_6g <- as.data.frame(lapply(datCluster,evalClustering_tmp,method="kmeans"))
+as.data.frame(t(res9_km_6g))
+```
+
+writeout/read
+```{r}
+#writeout
+all_res <- list(lv3g=res9_lv_3g,km3g=res9_km_3g,lv6g=res9_lv_6g,km6g=res9_km_6g)
+saveRDS(all_res,"results/SC_SimDataEval/SC_Clustering_EvalRes_Sim_SplatPop90.rds")
+```
+
+UMAP cell type
+```{r}
+p_Scale <- list()
+for(x in names(datCluster)){
+    p <- DimPlot(datCluster[[x]],reduction="umap",group.by="Group")+ggtitle(x)+scale_color_manual(values=selected_palette2)
+    print(p)
+    p_Scale[[x]] <- p
+}
+```
+
+PCA cell type
+```{r}
+p_Scale_pca <- list()
+for(x in names(datCluster)){
+    p <- DimPlot(datCluster[[x]],reduction="pca",group.by="G_C")+ggtitle(x)+scale_color_manual(values=selected_palette)
+    print(p)
+    p_Scale_pca[[x]] <- p
+}
+```
+
+### combine umap/pca plots
+combine plots UMAP scale
+```{r fig.height=7.2, fig.width=12}
+p_Scale <- p_Scale[c("raw","true","afMF","ALRA","AutoClass","Bfimpute","ccImpute","DCA","I_Impute","kNN_smoothing","MAGIC_log","scRMD")]
+ggarrange(plotlist=p_Scale,ncol=4,nrow=3)
+```
+
+combine plots PCA scale
+```{r fig.height=7.2, fig.width=12}
+p_Scale_pca <- p_Scale_pca[c("raw","true","AutoClass","DCA","afMF","ALRA","ccImpute","I_Impute","Bfimpute","scRMD","kNN_smoothing","MAGIC_log")]
+ggarrange(plotlist=p_Scale_pca,ncol=4,nrow=3)
+```
+
+## summary and visualization
+read data
+```{r}
+d1 <- readRDS("results/SC_SimDataEval/SC_Clustering_EvalRes_Sim_Mock90.rds")
+d2 <- readRDS("results/SC_SimDataEval/SC_Clustering_EvalRes_Sim_SplatPop90.rds")
+
+res1_lv <- d1$lv
+res2_lv <- d2$lv3g
+
+res1_km <- d1$km
+res2_km <- d2$km3g
+```
+
+### process data lv
+```{r}
+##LV cluster
+rownames(res1_lv) <- c("Hacc","Hpur","ARI",,"NMI")
+
+res_lv <- data.frame()
+res_lv_median <- data.frame()
+for(i in 1:2){
+    tmp1 <- res1_lv[i,1]-res1_lv[i,-1]
+    tmp2 <- res2_lv[i,1]-res2_lv[i,-1]
+    tmp <- rbind(tmp1,tmp2)
+    rownames(tmp) <- paste0(rownames(res1_lv)[i],"_",c("Mock90","SplatPop90"))
+    tmp_median <- apply(tmp,2,median)
+    res_lv <- rbind(res_lv,tmp)
+    res_lv_median <- rbind(res_lv_median,tmp_median)
+}
+
+for(i in 3:4){
+    tmp1 <- res1_lv[i,-1]-res1_lv[i,1]
+    tmp2 <- res2_lv[i,-1]-res2_lv[i,1]
+    tmp <- rbind(tmp1,tmp2)
+    rownames(tmp) <- paste0(rownames(res1_lv)[i],"_",c("Mock90","SplatPop90"))
+    tmp_median <- apply(tmp,2,median)
+    res_lv <- rbind(res_lv,tmp)
+    res_lv_median <- rbind(res_lv_median,tmp_median)
+}
+
+res_lv_median <- as.data.frame(t(res_lv_median))
+rownames(res_lv_median) <- colnames(res1_lv)[-1]
+colnames(res_lv_median) <- c("Hacc","Hpur","ARI","NMI")
+
+res_lv_median$method <- rownames(res_lv_median)
+res_lv_median_melt <- data.table::melt(res_lv_median,id.vars=c("method"))
+colnames(res_lv_median_melt)[2:3] <- c("Metrics","Metrics_Difference")
+head(res_lv_median_melt)
+
+res_lv$Metrics_Datasets <- rownames(res_lv)
+res_lv$Metrics <- sapply(rownames(res_lv),function(x) strsplit(x,"\\_")[[1]][1] )
+res_lv_melt <- data.table::melt(res_lv,id.vars=c("Metrics_Datasets","Metrics"))
+colnames(res_lv_melt)[3:4] <- c("method","Metrics_Difference")
+head(res_lv_melt)
+```
+
+
+heatmap(median metrics)
+```{r}
+rank1 <- apply(res_lv_median[,-ncol(res_lv_median)],2,rank)
+rank1 <- apply(rank1,1,median)
+rank1 <- names(rank1[order(rank1)])
+res_lv_median_melt$Method <- factor(res_lv_median_melt$method,levels=unique(res_lv_median_melt$method[order(res_lv_median_melt$method)]))
+res_lv_median_melt$method <- factor(res_lv_median_melt$method,levels=rank1)
+
+tmp_hm <- res_lv_median_melt[res_lv_median_melt$method!="true",]
+
+clu_4metric_lv_hm <- ggplot(tmp_hm,aes(method,Metrics,fill=Metrics_Difference))+geom_tile()+scale_fill_gradient2(low="blue",mid="white",high="red",midpoint=0)+ggtitle("Louvain Clustering Evaluation Metrics(Values of Difference)")+xlab("Method")+theme(plot.title=element_text(size=16),legend.title=element_text(size=15),legend.text=element_text(size=14),axis.title=element_text(size=18),axis.text.x=element_text(angle=90,size=15),axis.text.y=element_text(size=15))#+geom_vline(xintercept=neg_md+0.5,linetype="dashed")
+clu_4metric_lv_hm
+```
+
+### process data kmeans
+```{r}
+##LV cluster
+rownames(res1_km) <- c("Hacc","Hpur","ARI","NMI")
+res1_km <- res1_km[,-1]
+res1_km <- res1_km[,c(ncol(res1_km),1:(ncol(res1_km)-1))]
+res2_km <- res2_km[,-1]
+res2_km <- res2_km[,c(ncol(res2_km),1:(ncol(res2_km)-1))]
+
+res_km <- data.frame()
+res_km_median <- data.frame()
+for(i in 1:2){
+    tmp1 <- res1_km[i,1]-res1_km[i,-1]
+    tmp2 <- res2_km[i,1]-res2_km[i,-1]
+    tmp <- rbind(tmp1,tmp2)
+    rownames(tmp) <- paste0(rownames(res1_km)[i],"_",c("Mock90","SplatPop90"))
+    tmp_median <- apply(tmp,2,median)
+    res_km <- rbind(res_km,tmp)
+    res_km_median <- rbind(res_km_median,tmp_median)
+}
+
+for(i in 3:4){
+    tmp1 <- res1_km[i,-1]-res1_km[i,1]
+    tmp2 <- res2_km[i,-1]-res2_km[i,1]
+    tmp <- rbind(tmp1,tmp2)
+    rownames(tmp) <- paste0(rownames(res1_km)[i],"_",c("Mock90","SplatPop90"))
+    tmp_median <- apply(tmp,2,median)
+    res_km <- rbind(res_km,tmp)
+    res_km_median <- rbind(res_km_median,tmp_median)
+}
+
+res_km_median <- as.data.frame(t(res_km_median))
+rownames(res_km_median) <- colnames(res1_km)[-1]
+colnames(res_km_median) <- c("Hacc","Hpur","ARI","NMI")
+
+res_km_median$method <- rownames(res_km_median)
+res_km_median_melt <- data.table::melt(res_km_median,id.vars=c("method"))
+colnames(res_km_median_melt)[2:3] <- c("Metrics","Metrics_Difference")
+head(res_km_median_melt)
+
+res_km$Metrics_Datasets <- rownames(res_km)
+res_km$Metrics <- sapply(rownames(res_km),function(x) strsplit(x,"\\_")[[1]][1] )
+res_km_melt <- data.table::melt(res_km,id.vars=c("Metrics_Datasets","Metrics"))
+colnames(res_km_melt)[3:4] <- c("method","Metrics_Difference")
+head(res_km_melt)
+```
+
+heatmap(median metrics)
+```{r}
+rank1 <- apply(res_km_median[,-ncol(res_km_median)],2,rank)
+rank1 <- apply(rank1,1,median)
+rank1 <- names(rank1[order(rank1)])
+res_km_median_melt$Method <- factor(res_km_median_melt$method,levels=unique(res_km_median_melt$method[order(res_km_median_melt$method)]))
+res_km_median_melt$method <- factor(res_km_median_melt$method,levels=rank1)
+
+tmp_hm <- res_km_median_melt[res_km_median_melt$method!="true",]
+tmp_hm[tmp_hm$Metrics_Difference<(-0.25),]$Metrics_Difference <- -0.25
+#tmp_hm[tmp_hm$Metrics_Difference>(0.01),]$Metrics_Difference <- 0.01
+
+clu_4metric_km_hm <- ggplot(tmp_hm,aes(method,Metrics,fill=Metrics_Difference))+geom_tile()+scale_fill_gradient2(low="blue",mid="white",high="red",midpoint=0)+ggtitle("K-means Clustering Evaluation Metrics(Values of Difference)")+xlab("Method")+theme(plot.title=element_text(size=16),legend.title=element_text(size=15),legend.text=element_text(size=14),axis.title=element_text(size=18),axis.text.x=element_text(angle=90,size=15),axis.text.y=element_text(size=15))#+geom_vline(xintercept=neg_md+0.5,linetype="dashed")
+clu_4metric_km_hm
+```
+
+# combine plot
+## supp1
+```{r fig.height=7, fig.width=12}
+ggarrange(sim_p_deg_scc_bp_mast,sim_deg_improve_bp_mast,sim_class_acc_bp,sim_auc_deg_bp,ACTA_acc_bp,ACTA_ur_bp,sim_celcell_scc_bp,sim_scclu_smd_bp,sim_fc_scc_bp,nrow=3,ncol=3,labels="AUTO")
+```
+
+## supp2
+```{r fig.height=9.4, fig.width=12.5}
+p1 <- ggarrange(sim_p_deg_scc_bp_rst,sim_p_deg_scc_bp_limma,sim_deg_improve_bp_rst,sim_deg_improve_bp_limma,ncol=2,nrow=2,labels="AUTO")
+p2 <- ggarrange(sim_class_prob_bp,ACTA_accdiff_hm,ACTA_prob_bp,clu_4metric_km_hm,clu_4metric_lv_hm,sim_pbclu_smd_bp,ncol=3,nrow=2,labels=c("E","F","G","H","I","J"))
+
+ggarrange(p1,p2,nrow=2,ncol=1,widths=c(2,3))
+```
+

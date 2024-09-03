@@ -1,0 +1,177 @@
+---
+title: "Scalability and Recommendation"
+output: html_notebook
+---
+
+load library
+```{r message=FALSE, warning=FALSE}
+library(Seurat)
+library(ggplot2)
+library(SingleCellExperiment)
+library(scran)
+library(SeuratData)
+library(edgeR)
+library(limma)
+library(clusterProfiler)
+library(data.table)
+library(SingleCellExperiment)
+library(SummarizedExperiment)
+library(muscat)
+library(pROC)
+library(igraph)
+library(mclust)
+library(cluster)
+library(SCINA)
+library(caret)
+library(MAST)
+library(AUCell)
+library(HGNChelper)
+library(SeuratDisk)
+library(monocle3)
+library(ggpubr)
+library(slingshot)
+library(grDevices)
+library(RColorBrewer)
+library(randomForest)
+library(caTools)
+library(mltools)
+#library(stringr)
+library(reldist)
+library(aricode)
+library(TSCAN)
+library(reshape2)
+library(pheatmap)
+library(philentropy)
+library(rawr)
+library(splatter)
+library(MatrixCorrelation)
+library(dplyr,lib.loc="/share/pkg.7/r/4.2.1/install/lib64/R/library")
+library(scater)
+library(Hmisc)
+
+selected_palette <- c("aquamarine4","azure4","powderblue","burlywood","coral","cornflowerblue","cyan3","darkgoldenrod2","darkorange3","peachpuff","royalblue","khaki2","plum1","lightsalmon")
+selected_palette2 <- c("plum1","aquamarine4","azure4","powderblue","burlywood","coral","cornflowerblue","cyan3","darkgoldenrod2","darkorange3","peachpuff","royalblue")
+```
+
+# Create data
+```{r}
+set.seed(123)
+tmpsce <- mockSCE(ncells=5000,ngenes=10000)
+SimParamsMock <- splatEstimate(tmpsce)
+SimParamsMock <- setParams(SimParamsMock,group.prob=c(0.3,0.25,0.2,0.15,0.1),seed=123,dropout.type="experiment",de.facLoc=0.5,de.facScale=0.5)
+SimDat <- splatSimulate(SimParamsMock,method="groups")
+
+SimDat.drop <- splatter:::splatSimDropout(SimDat,setParam(SimParamsMock,"dropout.mid",6.7))
+print("drop dropout rate")
+sum(SimDat.drop@assays@data$Dropout)/(nrow(SimDat.drop)*ncol(SimDat.drop))
+
+#save TXT
+write.table(as.matrix(SimDat.drop@assays@data$counts),"simulated_data/rawTXT/ForScal_Sim_Mock_G10kC5000_5UGroup_de0.5_dropout90.txt",sep="\t",quote=FALSE)
+
+#10k
+set.seed(123)
+tmpsce <- mockSCE(ncells=10000,ngenes=10000)
+SimParamsMock <- splatEstimate(tmpsce)
+SimParamsMock <- setParams(SimParamsMock,group.prob=c(0.3,0.25,0.2,0.15,0.1),seed=123,dropout.type="experiment",de.facLoc=0.5,de.facScale=0.5)
+SimDat <- splatSimulate(SimParamsMock,method="groups")
+
+SimDat.drop <- splatter:::splatSimDropout(SimDat,setParam(SimParamsMock,"dropout.mid",6.7))
+print("drop dropout rate")
+sum(SimDat.drop@assays@data$Dropout)/(nrow(SimDat.drop)*ncol(SimDat.drop))
+
+#save TXT
+write.table(as.matrix(SimDat.drop@assays@data$counts),"simulated_data/rawTXT/ForScal_Sim_Mock_G10kC10k_5UGroup_de0.5_dropout90.txt",sep="\t",quote=FALSE)
+
+#50k
+set.seed(123)
+tmpsce <- mockSCE(ncells=50000,ngenes=10000)
+SimParamsMock <- splatEstimate(tmpsce)
+SimParamsMock <- setParams(SimParamsMock,group.prob=c(0.3,0.25,0.2,0.15,0.1),seed=123,dropout.type="experiment",de.facLoc=0.5,de.facScale=0.5)
+SimDat <- splatSimulate(SimParamsMock,method="groups")
+
+SimDat.drop <- splatter:::splatSimDropout(SimDat,setParam(SimParamsMock,"dropout.mid",6.7))
+print("drop dropout rate")
+sum(SimDat.drop@assays@data$Dropout)/(nrow(SimDat.drop)*ncol(SimDat.drop))
+
+#save TXT
+write.table(as.matrix(SimDat.drop@assays@data$counts),"simulated_data/rawTXT/ForScal_Sim_Mock_G10kC50k_5UGroup_de0.5_dropout90.txt",sep="\t",quote=FALSE)
+```
+
+# Scalability
+## Time
+```{r}
+df_time <- data.frame(Method=c(rep("ALRA",4),rep("AutoClass(GPU)",4),rep("Bfimpute",4),rep("ccImpute",4),rep("DCA",4),rep("I_Impute",4),rep("kNN_smoothing",4),rep("MAGIC",4),rep("MAGIC_log",4),rep("scRMD",4),rep("afMF",4)),Cell=rep(c("1500","5000","10000","50000"),11),Time=c(45,135,241,1300,166,529,1659,5666,1306,4646,6992,NA,290,1062,2398,NA,142,336,703,3980,1431,30401,NA,NA,97,162,322,2424,118,177,240,2470,67,90,217,2290,371,860,1544,13831,468,2911,4471,41223))
+df_time$Cell <- factor(df_time$Cell,levels=c("1500","5000","10000","50000"))
+df_time$Time_log <- log2(df_time$Time)
+df_time$Time_min <- df_time$Time/60
+```
+
+plots
+```{r}
+sc_logtime <- ggplot(df_time,aes(x=Cell,y=Time_log,group=Method,color=Method))+geom_line()+geom_point()+theme_minimal()+xlab("Number of Cells")+ylab("Log2 Time(s) Used")+ggtitle("Log2 Time(s) Used")+scale_color_manual(values=selected_palette)+theme(plot.title=element_text(size=16),legend.title=element_text(size=15),legend.text=element_text(size=14),axis.title=element_text(size=18),axis.text.x=element_text(size=15),axis.text.y=element_text(size=15))
+sc_logtime
+```
+
+
+## Memory
+```{r}
+df_mem <- data.frame(Method=c(rep("ALRA",4),rep("AutoClass(GPU)",4),rep("Bfimpute",4),rep("ccImpute",4),rep("DCA",4),rep("I_Impute",4),rep("kNN_smoothing",4),rep("MAGIC",4),rep("MAGIC_log",4),rep("scRMD",4),rep("afMF",4)),Cell=rep(c("1500","5000","10000","50000"),11),Memory=c(1.636,5.233,8.812,41.256,15.822,18.288,22.872,50.646,9.900,24.782,81.669,NA,64.913,133.745,405.282,NA,4.125,4.681,6.227,16.381,2.384,8.214,NA,NA,1.537,2.989,7.573,70.755,0.834,2.099,4.261,21.992,0.834,2.096,4.259,21.995,3.773,11.724,22.438,111.601,1.597,3.722,6.904,22.310))
+df_mem$Cell <- factor(df_mem$Cell,levels=c("1500","5000","10000","50000"))
+df_mem$Memory_log <- log2(df_mem$Memory)
+```
+
+plots
+```{r}
+sc_logmem <- ggplot(df_mem,aes(x=Cell,y=Memory_log,group=Method,color=Method))+geom_line()+geom_point()+theme_minimal()+xlab("Number of Cells")+ylab("Log2 Max Memory Usage(GB)")+ggtitle("Log2 Max Memory Usage(GB)")+scale_color_manual(values=selected_palette)+theme(plot.title=element_text(size=16),legend.title=element_text(size=15),legend.text=element_text(size=14),axis.title=element_text(size=18),axis.text.x=element_text(size=15),axis.text.y=element_text(size=15))
+sc_logmem
+```
+
+# Recommendation
+'No Obvious Difference' indicates no difference or with both advantages and disadvantages
+'Better or Worse' for advanced application indicates whether compatible or not 
+```{r}
+DE_res <- c("No Obvious Difference","Slightly Worse","Generally Worse","Generally Worse","Slightly Worse","Slightly Worse","Generally Worse","No Obvious Difference","No Obvious Difference","No Obvious Difference","Generally Better")
+DEPB_res <- c("Generally Worse","Generally Worse","Generally Worse","Slightly Worse","Generally Worse","Generally Worse","No Obvious Difference","Generally Worse","Generally Worse","Slightly Worse","Generally Worse")
+
+Class_res <- c("Generally Better","Generally Better","Slightly Better","Slightly Better","No Obvious Difference","Slightly Better","No Obvious Difference","Generally Better","Generally Better","Slightly Better","Generally Better")
+BMPred_res <- c("Generally Better","Generally Better","No Obvious Difference","No Obvious Difference","Slightly Better","Slightly Better","Generally Better","Generally Better","Generally Better","No Obvious Difference","Generally Better")
+AutoCTA_res <- c("Generally Better","Generally Better",NA,NA,"No Obvious Difference",NA,"Generally Better","Generally Better","Generally Better","Slightly Better","Generally Better")
+GSEA_res <- c("No Obvious Difference","Slightly Better","No Obvious Difference","Generally Worse","No Obvious Difference","No Obvious Difference","No Obvious Difference","Slightly Better","Slightly Better","No Obvious Difference","Generally Better")
+Cluster_res <- c("Slightly Better","Slightly Better","No Obvious Difference","No Obvious Difference","Generally Worse","Generally Worse","Generally Worse","Slightly Better","Slightly Better","No Obvious Difference","Slightly Better")
+PTA_res <- c("No Obvious Difference","No Obvious Difference","No Obvious Difference","No Obvious Difference","No Obvious Difference","Generally Worse","Generally Worse","Generally Better","Generally Better","No Obvious Difference","No Obvious Difference")
+PTASl_res <- c("Slightly Worse","Generally Worse","Generally Worse","Generally Worse","Generally Worse","Generally Worse","Slightly Worse","Slightly Worse","Slightly Worse","Slightly Worse","Slightly Worse")
+PTADPT_res <- c("Slightly Better","No Obvious Difference","Slightly Worse","Slightly Better","Generally Worse","Generally Worse",NA,"Slightly Better","Slightly Better","No Obvious Difference","Slightly Better")
+
+SCENIC_res <- c("Slightly Better","Generally Worse",NA,NA,"No Obvious Difference",NA,"No Obvious Difference","No Obvious Difference","No Obvious Difference","No Obvious Difference","Slightly Better")
+CPDB_res <- c("No Obvious Difference","Slightly Worse",NA,NA,"Generally Worse",NA,NA,"Slightly Worse","Slightly Worse","No Obvious Difference","Slightly Worse")
+SCBulk_res <- c("Generally Better","Slightly Better","No Obvious Difference","No Obvious Difference","Slightly Better","Generally Better","Generally Better","Generally Better","Generally Better","No Obvious Difference","Generally Better")
+SP_res <- c("Generally Better","Generally Better","Generally Worse","No Obvious Difference","Generally Better","No Obvious Difference","Generally Better","No Obvious Difference","No Obvious Difference","No Obvious Difference","Slightly Better")
+#FISH_res <- c("Generally Better","Generally Worse","Generally Better","No Obvious Difference","Generally Worse","Generally Better","Slightly Worse","Slightly Worse","Generally Worse","No Obvious Difference","Generally Better")
+CellCellCor_res <- c("Generally Better","Slightly Better","No Obvious Difference","No Obvious Difference","No Obvious Difference","Slightly Worse","Generally Better","Generally Better","Generally Better","No Obvious Difference","Generally Better")
+
+recomm <- data.frame(Method=rep(c("ALRA","AutoClass","Bfimpute","ccImpute","DCA","I_Impute","kNN_smoothing","MAGIC","MAGIC_log","scRMD","afMF"),15),Evaluation=rep(c("Differential Expression Analysis(SC Level)","Differential Expression Analysis(PB Level)","GSEA(SC Level DE-based)","Classification","Biomarker Prediction","Automatic Cell Type Annotation","Dimension Reduction & Clustering","Pseudotime Trajectory Analysis(Monocle3)","Pseudotime Trajectory Analysis(Slingshot)","Pseudotime Trajectory Analysis(DPT)","AUCell&SCENIC","Cell-Cell Comm(CellPhoneDB&CellChat)","SC-Bulk Profiling Similarity","mRNA-Surface Protein Correlation","Cell-Cell Correlation Visualization"),each=11),Rate=c(DE_res,DEPB_res,GSEA_res,Class_res,BMPred_res,AutoCTA_res,Cluster_res,PTA_res,PTASl_res,PTADPT_res,SCENIC_res,CPDB_res,SCBulk_res,SP_res,CellCellCor_res))
+recomm$Method <- factor(recomm$Method,levels=c("afMF","ALRA","AutoClass","Bfimpute","ccImpute","DCA","I_Impute","kNN_smoothing","MAGIC","MAGIC_log","scRMD"))
+recomm$Evaluation <- factor(recomm$Evaluation,levels=c("Differential Expression Analysis(SC Level)","Differential Expression Analysis(PB Level)","GSEA(SC Level DE-based)","Classification","Biomarker Prediction","Automatic Cell Type Annotation","Dimension Reduction & Clustering","Pseudotime Trajectory Analysis(Monocle3)","Pseudotime Trajectory Analysis(Slingshot)","Pseudotime Trajectory Analysis(DPT)","AUCell&SCENIC","Cell-Cell Comm(CellPhoneDB&CellChat)","SC-Bulk Profiling Similarity","mRNA-Surface Protein Correlation","Cell-Cell Correlation Visualization"))
+recomm$Rate <- ifelse(recomm$Rate=="No Obvious Difference","No Difference/With Pros&Cons",recomm$Rate)
+recomm$Rate <- factor(recomm$Rate,levels=c("Generally Worse","Slightly Worse","No Difference/With Pros&Cons","Slightly Better","Generally Better"))
+recomm$Score <- as.numeric(recomm$Rate)
+
+rank1 <- recomm %>% dplyr::group_by(Method) %>% dplyr::summarize(Scores=sum(Score,na.rm=T))
+rank1 <- rank1[order(rank1$Scores,decreasing=TRUE),]$Method
+recomm$Method <- factor(recomm$Method,levels=rank1)
+```
+
+```{r}
+recomm_hm <- ggplot(data=recomm,aes(x=Method,y=Evaluation,fill=Rate))+geom_tile()+scale_fill_manual(values=c("royalblue1","lightskyblue1","cornsilk","darkorange","goldenrod1"))+theme(plot.title=element_text(size=16),legend.title=element_text(size=15),legend.text=element_text(size=14),axis.title=element_text(size=18),axis.text.x=element_text(angle=90,size=15),axis.text.y=element_text(size=13))
+recomm_hm
+```
+
+# combine
+```{r fig.height=5, fig.width=7.6}
+p1 <- ggarrange(sc_logtime,sc_logmem,ncol=2,nrow=1,labels="AUTO")
+p2 <- ggarrange(recomm_hm,ncol=1,nrow=1,labels=c("C"))
+ggarrange(p1,p2,nrow=2,ncol=1)
+```
+
+
+

@@ -1,0 +1,3089 @@
+---
+title: "Pseudotime Trajectory"
+output: html_notebook
+---
+
+load library
+```{r message=FALSE, warning=FALSE}
+library(Seurat)
+library(ggplot2)
+library(SingleCellExperiment)
+library(scran)
+library(SeuratData)
+library(edgeR)
+library(limma)
+library(clusterProfiler)
+library(data.table)
+library(SingleCellExperiment)
+library(SummarizedExperiment)
+library(muscat)
+library(pROC)
+library(igraph)
+library(mclust)
+library(cluster)
+library(SCINA)
+library(caret)
+library(MAST)
+library(AUCell)
+library(HGNChelper)
+library(SeuratDisk)
+library(monocle3)
+library(ggpubr)
+library(slingshot)
+library(grDevices)
+library(RColorBrewer)
+library(randomForest)
+library(caTools)
+library(mltools)
+#library(stringr)
+library(reldist)
+library(aricode)
+library(TSCAN)
+library(reshape2)
+library(pheatmap)
+library(philentropy)
+library(rawr)
+library(splatter)
+library(combinat)
+library(destiny)
+library(dpt)
+library(monocle)
+
+selected_palette <- c("aquamarine4","azure4","powderblue","burlywood","coral","cornflowerblue","cyan3","darkgoldenrod2","darkorange3","peachpuff","royalblue","khaki2","plum1","lightsalmon")
+selected_palette2 <- c("aquamarine4","azure4","powderblue","burlywood","coral","cornflowerblue","cyan3","darkorange3","peachpuff","royalblue","khaki2","plum1","lightsalmon")
+```
+
+functions
+```{r}
+#monocle3
+get_earliest_principal_node <- function(cds,time_bin="0_9_0"){
+  cell_ids <- which(colData(cds)[,"group"]==time_bin)
+  closest_vertex <- cds@principal_graph_aux[["UMAP"]]$pr_graph_cell_proj_closest_vertex
+  closest_vertex <- as.matrix(closest_vertex[colnames(cds),])
+  root_pr_nodes <- igraph::V(principal_graph(cds)[["UMAP"]])$name[as.numeric(names(which.max(table(closest_vertex[cell_ids,]))))]
+  return(root_pr_nodes)
+}
+
+getCellOrder <- function(cds,metad){
+    metad <- metad[colnames(cds),]
+    metad$cellorder1 <- cds@principal_graph_aux@listData$UMAP$pseudotime
+    return(metad)
+}
+
+evalSCC <- function(x,col1,col2,method="spearman"){
+    res <- cor.test(x[,col1],x[,col2],method=method)
+    return(res$estimate)
+}
+
+getCDS <- function(x,metad,time_bin="0_9_0"){
+    #x <- x[,colSums(x)!=0]
+    #metad <- metad[colnames(x),]
+    cds <- new_cell_data_set(x,cell_metadata=metad)
+    cds <- cds[,colSums(exprs(cds))!=0]
+    cds <- estimate_size_factors(cds)
+    cds <- preprocess_cds(cds,norm_method="none")
+    cds <- reduce_dimension(cds)
+    cds <- cluster_cells(cds)
+    cds <- learn_graph(cds)
+    cds <- order_cells(cds,root_pr_nodes=get_earliest_principal_node(cds,time_bin))
+}
+
+plotMonocle3 <- function(cds,color_g,datname="raw",rd_method="UMAP"){
+    plot_cells(cds,color_cells_by=color_g,label_groups_by_cluster=FALSE,label_cell_groups=FALSE,label_leaves=FALSE,label_branch_points=FALSE,label_roots=FALSE,show_trajectory_graph=FALSE,trajectory_graph_segment_size=1.5,group_label_size=4,graph_label_size=4,cell_size=2.5,reduction_method=rd_method)+ggtitle(datname)
+}
+
+#slingshot
+getSlingshot <- function(x,metad,startclu="0_9_0",endclu=NULL,scale_=FALSE){
+    print("process...")
+    tmp <- SingleCellExperiment(assays=list(logcounts=as.matrix(x)),colData=metad)
+    tmp_pca <- prcomp(t(assays(tmp)$logcounts),scale.=scale_) #already lognorm
+    reducedDims(tmp) <- SimpleList(PCA=tmp_pca$x[,1:2])
+    tmp <- slingshot(tmp,clusterLabels='group',reducedDim='PCA',start.clus=startclu,end.clus=endclu)
+    return(tmp)
+}
+
+evalSlingshot <- function(x,method="spearman",...){
+    pt_col <- grep("slingPseudotime",colnames(colData(x)))
+    lineages <- c(...)
+    res <- c()
+    for(y in lineages){
+        #determine by max overlaps cell lineages
+        max_ovlp <- which.max(sapply(pt_col,function(z) 
+            sum(rownames(colData(x)[!is.na(colData(x)[,z]),])%in%rownames(colData(x)[!is.na(colData(x)[,y]),])) ))
+        max_cor <- cor.test(colData(x)[,pt_col[max_ovlp]],colData(x)[,y],method=method)$estimate
+        res <- c(res,max_cor)
+    }
+    names(res) <- lineages
+    return(res)
+}
+
+evalPOS <- function(sc,lineage,meta){
+    pt_col <- grep("slingPseudotime",colnames(colData(sc)))
+    #max_cor <- which.max(apply(colData(sc)[,pt_col],2,function(z) cor.test(z,colData(sc)[,lineage],method="spearman")$estimate ))
+    max_ovlp <- which.max(sapply(pt_col,function(z) 
+            sum(rownames(colData(sc)[!is.na(colData(sc)[,z]),])%in%rownames(colData(sc)[!is.na(colData(sc)[,lineage]),])) ))
+    ptorder <- colData(sc)[order(colData(sc)[,pt_col[max_ovlp]]),]$cell
+    ptorder <- ptorder[ptorder%in%meta[!is.na(meta[,lineage]),"cell"]]
+    res <- orderscore(meta[,c("cell",lineage)],list(ptorder))
+    return(res)
+}
+
+evalPOS_M3 <- function(sc,pt,timeNum){
+    ptorder <- sc[order(sc[,pt]),]$cell
+    res <- orderscore(sc[!is.na(sc[,timeNum]),c("cell",timeNum)],list(ptorder[ptorder%in%sc[!is.na(sc[,timeNum]),"cell"]]))
+    return(res)
+}
+
+evalOverlap <- function(x,...){
+    pt_col <- grep("slingPseudotime",colnames(colData(x)))
+    lineages <- c(...)
+    res <- c()
+    for(y in lineages){
+        max_ovlp <- max(sapply(pt_col,function(z) 
+            sum(rownames(colData(x)[!is.na(colData(x)[,z]),])%in%rownames(colData(x)[!is.na(colData(x)[,y]),]))/length(rownames(colData(x)[!is.na(colData(x)[,y]),])) ))
+        res <- c(res,max_ovlp)
+    }
+    names(res) <- lineages
+    return(res)
+}
+
+evalFalseOverlap <- function(x,...){
+    pt_col <- grep("slingPseudotime",colnames(colData(x)))
+    lineages <- c(...)
+    tmpmeta <- colData(x)[colData(x)$celltype!=0,] # remove root cells
+    #tmpmeta <- colData(x)
+    res <- c()
+    for(y in lineages){
+        ovlp <- sapply(pt_col,function(z) 
+            sum(rownames(tmpmeta[!is.na(tmpmeta[,z]),])%in%rownames(tmpmeta[!is.na(tmpmeta[,y]),]))/length(rownames(tmpmeta[!is.na(tmpmeta[,y]),])) )
+        res <- c(res,mean(ovlp[-which.max(ovlp)]))
+    }
+    names(res) <- lineages
+    return(res)
+}
+
+evalNumTraj <- function(x,TrueTraj){
+    pt_col <- grep("slingPseudotime",colnames(colData(x)))
+    res <- c(length(pt_col),TrueTraj)
+    names(res) <- c("Num_Infered_Traj","True_Num_Traj")
+    return(res)
+}
+
+plotTrajectory <- function(x,ng=10){
+    tmpcolor <- brewer.pal(ng,'Set3')[factor(x$group)]
+    plot(reducedDims(x)$PCA,col=tmpcolor,asp=1,pch=16)
+    lines(SlingshotDataSet(x),lwd=2,type='lineages',col='black')
+    legend("topright",legend=levels(factor(x$group)),pch=19,col=brewer.pal(ng,'Set3')[factor(levels(factor(x$group)))])
+
+}
+
+plotTrajectory2 <- function(dataset,x,ng=3){
+    tmpcolor <- brewer.pal(ng,'Set1')[dataset[[x]]$celltype_f]
+    plot(reducedDims(dataset[[x]])$PCA,col=tmpcolor,asp=1,pch=16)
+    lines(SlingshotDataSet(dataset[[x]]),lwd=2,type='lineages',col='black')
+    legend("topright",legend=levels(dataset[[x]]$celltype_f),pch=19,col=brewer.pal(ng,'Set1')[factor(levels(dataset[[x]]$celltype_f))])
+    title(main=x)
+}
+
+evalOverlapTable <- function(x,...){
+    pt_col <- grep("slingPseudotime",colnames(colData(x)))
+    lineages <- c(...)
+    res <- data.frame(lineages=lineages)
+    rownames(res) <- res$lineages
+    res <- cbind(res,matrix(NA,ncol=length(pt_col),nrow=length(lineages)))
+    for(y in lineages){
+        ovlp <- sapply(pt_col,function(z) 
+            sum(rownames(colData(x)[!is.na(colData(x)[,z]),])%in%rownames(colData(x)[!is.na(colData(x)[,y]),]))/length(rownames(colData(x)[!is.na(colData(x)[,y]),])) )
+        res[y,2:ncol(res)] <- ovlp
+    }
+    #names(res) <- lineages
+    return(as.data.frame(res[,-1]))
+}
+
+evalSlingshotAll <- function(x,method="spearman",...){
+    pt_col <- grep("slingPseudotime",colnames(colData(x)))
+    lineages <- c(...)
+    res <- data.frame(lineages=lineages)
+    rownames(res) <- res$lineages
+    res <- cbind(res,matrix(NA,ncol=length(pt_col),nrow=length(lineages)))
+    for(y in lineages){
+        corres <- apply(colData(x)[,pt_col],2,function(z)
+            cor.test(z,colData(x)[,y],method=method)$estimate )
+        res[y,2:ncol(res)] <- corres
+    }
+    return(res[,-1])
+}
+
+evalSlingshotPCT <- function(x){
+    pt_col <- grep("slingPseudotime",colnames(colData(x)))
+    res <- data.frame(PT=colnames(colData(x))[pt_col])
+    rownames(res) <- res$PT
+    res <- cbind(res,matrix(NA,ncol=length(unique(colData(x)$celltype_f)),nrow=length(pt_col)))
+    for(y in pt_col){
+        tmp_PT <- colData(x)[!is.na(colData(x)[,y]),]
+        CTPCT <- table(tmp_PT$celltype_f)/nrow(tmp_PT)
+        res[colnames(colData(x))[y],2:ncol(res)] <- CTPCT
+        colnames(res) <- c("PT","PathGroup1","PathGroup2","PathGroup3")
+    }
+    return(t(res[,-1]))
+}
+
+getDPT <- function(x,tip_p){
+    print("start")
+    set.seed(123)
+    dm <- DiffusionMap(t(x))
+    dpt <- destiny::DPT(dm,tips=tip_p) #end point
+    return(dpt)
+}
+
+eval_DPT_SCC <- function(dpt,meta,scol,method="spearman"){
+    res <- cor.test(dpt$dpt,meta[rownames(dpt@branch),scol],method=method)
+    return(res$estimate)
+}
+
+eval_DPT_POS <- function(dpt,meta,scol,timeNum="celltype"){
+    meta <- meta[rownames(dpt@branch),]
+    meta <- meta[!is.na(meta[,scol]),c("cell",timeNum)]
+    dpt_rank <- dpt$dpt
+    names(dpt_rank) <- rownames(dpt@branch)
+    dpt_rank <- names(dpt_rank[order(dpt_rank)])
+    dpt_rank <- dpt_rank[dpt_rank%in%meta$cell]
+    res <- orderscore(meta,list(dpt_rank))
+    return(res)
+}
+
+evalBranch_DPT <- function(x,meta){
+    meta <- meta[rownames(x@branch),]
+    acc <- -mean(sapply(unique(x$Branch),function(i){
+        p <- table(meta[x$Branch==i,"celltype_c"])/sum(x$Branch==i,na.rm=TRUE)
+        sum(p*log(p),na.rm=TRUE)
+    }))
+
+    pur <- -mean(sapply(unique(meta$celltype_c),function(sct){
+        p <- table(x$Branch[meta$celltype_c==sct])/sum(meta$celltype_c==sct,na.rm=TRUE)
+        sum(p*log(p),na.rm=TRUE)
+    }))
+
+    ARI <- adjustedRandIndex(meta$celltype_c,x$Branch)
+
+    NMI_value <- NMI(x$Branch[!is.na(x$Branch)],meta$celltype_c[!is.na(x$Branch)])
+    #NMI_value <- NMI(x$lv_clu,x$celltype,variant="sum")
+    
+    df <- c(acc,pur,ARI,NMI_value)
+    names(df) <- c("acc","pur","ARI","NMI")
+    return(df)
+}
+
+GM_state <- function(cds,T_label="celltype_c",start_p="H2228"){
+  if (length(unique(phenoData(cds)$State)) > 1){
+      #T0_counts <- table(pData(cds)$State,pData(cds)[,T_label])[,"0"]
+      #return(as.numeric(names(T0_counts)[which(T0_counts == max(T0_counts))]))
+      root_counts <- table(cds@phenoData@data[cds@phenoData@data[,T_label]==start_p,]$State)
+      root_state <- names(root_counts[which.max(root_counts)])
+      return(root_state)
+  } else {
+    return(1)
+  }
+}
+
+getPsig <- function(x){
+    if(x>0.1){
+        return(" ")
+    }else if(x<=0.0005){
+        return("***")
+    }else if(x<=0.005){
+        return("**")
+    }else if(x<=0.05){
+        return("*")
+    }else if(x<=0.1){
+        return(".")
+    }
+}
+```
+
+# real data
+## cellbench cellmix1
+### preprocess data
+```{r message=FALSE, warning=FALSE}
+##raw
+raw_dat <- fread("rawcount_txt/cellbench_cellmix1_genebycell.txt",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+raw_dat <- as.matrix(raw_dat,rownames=1)
+raw_dat_keep <- raw_dat[,]
+
+##imputed
+MAGIClog_dat <- fread("MAGIC_log/cellbench_cellmix1_genebycell.tsv",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+MAGIClog_dat <- as.matrix(MAGIClog_dat,rownames=1)
+alra_dat <- fread("alra/cellbench_cellmix1_genebycell_alra.txt",sep="\t",stringsAsFactors=FALSE)
+alra_dat <- as.matrix(alra_dat,rownames=1)
+dca_dat <- fread("dca/cellbench_cellmix1/mean.tsv",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+dca_dat <- as.matrix(dca_dat,rownames=1)
+MAGIC_dat <- fread("MAGIC/cellbench_cellmix1_genebycell.tsv",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+MAGIC_dat <- as.matrix(MAGIClog_dat,rownames=1)
+AutoClass_dat <- fread("AutoClass/cellbench_cellmix1_genebycell_AC.txt",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+AutoClass_dat <- as.matrix(AutoClass_dat,rownames=1)
+ccImpute_dat <- fread("ccImpute/cellbench_cellmix1_genebycell_cc.txt",sep="\t",stringsAsFactors=FALSE)
+ccImpute_dat <- as.matrix(ccImpute_dat,rownames=1)
+ks_dat <- fread("knn_smoothing/cellbench_cellmix1_genebycell_ks.txt",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+ks_dat <- as.matrix(ks_dat,rownames=1)
+Iimpute_dat <- fread("I_Impute/cellbench_cellmix1_genebycell_CImp.txt",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+Iimpute_dat <- as.matrix(Iimpute_dat,rownames=1)
+scRMDnorm_dat <- fread("scRMD/cellbench_cellmix1_genebycell_scRMDlognorm.txt",sep="\t",stringsAsFactors=FALSE)
+scRMDnorm_dat <- as.matrix(scRMDnorm_dat,rownames=1)
+Bf_dat <- fread("Bfimpute/cellbench_cellmix1_genebycell_Bfimpute_specc.txt",sep="\t",stringsAsFactors=FALSE)
+Bf_dat <- as.matrix(Bf_dat,rownames=1)
+
+afMF_dat <- fread("afMF/imputed_data/cellbench_cellmix1_sigma3_0_convergence_True.txt",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+afMF_dat <- as.matrix(afMF_dat,rownames=1)
+
+metadat <- read.csv("metadata/cellmix1.metadata.csv",header=TRUE,stringsAsFactors=FALSE)
+metadat$group <- paste(metadat$H1975,metadat$H2228,metadat$HCC827,sep="_")
+rownames(metadat) <- colnames(raw_dat)
+prep_traj_order <- function(cds){
+  cds$H2228_to_H1975 = NA
+  cds$H2228_to_H1975[cds$group=="0_9_0"] = 0
+  cds$H2228_to_H1975[cds$group=="1_7_1"] = 1
+  cds$H2228_to_H1975[cds$group=="2_5_2"] = 2
+  cds$H2228_to_H1975[cds$group=="3_3_3"] = 3
+  cds$H2228_to_H1975[cds$group=="5_2_2"] = 4
+  cds$H2228_to_H1975[cds$group=="7_1_1"] = 5
+  cds$H2228_to_H1975[cds$group=="9_0_0"] = 6
+  
+  cds$H2228_to_HCC827 = NA
+  cds$H2228_to_HCC827[cds$group=="0_9_0"] = 0
+  cds$H2228_to_HCC827[cds$group=="1_7_1"] = 1
+  cds$H2228_to_HCC827[cds$group=="2_5_2"] = 2
+  cds$H2228_to_HCC827[cds$group=="3_3_3"] = 3
+  cds$H2228_to_HCC827[cds$group=="2_2_5"] = 4
+  cds$H2228_to_HCC827[cds$group=="1_1_7"] = 5
+  cds$H2228_to_HCC827[cds$group=="0_0_9"] = 6
+  
+  cds$H1975_to_HCC827 = NA
+  cds$H1975_to_HCC827[cds$group=="9_0_0"] = 0
+  cds$H1975_to_HCC827[cds$group=="7_1_1"] = 1
+  cds$H1975_to_HCC827[cds$group=="5_2_2"] = 2
+  cds$H1975_to_HCC827[cds$group=="3_3_3"] = 3
+  cds$H1975_to_HCC827[cds$group=="2_2_5"] = 4
+  cds$H1975_to_HCC827[cds$group=="1_1_7"] = 5
+  cds$H1975_to_HCC827[cds$group=="0_0_9"] = 6
+  cds <- cds[cds$traj=="YES",]
+  return(cds)
+}
+metadat <- prep_traj_order(metadat)
+metadat$cell <- rownames(metadat)
+metadat$celltype <- NA
+metadat[metadat$group%in%c("0_9_0","1_7_1","2_5_2","3_3_3"),]$celltype <- 0 #root H2228
+metadat[metadat$group%in%c("5_2_2","7_1_1","9_0_0"),]$celltype <- 1 #H1975
+metadat[metadat$group%in%c("0_0_9","1_1_7","2_2_5"),]$celltype <- 2 #HCC827
+
+metadat$celltype_c <- NA
+metadat[metadat$celltype==0,]$celltype_c <- "H2228" #root H2228
+metadat[metadat$celltype==1,]$celltype_c <- "H1975" #H1975
+metadat[metadat$celltype==2,]$celltype_c <- "HCC827"
+
+metadat$celltype_f <- factor(metadat$celltype_c,levels=c("H2228","H1975","HCC827"))
+```
+
+normalized/log2 data
+```{r}
+raw_dat <- CreateSeuratObject(counts=raw_dat,meta.data=metadat,min.cells=0,min.features=0)
+raw_dat <- NormalizeData(raw_dat)
+raw_dat <- as.matrix(raw_dat@assays$RNA@data)
+
+dca_dat <- log2(dca_dat)
+
+ks_dat <- CreateSeuratObject(counts=ks_dat,meta.data=metadat,min.cells=0,min.features=0)
+ks_dat <- NormalizeData(ks_dat)
+ks_dat <- as.matrix(ks_dat@assays$RNA@data)
+
+Iimpute_dat <- log2(Iimpute_dat+min(Iimpute_dat[Iimpute_dat!=0]))
+```
+
+combine normalized data
+```{r}
+dat <- list(raw=raw_dat,ALRA=alra_dat,AutoClass=AutoClass_dat,Bfimpute=Bf_dat,ccImpute=ccImpute_dat,DCA=dca_dat,I_Impute=Iimpute_dat,kNN_smoothing=ks_dat,MAGIC=MAGIC_dat,MAGIC_log=MAGIClog_dat,scRMD=scRMDnorm_dat,afMF=afMF_dat)
+rm(raw_dat)
+rm(alra_dat)
+rm(AutoClass_dat)
+rm(Bf_dat)
+rm(ccImpute_dat)
+rm(Iimpute_dat)
+rm(ks_dat)
+rm(dca_dat)
+rm(MAGIC_dat)
+rm(MAGIClog_dat)
+rm(scRMDnorm_dat)
+rm(afMF_dat)
+
+colnames(dat$ALRA) <- colnames(dat$raw)
+dat <- lapply(dat,function(x) x[,rownames(metadat)])
+raw_dat_keep <- raw_dat_keep[,rownames(metadat)]
+```
+
+### evaluate
+#### monocle3
+processing raw data
+```{r}
+cds <- new_cell_data_set(raw_dat_keep,cell_metadata=metadat)
+cds <- preprocess_cds(cds)
+cds <- reduce_dimension(cds)
+cds <- cluster_cells(cds)
+cds <- learn_graph(cds)
+
+cds <- order_cells(cds,root_pr_nodes=get_earliest_principal_node(cds))
+#plot_cells(cds,color_cells_by="pseudotime",label_cell_groups=FALSE,label_leaves=TRUE,label_branch_points=TRUE,trajectory_graph_segment_size=1.5,group_label_size=4,graph_label_size=4,cell_size=2.5)
+
+tmp <- getCellOrder(cds,metadat)
+evalSCC(tmp,"cellorder1","H2228_to_H1975","spearman")
+evalSCC(tmp,"cellorder1","H2228_to_HCC827","spearman")
+```
+
+analysis
+```{r message=FALSE, warning=FALSE}
+res1 <- lapply(dat,getCDS,metadat)
+res1[["monocle3"]] <- cds
+res1order <- lapply(res1,getCellOrder,metadat)
+res1_1 <- as.data.frame(lapply(res1order,evalSCC,"cellorder1","H2228_to_H1975","spearman"))
+res1_2 <- as.data.frame(lapply(res1order,evalSCC,"cellorder1","H2228_to_HCC827","spearman"))
+res1_pt_m <- as.data.frame(t(rbind(res1_1,res1_2)))
+colnames(res1_pt_m) <- c("cellmix1_pt1","cellmix1_pt2")
+res1_pt_m
+```
+
+POS
+```{r}
+tmp1 <- as.data.frame(lapply(res1order,evalPOS_M3,"cellorder1","H2228_to_H1975"))
+tmp2 <- as.data.frame(lapply(res1order,evalPOS_M3,"cellorder1","H2228_to_HCC827"))
+
+res1_pos_m <- as.data.frame(t(rbind(tmp1,tmp2)))
+colnames(res1_pos_m) <- c("cellmix1_pos1","cellmix1_pos2")
+res1_pos_m
+```
+
+##### DR plots
+large Group plots(PCA)
+```{r fig.height=4, fig.width=7.5}
+p_list <- list()
+for(x in names(res1)){
+    p_list[[x]] <- plotMonocle3(res1[[x]],"celltype_c",x,rd_method="PCA")
+}
+ggarrange(plotlist=p_list[c("raw","afMF","ALRA","AutoClass","MAGIC_log","monocle3")],ncol=3,nrow=2)
+```
+
+large Group plots(UMAP)
+```{r fig.height=4, fig.width=7.5}
+p_list <- list()
+for(x in names(res1)){
+    p_list[[x]] <- plotMonocle3(res1[[x]],"celltype_c",x,rd_method="UMAP")
+}
+cellmix1_UMAP_main6 <- ggarrange(plotlist=p_list[c("raw","afMF","ALRA","AutoClass","MAGIC_log","monocle3")],ncol=3,nrow=2)
+cellmix1_UMAP_main6
+```
+
+others supp(UMAP)
+```{r fig.height=4, fig.width=7.5}
+cellmix1_UMAP_others <- ggarrange(plotlist=p_list[c("Bfimpute","ccImpute","DCA","I_Impute","kNN_smoothing","scRMD")],ncol=3,nrow=2)
+cellmix1_UMAP_others
+```
+
+PT plots(UMAP)
+```{r fig.height=4, fig.width=7.5}
+p_list <- list()
+for(x in names(res1)){
+    p_list[[x]] <- plotMonocle3(res1[[x]],"pseudotime",x,rd_method="UMAP")
+}
+cellmix1_UMAP_main6_pt <- ggarrange(plotlist=p_list[c("raw","afMF","ALRA","AutoClass","MAGIC_log","monocle3")],ncol=3,nrow=2)
+cellmix1_UMAP_main6_pt
+```
+
+save results
+```{r}
+tmp_res <- list(order_dat=res1order,res_pt=res1_pt_m,res_pos=res1_pos_m)
+saveRDS(tmp_res,"results/SC_Pseudotime_Trajectory/cellmix1_monocle3.rds")
+```
+
+#### slingshot
+tutorial processing
+```{r}
+sce <- SingleCellExperiment(assays=List(counts=raw_dat_keep))
+FQnorm <- function(counts){
+    rk <- apply(counts,2,rank,ties.method='min')
+    counts.sort <- apply(counts,2,sort)
+    refdist <- apply(counts.sort,1,median)
+    norm <- apply(rk,2,function(r){ refdist[r] })
+    rownames(norm) <- rownames(counts)
+    return(norm)
+}
+assays(sce)$norm <- FQnorm(assays(sce)$counts)
+sce <- log1p(assays(sce)$norm)
+dat[["slingshot"]] <- sce
+```
+
+run(endclu=c("0_0_9","9_0_0"))
+```{r message=FALSE, warning=FALSE}
+res1_ss <- lapply(dat,getSlingshot,metadat,endclu=c("9_0_0","0_0_9"))
+
+res1_scc_ss <- as.data.frame(lapply(res1_ss,evalSlingshot,"spearman","H2228_to_H1975","H2228_to_HCC827"))
+res1_scc_ss <- as.data.frame(t(res1_scc_ss))
+res1_scc_ss
+
+res1_ovlp_ss <- as.data.frame(lapply(res1_ss,evalOverlap,"H2228_to_H1975","H2228_to_HCC827"))
+res1_ovlp_ss <- as.data.frame(t(res1_ovlp_ss))
+res1_ovlp_ss
+
+res1_fovlp_ss <- as.data.frame(lapply(res1_ss,evalFalseOverlap,"H2228_to_H1975","H2228_to_HCC827"))
+res1_fovlp_ss <- as.data.frame(t(res1_fovlp_ss))
+res1_fovlp_ss
+
+tmp1 <- as.data.frame(lapply(res1_ss,evalPOS,"H2228_to_H1975",metadat))
+tmp2 <- as.data.frame(lapply(res1_ss,evalPOS,"H2228_to_HCC827",metadat))
+res1_pos_ss <- rbind(tmp1,tmp2)
+res1_pos_ss <- as.data.frame(t(res1_pos_ss))
+res1_pos_ss
+```
+
+overlapTable
+```{r}
+sum(metadat$celltype==0)/sum(!is.na(metadat$H2228_to_H1975))
+sum(metadat$celltype==0)/sum(!is.na(metadat$H2228_to_HCC827))
+res1_ovlp_tb_ss <- lapply(res1_ss,evalOverlapTable,"H2228_to_H1975","H2228_to_HCC827")
+res1_ovlp_tb_ss <- as.data.frame(t(as.data.frame(res1_ovlp_tb_ss)))
+res1_ovlp_tb_ss
+```
+
+plots 3 group
+```{r}
+for(x in names(res1_ss)){
+    plotTrajectory2(res1_ss,x)
+}
+```
+
+save results
+```{r}
+tmp_res <- list(data=res1_ss,scc=res1_scc_ss,pos=res1_pos_ss,overlap_table=res1_ovlp_tb_ss,overlap=res1_ovlp_ss,f_overlap=res1_fovlp_ss)
+saveRDS(tmp_res,"results/SC_Pseudotime_Trajectory/cellmix1_slingshot.rds")
+```
+
+#### DPT
+##### pseudotime
+pseudotime
+```{r}
+H2228 <- which(metadat$group=="0_9_0")
+H1975 <- which(metadat$group=="9_0_0")
+HCC827 <- which(metadat$group=="0_0_9")
+
+dpt_res <- lapply(dat[-c(8,12)],getDPT,tip_p=c(H2228[3],H1975[5],HCC827[1]))
+
+## SCC and POS
+res1_1 <- as.data.frame(lapply(dpt_res,eval_DPT_SCC,metadat,"H2228_to_H1975","spearman"))
+res1_2 <- as.data.frame(lapply(dpt_res,eval_DPT_SCC,metadat,"H2228_to_HCC827","spearman"))
+res1_pt_m <- as.data.frame(t(rbind(res1_1,res1_2)))
+colnames(res1_pt_m) <- c("cellmix1_pt1","cellmix1_pt2")
+res1_pt_m
+
+tmp1 <- as.data.frame(lapply(dpt_res,eval_DPT_POS,metadat,"H2228_to_H1975"))
+tmp2 <- as.data.frame(lapply(dpt_res,eval_DPT_POS,metadat,"H2228_to_HCC827"))
+res1_pos_m <- as.data.frame(t(rbind(tmp1,tmp2)))
+colnames(res1_pos_m) <- c("cellmix1_pos1","cellmix1_pos2")
+res1_pos_m
+```
+
+plots
+```{r fig.height=4, fig.width=9, message=FALSE, warning=FALSE}
+## plots
+p_branch <- list()
+p_dpt <- list()
+p_celltype <- list()
+p_combine <- list()
+for(x in names(dpt_res)){
+    df <- data.frame(DC1=eigenvectors(dpt_res[[x]]@dm)[,1],DC2=eigenvectors(dpt_res[[x]]@dm)[,2],DPTval=dpt_res[[x]]$dpt,Cell_Type=metadat$celltype_c,Branch=as.character(dpt_res[[x]]$Branch))
+    p_celltype[[x]] <- ggscatter(df,x="DC1",y="DC2",color="Cell_Type",palette="npg")+theme(legend.position="right")+ggtitle(x)
+    p_branch[[x]] <- plot(dpt_res[[x]],root=1,paths_to=c(2,3),col_by='branch')
+    p_dpt[[x]] <- plot(dpt_res[[x]],root=1,paths_to=c(2,3),col_by='dpt')
+    p_combine[[x]] <- ggarrange(p_celltype[[x]],p_branch[[x]],p_dpt[[x]],ncol=3,nrow=1,"AUTO")
+}
+
+# for(x in p_combine){
+#     print(x)
+# }
+
+dpt_DCplots <- ggarrange(p_celltype$raw,p_branch$raw,p_dpt$raw,p_celltype$afMF,p_branch$afMF,p_dpt$afMF,nrow=2,ncol=3)
+dpt_DCplots
+```
+
+trajectory
+```{r}
+res_branch <- as.data.frame(lapply(dpt_res,evalBranch_DPT,metadat))
+as.data.frame(t(res_branch))
+```
+
+save results
+```{r}
+tmp_res <- list(res_pt=res1_pt_m,res_pos=res1_pos_m,res_branch=res_branch)
+saveRDS(tmp_res,"results/SC_Pseudotime_Trajectory/cellmix1_DPT.rds")
+```
+
+## cellbench cellmix2
+### preprocess data
+```{r message=FALSE, warning=FALSE}
+##raw
+raw_dat <- fread("rawcount_txt/cellbench_cellmix2_genebycell.txt",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+raw_dat <- as.matrix(raw_dat,rownames=1)
+raw_dat_keep <- raw_dat[,]
+
+##imputed
+MAGIClog_dat <- fread("MAGIC_log/cellbench_cellmix2_genebycell.tsv",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+MAGIClog_dat <- as.matrix(MAGIClog_dat,rownames=1)
+alra_dat <- fread("alra/cellbench_cellmix2_genebycell_alra.txt",sep="\t",stringsAsFactors=FALSE)
+alra_dat <- as.matrix(alra_dat,rownames=1)
+dca_dat <- fread("dca/cellbench_cellmix2/mean.tsv",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+dca_dat <- as.matrix(dca_dat,rownames=1)
+MAGIC_dat <- fread("MAGIC/cellbench_cellmix2_genebycell.tsv",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+MAGIC_dat <- as.matrix(MAGIClog_dat,rownames=1)
+AutoClass_dat <- fread("AutoClass/cellbench_cellmix2_genebycell_AC.txt",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+AutoClass_dat <- as.matrix(AutoClass_dat,rownames=1)
+ccImpute_dat <- fread("ccImpute/cellbench_cellmix2_genebycell_cc.txt",sep="\t",stringsAsFactors=FALSE)
+ccImpute_dat <- as.matrix(ccImpute_dat,rownames=1)
+ks_dat <- fread("knn_smoothing/cellbench_cellmix2_genebycell_ks.txt",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+ks_dat <- as.matrix(ks_dat,rownames=1)
+Iimpute_dat <- fread("I_Impute/cellbench_cellmix2_genebycell_CImp.txt",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+Iimpute_dat <- as.matrix(Iimpute_dat,rownames=1)
+scRMDnorm_dat <- fread("scRMD/cellbench_cellmix2_genebycell_scRMDlognorm.txt",sep="\t",stringsAsFactors=FALSE)
+scRMDnorm_dat <- as.matrix(scRMDnorm_dat,rownames=1)
+Bf_dat <- fread("Bfimpute/cellbench_cellmix2_genebycell_Bfimpute_specc.txt",sep="\t",stringsAsFactors=FALSE)
+Bf_dat <- as.matrix(Bf_dat,rownames=1)
+
+afMF_dat <- fread("afMF/imputed_data/cellbench_cellmix2_sigma3_0_convergence_True.txt",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+afMF_dat <- as.matrix(afMF_dat,rownames=1)
+
+metadat <- read.csv("metadata/cellmix2.metadata.csv",header=TRUE,stringsAsFactors=FALSE)
+metadat$group <- paste(metadat$H1975,metadat$H2228,metadat$HCC827,sep="_")
+rownames(metadat) <- colnames(raw_dat)
+prep_traj_order <- function(cds){
+  cds$H2228_to_H1975 = NA
+  cds$H2228_to_H1975[cds$group=="0_9_0"] = 0
+  cds$H2228_to_H1975[cds$group=="1_7_1"] = 1
+  cds$H2228_to_H1975[cds$group=="2_5_2"] = 2
+  cds$H2228_to_H1975[cds$group=="3_3_3"] = 3
+  cds$H2228_to_H1975[cds$group=="5_2_2"] = 4
+  cds$H2228_to_H1975[cds$group=="7_1_1"] = 5
+  cds$H2228_to_H1975[cds$group=="9_0_0"] = 6
+  
+  cds$H2228_to_HCC827 = NA
+  cds$H2228_to_HCC827[cds$group=="0_9_0"] = 0
+  cds$H2228_to_HCC827[cds$group=="1_7_1"] = 1
+  cds$H2228_to_HCC827[cds$group=="2_5_2"] = 2
+  cds$H2228_to_HCC827[cds$group=="3_3_3"] = 3
+  cds$H2228_to_HCC827[cds$group=="2_2_5"] = 4
+  cds$H2228_to_HCC827[cds$group=="1_1_7"] = 5
+  cds$H2228_to_HCC827[cds$group=="0_0_9"] = 6
+  
+  cds$H1975_to_HCC827 = NA
+  cds$H1975_to_HCC827[cds$group=="9_0_0"] = 0
+  cds$H1975_to_HCC827[cds$group=="7_1_1"] = 1
+  cds$H1975_to_HCC827[cds$group=="5_2_2"] = 2
+  cds$H1975_to_HCC827[cds$group=="3_3_3"] = 3
+  cds$H1975_to_HCC827[cds$group=="2_2_5"] = 4
+  cds$H1975_to_HCC827[cds$group=="1_1_7"] = 5
+  cds$H1975_to_HCC827[cds$group=="0_0_9"] = 6
+  cds <- cds[cds$traj=="YES",]
+  return(cds)
+}
+metadat <- prep_traj_order(metadat)
+metadat$cell <- rownames(metadat)
+metadat$celltype <- NA
+metadat[metadat$group%in%c("0_9_0","1_7_1","2_5_2","3_3_3"),]$celltype <- 0 #root H2228
+metadat[metadat$group%in%c("5_2_2","7_1_1","9_0_0"),]$celltype <- 1 #H1975
+metadat[metadat$group%in%c("0_0_9","1_1_7","2_2_5"),]$celltype <- 2 #HCC827
+
+metadat$celltype_c <- NA
+metadat[metadat$celltype==0,]$celltype_c <- "H2228" #root H2228
+metadat[metadat$celltype==1,]$celltype_c <- "H1975" #H1975
+metadat[metadat$celltype==2,]$celltype_c <- "HCC827"
+
+metadat$celltype_f <- factor(metadat$celltype_c,levels=c("H2228","H1975","HCC827"))
+```
+
+normalized/log2 data
+```{r}
+raw_dat <- CreateSeuratObject(counts=raw_dat,meta.data=metadat,min.cells=0,min.features=0)
+raw_dat <- NormalizeData(raw_dat)
+raw_dat <- as.matrix(raw_dat@assays$RNA@data)
+
+dca_dat <- log2(dca_dat)
+
+ks_dat <- CreateSeuratObject(counts=ks_dat,meta.data=metadat,min.cells=0,min.features=0)
+ks_dat <- NormalizeData(ks_dat)
+ks_dat <- as.matrix(ks_dat@assays$RNA@data)
+
+Iimpute_dat <- log2(Iimpute_dat+min(Iimpute_dat[Iimpute_dat!=0]))
+```
+
+combine normalized data
+```{r}
+dat <- list(raw=raw_dat,ALRA=alra_dat,AutoClass=AutoClass_dat,Bfimpute=Bf_dat,ccImpute=ccImpute_dat,DCA=dca_dat,I_Impute=Iimpute_dat,kNN_smoothing=ks_dat,MAGIC=MAGIC_dat,MAGIC_log=MAGIClog_dat,scRMD=scRMDnorm_dat,afMF=afMF_dat)
+rm(raw_dat)
+rm(alra_dat)
+rm(AutoClass_dat)
+rm(Bf_dat)
+rm(ccImpute_dat)
+rm(Iimpute_dat)
+rm(ks_dat)
+rm(dca_dat)
+rm(MAGIC_dat)
+rm(MAGIClog_dat)
+rm(scRMDnorm_dat)
+
+rm(afMF_dat)
+
+colnames(dat$ALRA) <- colnames(dat$raw)
+dat <- lapply(dat,function(x) x[,rownames(metadat)])
+raw_dat_keep <- raw_dat_keep[,rownames(metadat)]
+```
+
+### evaluate
+#### monocle3
+tutorial processing raw data
+```{r}
+cds <- new_cell_data_set(raw_dat_keep,cell_metadata=metadat)
+cds <- preprocess_cds(cds)
+cds <- reduce_dimension(cds)
+cds <- cluster_cells(cds)
+cds <- learn_graph(cds)
+
+cds <- order_cells(cds,root_pr_nodes=get_earliest_principal_node(cds))
+#plot_cells(cds,color_cells_by="pseudotime",label_cell_groups=FALSE,label_leaves=TRUE,label_branch_points=TRUE,trajectory_graph_segment_size=1.5,group_label_size=4,graph_label_size=4,cell_size=2.5)
+
+tmp <- getCellOrder(cds,metadat)
+evalSCC(tmp,"cellorder1","H2228_to_H1975","spearman")
+evalSCC(tmp,"cellorder1","H2228_to_HCC827","spearman")
+```
+
+analysis
+```{r message=FALSE, warning=FALSE}
+res1 <- lapply(dat,getCDS,metadat)
+res1[["monocle3"]] <- cds
+res1order <- lapply(res1,getCellOrder,metadat)
+res1_1 <- as.data.frame(lapply(res1order,evalSCC,"cellorder1","H2228_to_H1975","spearman"))
+res1_2 <- as.data.frame(lapply(res1order,evalSCC,"cellorder1","H2228_to_HCC827","spearman"))
+res1_pt_m <- as.data.frame(t(rbind(res1_1,res1_2)))
+colnames(res1_pt_m) <- c("cellmix2_pt1","cellmix2_pt2")
+res1_pt_m
+```
+
+POS
+```{r}
+tmp1 <- as.data.frame(lapply(res1order,evalPOS_M3,"cellorder1","H2228_to_H1975"))
+tmp2 <- as.data.frame(lapply(res1order,evalPOS_M3,"cellorder1","H2228_to_HCC827"))
+
+res1_pos_m <- as.data.frame(t(rbind(tmp1,tmp2)))
+colnames(res1_pos_m) <- c("cellmix1_pos1","cellmix1_pos2")
+res1_pos_m
+```
+
+##### DR plots
+large Group plots(PCA)
+```{r fig.height=4, fig.width=7.5}
+p_list <- list()
+for(x in names(res1)){
+    p_list[[x]] <- plotMonocle3(res1[[x]],"celltype_c",x,rd_method="PCA")
+}
+ggarrange(plotlist=p_list[c("raw","afMF","ALRA","AutoClass","MAGIC_log","monocle3")],ncol=3,nrow=2)
+```
+
+large Group plots(UMAP)
+```{r fig.height=4, fig.width=7.5}
+p_list <- list()
+for(x in names(res1)){
+    p_list[[x]] <- plotMonocle3(res1[[x]],"celltype_c",x,rd_method="UMAP")
+}
+cellmix2_UMAP_main6 <- ggarrange(plotlist=p_list[c("raw","afMF","ALRA","AutoClass","MAGIC_log","monocle3")],ncol=3,nrow=2)
+cellmix2_UMAP_main6
+```
+
+others supp(UMAP)
+```{r fig.height=4, fig.width=7.5}
+cellmix2_UMAP_others <- ggarrange(plotlist=p_list[c("Bfimpute","ccImpute","DCA","I_Impute","kNN_smoothing","scRMD")],ncol=3,nrow=2)
+cellmix2_UMAP_others
+```
+
+PT plots(UMAP)
+```{r fig.height=4, fig.width=7.5}
+p_list <- list()
+for(x in names(res1)){
+    p_list[[x]] <- plotMonocle3(res1[[x]],"pseudotime",x,rd_method="UMAP")
+}
+cellmix2_UMAP_main6_pt <- ggarrange(plotlist=p_list[c("raw","afMF","ALRA","AutoClass","MAGIC_log","monocle3")],ncol=3,nrow=2)
+cellmix2_UMAP_main6_pt
+```
+
+
+save results
+```{r}
+tmp_res <- list(order_dat=res1order,res_pt=res1_pt_m,res_pos=res1_pos_m)
+saveRDS(tmp_res,"results/SC_Pseudotime_Trajectory/cellmix2_monocle3.rds")
+```
+
+
+#### slingshot
+tutorial processing
+```{r}
+sce <- SingleCellExperiment(assays=List(counts=raw_dat_keep))
+FQnorm <- function(counts){
+    rk <- apply(counts,2,rank,ties.method='min')
+    counts.sort <- apply(counts,2,sort)
+    refdist <- apply(counts.sort,1,median)
+    norm <- apply(rk,2,function(r){ refdist[r] })
+    rownames(norm) <- rownames(counts)
+    return(norm)
+}
+assays(sce)$norm <- FQnorm(assays(sce)$counts)
+sce <- log1p(assays(sce)$norm)
+dat[["slingshot"]] <- sce
+```
+
+run(endclu=c("0_0_9","9_0_0"))
+```{r message=FALSE, warning=FALSE}
+res1_ss <- lapply(dat,getSlingshot,metadat,endclu=c("9_0_0","0_0_9"))
+
+res1_scc_ss <- as.data.frame(lapply(res1_ss,evalSlingshot,"spearman","H2228_to_H1975","H2228_to_HCC827"))
+res1_scc_ss <- as.data.frame(t(res1_scc_ss))
+res1_scc_ss
+
+res1_ovlp_ss <- as.data.frame(lapply(res1_ss,evalOverlap,"H2228_to_H1975","H2228_to_HCC827"))
+res1_ovlp_ss <- as.data.frame(t(res1_ovlp_ss))
+res1_ovlp_ss
+
+res1_fovlp_ss <- as.data.frame(lapply(res1_ss,evalFalseOverlap,"H2228_to_H1975","H2228_to_HCC827"))
+res1_fovlp_ss <- as.data.frame(t(res1_fovlp_ss))
+res1_fovlp_ss
+
+tmp1 <- as.data.frame(lapply(res1_ss,evalPOS,"H2228_to_H1975",metadat))
+tmp2 <- as.data.frame(lapply(res1_ss,evalPOS,"H2228_to_HCC827",metadat))
+res1_pos_ss <- rbind(tmp1,tmp2)
+res1_pos_ss <- as.data.frame(t(res1_pos_ss))
+res1_pos_ss
+```
+
+overlapTable
+```{r}
+sum(metadat$celltype==0)/sum(!is.na(metadat$H2228_to_H1975))
+sum(metadat$celltype==0)/sum(!is.na(metadat$H2228_to_HCC827))
+res1_ovlp_tb_ss <- lapply(res1_ss,evalOverlapTable,"H2228_to_H1975","H2228_to_HCC827")
+res1_ovlp_tb_ss <- as.data.frame(t(as.data.frame(res1_ovlp_tb_ss)))
+res1_ovlp_tb_ss
+```
+
+plots 3 group
+```{r}
+for(x in names(res1_ss)){
+    plotTrajectory2(res1_ss,x)
+}
+```
+
+save results
+```{r}
+tmp_res <- list(data=res1_ss,scc=res1_scc_ss,pos=res1_pos_ss,overlap_table=res1_ovlp_tb_ss,overlap=res1_ovlp_ss,f_overlap=res1_fovlp_ss)
+saveRDS(tmp_res,"results/SC_Pseudotime_Trajectory/cellmix2_slingshot.rds")
+```
+
+
+#### DPT
+##### pseudotime
+pseudotime
+```{r}
+H2228 <- which(metadat$group=="0_9_0")
+H1975 <- which(metadat$group=="9_0_0")
+HCC827 <- which(metadat$group=="0_0_9")
+
+dpt_res <- lapply(dat[-c(8,12)],getDPT,tip_p=c(H2228[3],H1975[5],HCC827[1]))
+
+## SCC and POS
+res1_1 <- as.data.frame(lapply(dpt_res,eval_DPT_SCC,metadat,"H2228_to_H1975","spearman"))
+res1_2 <- as.data.frame(lapply(dpt_res,eval_DPT_SCC,metadat,"H2228_to_HCC827","spearman"))
+res1_pt_m <- as.data.frame(t(rbind(res1_1,res1_2)))
+colnames(res1_pt_m) <- c("cellmix2_pt1","cellmix2_pt2")
+res1_pt_m
+
+tmp1 <- as.data.frame(lapply(dpt_res,eval_DPT_POS,metadat,"H2228_to_H1975"))
+tmp2 <- as.data.frame(lapply(dpt_res,eval_DPT_POS,metadat,"H2228_to_HCC827"))
+res1_pos_m <- as.data.frame(t(rbind(tmp1,tmp2)))
+colnames(res1_pos_m) <- c("cellmix2_pos1","cellmix2_pos2")
+res1_pos_m
+```
+
+plots
+```{r fig.height=6, fig.width=9, message=FALSE, warning=FALSE}
+## plots
+p_branch <- list()
+p_dpt <- list()
+p_celltype <- list()
+p_combine <- list()
+for(x in names(dpt_res)){
+    df <- data.frame(DC1=eigenvectors(dpt_res[[x]]@dm)[,1],DC2=eigenvectors(dpt_res[[x]]@dm)[,2],DPTval=dpt_res[[x]]$dpt,Cell_Type=metadat$celltype_c,Branch=as.character(dpt_res[[x]]$Branch))
+    p_celltype[[x]] <- ggscatter(df,x="DC1",y="DC2",color="Cell_Type",palette="npg")+theme(legend.position="right")+ggtitle(x)
+    p_branch[[x]] <- plot(dpt_res[[x]],root=1,paths_to=c(2,3),col_by='branch')
+    p_dpt[[x]] <- plot(dpt_res[[x]],root=1,paths_to=c(2,3),col_by='dpt')
+    p_combine[[x]] <- ggarrange(p_celltype[[x]],p_branch[[x]],p_dpt[[x]],ncol=3,nrow=1,"AUTO")
+}
+
+# for(x in p_combine){
+#     print(x)
+# }
+
+dpt_DCplots <- ggarrange(p_celltype$raw,p_branch$raw,p_dpt$raw,p_celltype$afMF,p_branch$afMF,p_dpt$afMF,p_celltype$MAGIC,p_branch$MAGIC,p_dpt$MAGIC,nrow=3,ncol=3)
+dpt_DCplots
+```
+
+other methods
+```{r fig.height=16,fig.width=9}
+dpt_DCplots_supp <- ggarrange(p_celltype$ALRA,p_branch$ALRA,p_dpt$ALRA,p_celltype$AutoClass,p_branch$AutoClass,p_dpt$AutoClass,p_celltype$Bfimpute,p_branch$Bfimpute,p_dpt$Bfimpute,p_celltype$ccImpute,p_branch$ccImpute,p_dpt$ccImpute,p_celltype$DCA,p_branch$DCA,p_dpt$DCA,p_celltype$I_Impute,p_branch$I_Impute,p_dpt$I_Impute,p_celltype$MAGIC_log,p_branch$MAGIC_log,p_dpt$MAGIC_log,p_celltype$scRMD,p_branch$scRMD,p_dpt$scRMD,nrow=8,ncol=3)
+dpt_DCplots_supp
+```
+
+
+trajectory
+```{r}
+res_branch <- as.data.frame(lapply(dpt_res,evalBranch_DPT,metadat))
+as.data.frame(t(res_branch))
+```
+
+save results
+```{r}
+tmp_res <- list(res_pt=res1_pt_m,res_pos=res1_pos_m,res_branch=res_branch)
+saveRDS(tmp_res,"results/SC_Pseudotime_Trajectory/cellmix2_DPT.rds")
+```
+
+## cellbench cellmix3
+### preprocess data
+```{r message=FALSE, warning=FALSE}
+##raw
+raw_dat <- fread("rawcount_txt/cellbench_cellmix3_genebycell.txt",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+raw_dat <- as.matrix(raw_dat,rownames=1)
+raw_dat_keep <- raw_dat[,]
+
+##imputed
+MAGIClog_dat <- fread("MAGIC_log/cellbench_cellmix3_genebycell.tsv",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+MAGIClog_dat <- as.matrix(MAGIClog_dat,rownames=1)
+alra_dat <- fread("alra/cellbench_cellmix3_genebycell_alra.txt",sep="\t",stringsAsFactors=FALSE)
+alra_dat <- as.matrix(alra_dat,rownames=1)
+dca_dat <- fread("dca/cellbench_cellmix3/mean.tsv",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+dca_dat <- as.matrix(dca_dat,rownames=1)
+MAGIC_dat <- fread("MAGIC/cellbench_cellmix3_genebycell.tsv",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+MAGIC_dat <- as.matrix(MAGIClog_dat,rownames=1)
+AutoClass_dat <- fread("AutoClass/cellbench_cellmix3_genebycell_AC.txt",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+AutoClass_dat <- as.matrix(AutoClass_dat,rownames=1)
+ccImpute_dat <- fread("ccImpute/cellbench_cellmix3_genebycell_cc.txt",sep="\t",stringsAsFactors=FALSE)
+ccImpute_dat <- as.matrix(ccImpute_dat,rownames=1)
+ks_dat <- fread("knn_smoothing/cellbench_cellmix3_genebycell_ks.txt",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+ks_dat <- as.matrix(ks_dat,rownames=1)
+Iimpute_dat <- fread("I_Impute/cellbench_cellmix3_genebycell_CImp.txt",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+Iimpute_dat <- as.matrix(Iimpute_dat,rownames=1)
+scRMDnorm_dat <- fread("scRMD/cellbench_cellmix3_genebycell_scRMDlognorm.txt",sep="\t",stringsAsFactors=FALSE)
+scRMDnorm_dat <- as.matrix(scRMDnorm_dat,rownames=1)
+Bf_dat <- fread("Bfimpute/cellbench_cellmix3_genebycell_Bfimpute_specc.txt",sep="\t",stringsAsFactors=FALSE)
+Bf_dat <- as.matrix(Bf_dat,rownames=1)
+
+afMF_dat <- fread("afMF/imputed_data/cellbench_cellmix3_sigma3_0_convergence_True.txt",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+afMF_dat <- as.matrix(afMF_dat,rownames=1)
+
+metadat <- read.csv("metadata/cellmix3.metadata.csv",header=TRUE,stringsAsFactors=FALSE)
+metadat$group <- paste(metadat$H1975,metadat$H2228,metadat$HCC827,sep="_")
+rownames(metadat) <- colnames(raw_dat)
+prep_traj_order <- function(cds){
+  cds$H2228_to_H1975 = NA
+  cds$H2228_to_H1975[cds$group=="0_9_0"] = 0
+  cds$H2228_to_H1975[cds$group=="1_7_1"] = 1
+  cds$H2228_to_H1975[cds$group=="2_5_2"] = 2
+  cds$H2228_to_H1975[cds$group=="3_3_3"] = 3
+  cds$H2228_to_H1975[cds$group=="5_2_2"] = 4
+  cds$H2228_to_H1975[cds$group=="7_1_1"] = 5
+  cds$H2228_to_H1975[cds$group=="9_0_0"] = 6
+  
+  cds$H2228_to_HCC827 = NA
+  cds$H2228_to_HCC827[cds$group=="0_9_0"] = 0
+  cds$H2228_to_HCC827[cds$group=="1_7_1"] = 1
+  cds$H2228_to_HCC827[cds$group=="2_5_2"] = 2
+  cds$H2228_to_HCC827[cds$group=="3_3_3"] = 3
+  cds$H2228_to_HCC827[cds$group=="2_2_5"] = 4
+  cds$H2228_to_HCC827[cds$group=="1_1_7"] = 5
+  cds$H2228_to_HCC827[cds$group=="0_0_9"] = 6
+  
+  cds$H1975_to_HCC827 = NA
+  cds$H1975_to_HCC827[cds$group=="9_0_0"] = 0
+  cds$H1975_to_HCC827[cds$group=="7_1_1"] = 1
+  cds$H1975_to_HCC827[cds$group=="5_2_2"] = 2
+  cds$H1975_to_HCC827[cds$group=="3_3_3"] = 3
+  cds$H1975_to_HCC827[cds$group=="2_2_5"] = 4
+  cds$H1975_to_HCC827[cds$group=="1_1_7"] = 5
+  cds$H1975_to_HCC827[cds$group=="0_0_9"] = 6
+  cds <- cds[cds$traj=="YES",]
+  return(cds)
+}
+metadat <- prep_traj_order(metadat)
+metadat$cell <- rownames(metadat)
+metadat$celltype <- NA
+metadat[metadat$group%in%c("0_9_0","1_7_1","2_5_2","3_3_3"),]$celltype <- 0 #root H2228
+metadat[metadat$group%in%c("5_2_2","7_1_1","9_0_0"),]$celltype <- 1 #H1975
+metadat[metadat$group%in%c("0_0_9","1_1_7","2_2_5"),]$celltype <- 2 #HCC827
+
+metadat$celltype_c <- NA
+metadat[metadat$celltype==0,]$celltype_c <- "H2228" #root H2228
+metadat[metadat$celltype==1,]$celltype_c <- "H1975" #H1975
+metadat[metadat$celltype==2,]$celltype_c <- "HCC827"
+
+metadat$celltype_f <- factor(metadat$celltype_c,levels=c("H2228","H1975","HCC827"))
+```
+
+normalized/log2 data
+```{r}
+raw_dat <- CreateSeuratObject(counts=raw_dat,meta.data=metadat,min.cells=0,min.features=0)
+raw_dat <- NormalizeData(raw_dat)
+raw_dat <- as.matrix(raw_dat@assays$RNA@data)
+
+dca_dat <- log2(dca_dat)
+
+ks_dat <- CreateSeuratObject(counts=ks_dat,meta.data=metadat,min.cells=0,min.features=0)
+ks_dat <- NormalizeData(ks_dat)
+ks_dat <- as.matrix(ks_dat@assays$RNA@data)
+
+Iimpute_dat <- log2(Iimpute_dat+min(Iimpute_dat[Iimpute_dat!=0]))
+```
+
+combine normalized data
+```{r}
+dat <- list(raw=raw_dat,ALRA=alra_dat,AutoClass=AutoClass_dat,Bfimpute=Bf_dat,ccImpute=ccImpute_dat,DCA=dca_dat,I_Impute=Iimpute_dat,kNN_smoothing=ks_dat,MAGIC=MAGIC_dat,MAGIC_log=MAGIClog_dat,scRMD=scRMDnorm_dat,afMF=afMF_dat)
+rm(raw_dat)
+rm(alra_dat)
+rm(AutoClass_dat)
+rm(Bf_dat)
+rm(ccImpute_dat)
+rm(Iimpute_dat)
+rm(ks_dat)
+rm(dca_dat)
+rm(MAGIC_dat)
+rm(MAGIClog_dat)
+rm(scRMDnorm_dat)
+
+rm(afMF_dat)
+
+colnames(dat$ALRA) <- colnames(dat$raw)
+dat <- lapply(dat,function(x) x[,rownames(metadat)])
+raw_dat_keep <- raw_dat_keep[,rownames(metadat)]
+```
+
+### evaluate
+#### monocle3
+ processing raw data
+```{r}
+cds <- new_cell_data_set(raw_dat_keep,cell_metadata=metadat)
+cds <- preprocess_cds(cds)
+cds <- reduce_dimension(cds)
+cds <- cluster_cells(cds)
+cds <- learn_graph(cds)
+
+cds <- order_cells(cds,root_pr_nodes=get_earliest_principal_node(cds))
+#plot_cells(cds,color_cells_by="pseudotime",label_cell_groups=FALSE,label_leaves=TRUE,label_branch_points=TRUE,trajectory_graph_segment_size=1.5,group_label_size=4,graph_label_size=4,cell_size=2.5)
+
+tmp <- getCellOrder(cds,metadat)
+evalSCC(tmp,"cellorder1","H2228_to_H1975","spearman")
+evalSCC(tmp,"cellorder1","H2228_to_HCC827","spearman")
+```
+
+analysis
+```{r message=FALSE, warning=FALSE}
+res1 <- lapply(dat,getCDS,metadat)
+res1[["monocle3"]] <- cds
+res1order <- lapply(res1,getCellOrder,metadat)
+res1_1 <- as.data.frame(lapply(res1order,evalSCC,"cellorder1","H2228_to_H1975","spearman"))
+res1_2 <- as.data.frame(lapply(res1order,evalSCC,"cellorder1","H2228_to_HCC827","spearman"))
+res1_pt_m <- as.data.frame(t(rbind(res1_1,res1_2)))
+colnames(res1_pt_m) <- c("cellmix3_pt1","cellmix3_pt2")
+res1_pt_m
+```
+
+POS
+```{r}
+tmp1 <- as.data.frame(lapply(res1order,evalPOS_M3,"cellorder1","H2228_to_H1975"))
+tmp2 <- as.data.frame(lapply(res1order,evalPOS_M3,"cellorder1","H2228_to_HCC827"))
+
+res1_pos_m <- as.data.frame(t(rbind(tmp1,tmp2)))
+colnames(res1_pos_m) <- c("cellmix1_pos1","cellmix1_pos2")
+res1_pos_m
+```
+
+##### DR plots
+large Group plots(PCA)
+```{r fig.height=4, fig.width=7.5}
+p_list <- list()
+for(x in names(res1)){
+    p_list[[x]] <- plotMonocle3(res1[[x]],"celltype_c",x,rd_method="PCA")
+}
+ggarrange(plotlist=p_list[c("raw","afMF","ALRA","AutoClass","MAGIC_log","monocle3")],ncol=3,nrow=2)
+```
+
+large Group plots(UMAP)
+```{r fig.height=4, fig.width=7.5}
+p_list <- list()
+for(x in names(res1)){
+    p_list[[x]] <- plotMonocle3(res1[[x]],"celltype_c",x,rd_method="UMAP")
+}
+cellmix3_UMAP_main6 <- ggarrange(plotlist=p_list[c("raw","afMF","ALRA","AutoClass","MAGIC_log","monocle3")],ncol=3,nrow=2)
+cellmix3_UMAP_main6
+```
+
+others supp(UMAP)
+```{r fig.height=4, fig.width=7.5}
+cellmix3_UMAP_others <- ggarrange(plotlist=p_list[c("Bfimpute","ccImpute","DCA","I_Impute","kNN_smoothing","scRMD")],ncol=3,nrow=2)
+cellmix3_UMAP_others
+```
+
+PT plots(UMAP)
+```{r fig.height=4, fig.width=7.5}
+p_list <- list()
+for(x in names(res1)){
+    p_list[[x]] <- plotMonocle3(res1[[x]],"pseudotime",x,rd_method="UMAP")
+}
+cellmix3_UMAP_main6_pt <- ggarrange(plotlist=p_list[c("raw","afMF","ALRA","AutoClass","MAGIC_log","monocle3")],ncol=3,nrow=2)
+cellmix3_UMAP_main6_pt
+```
+
+save results
+```{r}
+tmp_res <- list(order_dat=res1order,res_pt=res1_pt_m,res_pos=res1_pos_m)
+saveRDS(tmp_res,"results/SC_Pseudotime_Trajectory/cellmix3_monocle3.rds")
+```
+
+
+#### slingshot
+tutorial processing
+```{r}
+sce <- SingleCellExperiment(assays=List(counts=raw_dat_keep))
+FQnorm <- function(counts){
+    rk <- apply(counts,2,rank,ties.method='min')
+    counts.sort <- apply(counts,2,sort)
+    refdist <- apply(counts.sort,1,median)
+    norm <- apply(rk,2,function(r){ refdist[r] })
+    rownames(norm) <- rownames(counts)
+    return(norm)
+}
+assays(sce)$norm <- FQnorm(assays(sce)$counts)
+sce <- log1p(assays(sce)$norm)
+dat[["slingshot"]] <- sce
+```
+
+run(endclu=c("0_0_9","9_0_0"))
+```{r message=FALSE, warning=FALSE}
+res1_ss <- lapply(dat,getSlingshot,metadat,endclu=c("9_0_0","0_0_9"))
+
+res1_scc_ss <- as.data.frame(lapply(res1_ss,evalSlingshot,"spearman","H2228_to_H1975","H2228_to_HCC827"))
+res1_scc_ss <- as.data.frame(t(res1_scc_ss))
+res1_scc_ss
+
+res1_ovlp_ss <- as.data.frame(lapply(res1_ss,evalOverlap,"H2228_to_H1975","H2228_to_HCC827"))
+res1_ovlp_ss <- as.data.frame(t(res1_ovlp_ss))
+res1_ovlp_ss
+
+res1_fovlp_ss <- as.data.frame(lapply(res1_ss,evalFalseOverlap,"H2228_to_H1975","H2228_to_HCC827"))
+res1_fovlp_ss <- as.data.frame(t(res1_fovlp_ss))
+res1_fovlp_ss
+
+tmp1 <- as.data.frame(lapply(res1_ss,evalPOS,"H2228_to_H1975",metadat))
+tmp2 <- as.data.frame(lapply(res1_ss,evalPOS,"H2228_to_HCC827",metadat))
+res1_pos_ss <- rbind(tmp1,tmp2)
+res1_pos_ss <- as.data.frame(t(res1_pos_ss))
+res1_pos_ss
+```
+
+overlapTable
+```{r}
+sum(metadat$celltype==0)/sum(!is.na(metadat$H2228_to_H1975))
+sum(metadat$celltype==0)/sum(!is.na(metadat$H2228_to_HCC827))
+res1_ovlp_tb_ss <- lapply(res1_ss,evalOverlapTable,"H2228_to_H1975","H2228_to_HCC827")
+res1_ovlp_tb_ss <- as.data.frame(t(as.data.frame(res1_ovlp_tb_ss)))
+res1_ovlp_tb_ss
+```
+
+plots 3 group
+```{r}
+for(x in names(res1_ss)){
+    plotTrajectory2(res1_ss,x)
+}
+```
+
+save results
+```{r}
+tmp_res <- list(data=res1_ss,scc=res1_scc_ss,pos=res1_pos_ss,overlap_table=res1_ovlp_tb_ss,overlap=res1_ovlp_ss,f_overlap=res1_fovlp_ss)
+saveRDS(tmp_res,"results/SC_Pseudotime_Trajectory/cellmix3_slingshot.rds")
+```
+
+#### DPT
+##### pseudotime
+
+pseudotime
+```{r}
+H2228 <- which(metadat$group=="0_9_0")
+H1975 <- which(metadat$group=="9_0_0")
+HCC827 <- which(metadat$group=="0_0_9")
+
+dpt_res <- lapply(dat[-c(8,12)],getDPT,tip_p=c(H2228[7],H1975[5],HCC827[1]))
+
+## SCC and POS
+res1_1 <- as.data.frame(lapply(dpt_res,eval_DPT_SCC,metadat,"H2228_to_H1975","spearman"))
+res1_2 <- as.data.frame(lapply(dpt_res,eval_DPT_SCC,metadat,"H2228_to_HCC827","spearman"))
+res1_pt_m <- as.data.frame(t(rbind(res1_1,res1_2)))
+colnames(res1_pt_m) <- c("cellmix3_pt1","cellmix3_pt2")
+res1_pt_m
+
+tmp1 <- as.data.frame(lapply(dpt_res,eval_DPT_POS,metadat,"H2228_to_H1975"))
+tmp2 <- as.data.frame(lapply(dpt_res,eval_DPT_POS,metadat,"H2228_to_HCC827"))
+res1_pos_m <- as.data.frame(t(rbind(tmp1,tmp2)))
+colnames(res1_pos_m) <- c("cellmix3_pos1","cellmix3_pos2")
+res1_pos_m
+```
+
+plots
+```{r fig.height=4, fig.width=9, message=FALSE, warning=FALSE}
+## plots
+p_branch <- list()
+p_dpt <- list()
+p_celltype <- list()
+p_combine <- list()
+for(x in names(dpt_res)){
+    df <- data.frame(DC1=eigenvectors(dpt_res[[x]]@dm)[,1],DC2=eigenvectors(dpt_res[[x]]@dm)[,2],DPTval=dpt_res[[x]]$dpt,Cell_Type=metadat$celltype_c,Branch=as.character(dpt_res[[x]]$Branch))
+    p_celltype[[x]] <- ggscatter(df,x="DC1",y="DC2",color="Cell_Type",palette="npg")+theme(legend.position="right")+ggtitle(x)
+    p_branch[[x]] <- plot(dpt_res[[x]],root=1,paths_to=c(2,3),col_by='branch')
+    p_dpt[[x]] <- plot(dpt_res[[x]],root=1,paths_to=c(2,3),col_by='dpt')
+    p_combine[[x]] <- ggarrange(p_celltype[[x]],p_branch[[x]],p_dpt[[x]],ncol=3,nrow=1,"AUTO")
+}
+
+# for(x in p_combine){
+#     print(x)
+# }
+
+dpt_DCplots <- ggarrange(p_celltype$raw,p_branch$raw,p_dpt$raw,p_celltype$afMF,p_branch$afMF,p_dpt$afMF,nrow=2,ncol=3)
+dpt_DCplots
+```
+
+trajectory
+```{r}
+res_branch <- as.data.frame(lapply(dpt_res,evalBranch_DPT,metadat))
+as.data.frame(t(res_branch))
+```
+
+save results
+```{r}
+tmp_res <- list(res_pt=res1_pt_m,res_pos=res1_pos_m,res_branch=res_branch)
+saveRDS(tmp_res,"results/SC_Pseudotime_Trajectory/cellmix3_DPT.rds")
+```
+
+## cellbench cellmix4
+### preprocess data
+```{r message=FALSE, warning=FALSE}
+##raw
+raw_dat <- fread("rawcount_txt/cellbench_cellmix4_genebycell.txt",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+raw_dat <- as.matrix(raw_dat,rownames=1)
+raw_dat_keep <- raw_dat[,]
+
+##imputed
+MAGIClog_dat <- fread("MAGIC_log/cellbench_cellmix4_genebycell.tsv",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+MAGIClog_dat <- as.matrix(MAGIClog_dat,rownames=1)
+alra_dat <- fread("alra/cellbench_cellmix4_genebycell_alra.txt",sep="\t",stringsAsFactors=FALSE)
+alra_dat <- as.matrix(alra_dat,rownames=1)
+dca_dat <- fread("dca/cellbench_cellmix4/mean.tsv",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+dca_dat <- as.matrix(dca_dat,rownames=1)
+MAGIC_dat <- fread("MAGIC/cellbench_cellmix4_genebycell.tsv",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+MAGIC_dat <- as.matrix(MAGIClog_dat,rownames=1)
+AutoClass_dat <- fread("AutoClass/cellbench_cellmix4_genebycell_AC.txt",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+AutoClass_dat <- as.matrix(AutoClass_dat,rownames=1)
+ccImpute_dat <- fread("ccImpute/cellbench_cellmix4_genebycell_cc.txt",sep="\t",stringsAsFactors=FALSE)
+ccImpute_dat <- as.matrix(ccImpute_dat,rownames=1)
+ks_dat <- fread("knn_smoothing/cellbench_cellmix4_genebycell_ks.txt",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+ks_dat <- as.matrix(ks_dat,rownames=1)
+Iimpute_dat <- fread("I_Impute/cellbench_cellmix4_genebycell_CImp.txt",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+Iimpute_dat <- as.matrix(Iimpute_dat,rownames=1)
+scRMDnorm_dat <- fread("scRMD/cellbench_cellmix4_genebycell_scRMDlognorm.txt",sep="\t",stringsAsFactors=FALSE)
+scRMDnorm_dat <- as.matrix(scRMDnorm_dat,rownames=1)
+Bf_dat <- fread("Bfimpute/cellbench_cellmix4_genebycell_Bfimpute_specc.txt",sep="\t",stringsAsFactors=FALSE)
+Bf_dat <- as.matrix(Bf_dat,rownames=1)
+
+afMF_dat <- fread("afMF/imputed_data/cellbench_cellmix4_sigma3_0_convergence_True.txt",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+afMF_dat <- as.matrix(afMF_dat,rownames=1)
+
+metadat <- read.csv("metadata/cellmix4.metadata.csv",header=TRUE,stringsAsFactors=FALSE)
+metadat$group <- paste(metadat$H1975,metadat$H2228,metadat$HCC827,sep="_")
+rownames(metadat) <- colnames(raw_dat)
+prep_traj_order <- function(cds){
+  cds$H2228_to_H1975 = NA
+  cds$H2228_to_H1975[cds$group=="0_9_0"] = 0
+  cds$H2228_to_H1975[cds$group=="1_7_1"] = 1
+  cds$H2228_to_H1975[cds$group=="2_5_2"] = 2
+  cds$H2228_to_H1975[cds$group=="3_3_3"] = 3
+  cds$H2228_to_H1975[cds$group=="5_2_2"] = 4
+  cds$H2228_to_H1975[cds$group=="7_1_1"] = 5
+  cds$H2228_to_H1975[cds$group=="9_0_0"] = 6
+  
+  cds$H2228_to_HCC827 = NA
+  cds$H2228_to_HCC827[cds$group=="0_9_0"] = 0
+  cds$H2228_to_HCC827[cds$group=="1_7_1"] = 1
+  cds$H2228_to_HCC827[cds$group=="2_5_2"] = 2
+  cds$H2228_to_HCC827[cds$group=="3_3_3"] = 3
+  cds$H2228_to_HCC827[cds$group=="2_2_5"] = 4
+  cds$H2228_to_HCC827[cds$group=="1_1_7"] = 5
+  cds$H2228_to_HCC827[cds$group=="0_0_9"] = 6
+  
+  cds$H1975_to_HCC827 = NA
+  cds$H1975_to_HCC827[cds$group=="9_0_0"] = 0
+  cds$H1975_to_HCC827[cds$group=="7_1_1"] = 1
+  cds$H1975_to_HCC827[cds$group=="5_2_2"] = 2
+  cds$H1975_to_HCC827[cds$group=="3_3_3"] = 3
+  cds$H1975_to_HCC827[cds$group=="2_2_5"] = 4
+  cds$H1975_to_HCC827[cds$group=="1_1_7"] = 5
+  cds$H1975_to_HCC827[cds$group=="0_0_9"] = 6
+  cds <- cds[cds$traj=="YES",]
+  return(cds)
+}
+metadat <- prep_traj_order(metadat)
+metadat$cell <- rownames(metadat)
+metadat$celltype <- NA
+metadat[metadat$group%in%c("0_9_0","1_7_1","2_5_2","3_3_3"),]$celltype <- 0 #root H2228
+metadat[metadat$group%in%c("5_2_2","7_1_1","9_0_0"),]$celltype <- 1 #H1975
+metadat[metadat$group%in%c("0_0_9","1_1_7","2_2_5"),]$celltype <- 2 #HCC827
+
+metadat$celltype_c <- NA
+metadat[metadat$celltype==0,]$celltype_c <- "H2228" #root H2228
+metadat[metadat$celltype==1,]$celltype_c <- "H1975" #H1975
+metadat[metadat$celltype==2,]$celltype_c <- "HCC827"
+
+metadat$celltype_f <- factor(metadat$celltype_c,levels=c("H2228","H1975","HCC827"))
+```
+
+normalized/log2 data
+```{r}
+raw_dat <- CreateSeuratObject(counts=raw_dat,meta.data=metadat,min.cells=0,min.features=0)
+raw_dat <- NormalizeData(raw_dat)
+raw_dat <- as.matrix(raw_dat@assays$RNA@data)
+
+dca_dat <- log2(dca_dat)
+
+ks_dat <- CreateSeuratObject(counts=ks_dat,meta.data=metadat,min.cells=0,min.features=0)
+ks_dat <- NormalizeData(ks_dat)
+ks_dat <- as.matrix(ks_dat@assays$RNA@data)
+
+Iimpute_dat <- log2(Iimpute_dat+min(Iimpute_dat[Iimpute_dat!=0]))
+```
+
+combine normalized data
+```{r}
+dat <- list(raw=raw_dat,ALRA=alra_dat,AutoClass=AutoClass_dat,Bfimpute=Bf_dat,ccImpute=ccImpute_dat,DCA=dca_dat,I_Impute=Iimpute_dat,kNN_smoothing=ks_dat,MAGIC=MAGIC_dat,MAGIC_log=MAGIClog_dat,scRMD=scRMDnorm_dat,afMF=afMF_dat)
+rm(raw_dat)
+rm(alra_dat)
+rm(AutoClass_dat)
+rm(Bf_dat)
+rm(ccImpute_dat)
+rm(Iimpute_dat)
+rm(ks_dat)
+rm(dca_dat)
+rm(MAGIC_dat)
+rm(MAGIClog_dat)
+rm(scRMDnorm_dat)
+
+rm(afMF_dat)
+
+colnames(dat$ALRA) <- colnames(dat$raw)
+dat <- lapply(dat,function(x) x[,rownames(metadat)])
+raw_dat_keep <- raw_dat_keep[,rownames(metadat)]
+```
+
+### evaluate
+#### monocle3
+processing raw data
+```{r}
+cds <- new_cell_data_set(raw_dat_keep,cell_metadata=metadat)
+cds <- preprocess_cds(cds)
+cds <- reduce_dimension(cds)
+cds <- cluster_cells(cds)
+cds <- learn_graph(cds)
+cds <- order_cells(cds,root_pr_nodes=get_earliest_principal_node(cds))
+tmp <- getCellOrder(cds,metadat)
+evalSCC(tmp,"cellorder1","H2228_to_H1975","spearman")
+evalSCC(tmp,"cellorder1","H2228_to_HCC827","spearman")
+```
+
+analysis
+```{r message=FALSE, warning=FALSE}
+res1 <- lapply(dat,getCDS,metadat)
+res1[["monocle3"]] <- cds
+res1order <- lapply(res1,getCellOrder,metadat)
+res1_1 <- as.data.frame(lapply(res1order,evalSCC,"cellorder1","H2228_to_H1975","spearman"))
+res1_2 <- as.data.frame(lapply(res1order,evalSCC,"cellorder1","H2228_to_HCC827","spearman"))
+res1_pt_m <- as.data.frame(t(rbind(res1_1,res1_2)))
+colnames(res1_pt_m) <- c("cellmix4_pt1","cellmix4_pt2")
+res1_pt_m
+```
+
+POS
+```{r}
+tmp1 <- as.data.frame(lapply(res1order,evalPOS_M3,"cellorder1","H2228_to_H1975"))
+tmp2 <- as.data.frame(lapply(res1order,evalPOS_M3,"cellorder1","H2228_to_HCC827"))
+
+res1_pos_m <- as.data.frame(t(rbind(tmp1,tmp2)))
+colnames(res1_pos_m) <- c("cellmix1_pos1","cellmix1_pos2")
+res1_pos_m
+```
+
+large Group plots(UMAP)
+```{r fig.height=4, fig.width=7.5}
+p_list <- list()
+for(x in names(res1)){
+    p_list[[x]] <- plotMonocle3(res1[[x]],"celltype_c",x,rd_method="UMAP")
+}
+cellmix4_UMAP_main6 <- ggarrange(plotlist=p_list[c("raw","afMF","ALRA","AutoClass","MAGIC_log","monocle3")],ncol=3,nrow=2)
+cellmix4_UMAP_main6
+```
+
+others supp
+```{r fig.height=4, fig.width=7.5}
+cellmix4_UMAP_others <- ggarrange(plotlist=p_list[c("Bfimpute","ccImpute","DCA","I_Impute","kNN_smoothing","scRMD")],ncol=3,nrow=2)
+cellmix4_UMAP_others
+```
+
+large Group plots(PCA)
+```{r fig.height=4, fig.width=7.5}
+p_list <- list()
+for(x in names(res1)){
+    p_list[[x]] <- plotMonocle3(res1[[x]],"celltype_c",x,rd_method="PCA")+scale_color_brewer(palette="Set2")
+}
+cellmix4_PCA_main6 <- ggarrange(plotlist=p_list[c("raw","afMF","ALRA","AutoClass","MAGIC_log","monocle3")],ncol=3,nrow=2)
+cellmix4_PCA_main6
+```
+
+others supp
+```{r fig.height=4, fig.width=7.5}
+cellmix4_PCA_others <- ggarrange(plotlist=p_list[c("Bfimpute","ccImpute","DCA","I_Impute","kNN_smoothing","scRMD")],ncol=3,nrow=2)
+cellmix4_PCA_others
+```
+
+
+PT plots(UMAP)
+```{r fig.height=4, fig.width=7.5}
+p_list <- list()
+for(x in names(res1)){
+    p_list[[x]] <- plotMonocle3(res1[[x]],"pseudotime",x,rd_method="UMAP")
+}
+cellmix4_UMAP_main6_pt <- ggarrange(plotlist=p_list[c("raw","afMF","ALRA","AutoClass","MAGIC_log","monocle3")],ncol=3,nrow=2)
+cellmix4_UMAP_main6_pt
+```
+
+PT plots(PCA)
+```{r fig.height=4, fig.width=7.5}
+p_list <- list()
+for(x in names(res1)){
+    p_list[[x]] <- plotMonocle3(res1[[x]],"HCC827",x,rd_method="PCA")
+}
+cellmix4_PCA_main6_pt <- ggarrange(plotlist=p_list[c("raw","afMF","ALRA","AutoClass","MAGIC_log","monocle3")],ncol=3,nrow=2)
+cellmix4_PCA_main6_pt
+```
+
+```{r fig.height=4, fig.width=7.5}
+p_list <- list()
+for(x in names(res1)){
+    p_list[[x]] <- plotMonocle3(res1[[x]],"pseudotime",x,rd_method="UMAP")
+}
+cellmix4_PCA_main6_pt <- ggarrange(plotlist=p_list[c("raw","afMF","ALRA","AutoClass","MAGIC_log","monocle3")],ncol=3,nrow=2)
+cellmix4_PCA_main6_pt
+```
+
+```{r fig.height=4, fig.width=7.5}
+p_list <- list()
+for(x in names(res1)){
+    p_list[[x]] <- plotMonocle3(res1[[x]],"pseudotime",x,rd_method="UMAP")
+}
+cellmix4_PCA_others_pt <- ggarrange(plotlist=p_list[c("Bfimpute","ccImpute","DCA","I_Impute","kNN_smoothing","scRMD")],ncol=3,nrow=2)
+cellmix4_PCA_others_pt
+```
+
+save results
+```{r}
+tmp_res <- list(order_dat=res1order,res_pt=res1_pt_m,res_pos=res1_pos_m)
+saveRDS(tmp_res,"results/SC_Pseudotime_Trajectory/cellmix4_monocle3.rds")
+```
+
+
+#### slingshot
+tutorial processing
+```{r}
+sce <- SingleCellExperiment(assays=List(counts=raw_dat_keep))
+FQnorm <- function(counts){
+    rk <- apply(counts,2,rank,ties.method='min')
+    counts.sort <- apply(counts,2,sort)
+    refdist <- apply(counts.sort,1,median)
+    norm <- apply(rk,2,function(r){ refdist[r] })
+    rownames(norm) <- rownames(counts)
+    return(norm)
+}
+assays(sce)$norm <- FQnorm(assays(sce)$counts)
+sce <- log1p(assays(sce)$norm)
+dat[["slingshot"]] <- sce
+```
+
+run(endclu=c("0_0_9","9_0_0"))
+```{r message=FALSE, warning=FALSE}
+res1_ss <- lapply(dat,getSlingshot,metadat,endclu=c("9_0_0","0_0_9"))
+
+res1_scc_ss <- as.data.frame(lapply(res1_ss,evalSlingshot,"spearman","H2228_to_H1975","H2228_to_HCC827"))
+res1_scc_ss <- as.data.frame(t(res1_scc_ss))
+res1_scc_ss
+
+res1_ovlp_ss <- as.data.frame(lapply(res1_ss,evalOverlap,"H2228_to_H1975","H2228_to_HCC827"))
+res1_ovlp_ss <- as.data.frame(t(res1_ovlp_ss))
+res1_ovlp_ss
+
+res1_fovlp_ss <- as.data.frame(lapply(res1_ss,evalFalseOverlap,"H2228_to_H1975","H2228_to_HCC827"))
+res1_fovlp_ss <- as.data.frame(t(res1_fovlp_ss))
+res1_fovlp_ss
+
+tmp1 <- as.data.frame(lapply(res1_ss,evalPOS,"H2228_to_H1975",metadat))
+tmp2 <- as.data.frame(lapply(res1_ss,evalPOS,"H2228_to_HCC827",metadat))
+res1_pos_ss <- rbind(tmp1,tmp2)
+res1_pos_ss <- as.data.frame(t(res1_pos_ss))
+res1_pos_ss
+```
+
+overlapTable
+```{r}
+sum(metadat$celltype==0)/sum(!is.na(metadat$H2228_to_H1975))
+sum(metadat$celltype==0)/sum(!is.na(metadat$H2228_to_HCC827))
+res1_ovlp_tb_ss <- lapply(res1_ss,evalOverlapTable,"H2228_to_H1975","H2228_to_HCC827")
+res1_ovlp_tb_ss <- as.data.frame(t(as.data.frame(res1_ovlp_tb_ss)))
+res1_ovlp_tb_ss
+```
+
+plots 3 group
+```{r}
+for(x in names(res1_ss)){
+    plotTrajectory2(res1_ss,x)
+}
+```
+
+save results
+```{r}
+tmp_res <- list(data=res1_ss,scc=res1_scc_ss,pos=res1_pos_ss,overlap_table=res1_ovlp_tb_ss,overlap=res1_ovlp_ss,f_overlap=res1_fovlp_ss)
+saveRDS(tmp_res,"results/SC_Pseudotime_Trajectory/cellmix4_slingshot.rds")
+```
+
+#### DPT
+##### pseudotime
+test
+```{r}
+set.seed(123)
+dm <- DiffusionMap(t(dat$afMF))
+H2228 <- which(metadat$group=="0_9_0")
+H1975 <- which(metadat$group=="9_0_0")
+HCC827 <- which(metadat$group=="0_0_9")
+dpt <- destiny::DPT(dm,tips=c(H2228[7],H1975[5],HCC827[1])) #end point
+plot(dpt,root=1,paths_to=c(2,3),col_by='branch')
+
+df <- data.frame(DC1=eigenvectors(dm)[,1],DC2=eigenvectors(dm)[,2],dptval=dpt$dpt,Cell_Type=metadat$celltype_c,Branch=as.character(dpt$Branch))
+p1 <- ggplot(df)+geom_point(aes(x=DC1,y=DC2,color=dptval))
+p2 <- ggplot(df)+geom_point(aes(x=DC1,y=DC2,color=Branch))
+p3 <- ggplot(df)+geom_point(aes(x=DC1,y=DC2,color=Cell_Type))
+p1
+p2
+p3
+
+table(dpt$Branch,metadat$celltype_c)
+cor.test(dpt$dpt,metadat$H2228_to_H1975,method="spearman")
+cor.test(dpt$dpt,metadat$H2228_to_HCC827,method="spearman")
+```
+
+pseudotime
+```{r}
+H2228 <- which(metadat$group=="0_9_0")
+H1975 <- which(metadat$group=="9_0_0")
+HCC827 <- which(metadat$group=="0_0_9")
+
+dpt_res <- lapply(dat[-c(8,12)],getDPT,tip_p=c(H2228[7],H1975[5],HCC827[1]))
+
+## SCC and POS
+res1_1 <- as.data.frame(lapply(dpt_res,eval_DPT_SCC,metadat,"H2228_to_H1975","spearman"))
+res1_2 <- as.data.frame(lapply(dpt_res,eval_DPT_SCC,metadat,"H2228_to_HCC827","spearman"))
+res1_pt_m <- as.data.frame(t(rbind(res1_1,res1_2)))
+colnames(res1_pt_m) <- c("cellmix4_pt1","cellmix4_pt2")
+res1_pt_m
+
+tmp1 <- as.data.frame(lapply(dpt_res,eval_DPT_POS,metadat,"H2228_to_H1975"))
+tmp2 <- as.data.frame(lapply(dpt_res,eval_DPT_POS,metadat,"H2228_to_HCC827"))
+res1_pos_m <- as.data.frame(t(rbind(tmp1,tmp2)))
+colnames(res1_pos_m) <- c("cellmix4_pos1","cellmix4_pos2")
+res1_pos_m
+```
+
+plots
+```{r fig.height=4, fig.width=9, message=FALSE, warning=FALSE}
+## plots
+p_branch <- list()
+p_dpt <- list()
+p_celltype <- list()
+p_combine <- list()
+for(x in names(dpt_res)){
+    df <- data.frame(DC1=eigenvectors(dpt_res[[x]]@dm)[,1],DC2=eigenvectors(dpt_res[[x]]@dm)[,2],DPTval=dpt_res[[x]]$dpt,Cell_Type=metadat$celltype_c,Branch=as.character(dpt_res[[x]]$Branch))
+    p_celltype[[x]] <- ggscatter(df,x="DC1",y="DC2",color="Cell_Type",palette="npg")+theme(legend.position="right")+ggtitle(x)
+    p_branch[[x]] <- plot(dpt_res[[x]],root=1,paths_to=c(2,3),col_by='branch')
+    p_dpt[[x]] <- plot(dpt_res[[x]],root=1,paths_to=c(2,3),col_by='dpt')
+    p_combine[[x]] <- ggarrange(p_celltype[[x]],p_branch[[x]],p_dpt[[x]],ncol=3,nrow=1,"AUTO")
+}
+
+# for(x in p_combine){
+#     print(x)
+# }
+
+dpt_DCplots <- ggarrange(p_celltype$raw,p_branch$raw,p_dpt$raw,p_celltype$afMF,p_branch$afMF,p_dpt$afMF,nrow=2,ncol=3)
+dpt_DCplots
+```
+
+trajectory
+```{r}
+res_branch <- as.data.frame(lapply(dpt_res,evalBranch_DPT,metadat))
+as.data.frame(t(res_branch))
+```
+
+save results
+```{r}
+tmp_res <- list(res_pt=res1_pt_m,res_pos=res1_pos_m,res_branch=res_branch)
+saveRDS(tmp_res,"results/SC_Pseudotime_Trajectory/cellmix4_DPT.rds")
+```
+
+## GSE118068_embryonic(batch job)
+```{r}
+raw_dat <- fread("rawcount_txt/GSE118068_embryonic_genebycell.txt",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+raw_dat <- as.matrix(raw_dat,rownames=1)
+raw_dat_keep <- raw_dat[,]
+
+##imputed
+MAGIClog_dat <- fread("MAGIC_log/GSE118068_embryonic_genebycell.tsv",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+MAGIClog_dat <- as.matrix(MAGIClog_dat,rownames=1)
+alra_dat <- fread("alra/GSE118068_embryonic_genebycell_alra.txt",sep="\t",stringsAsFactors=FALSE)
+alra_dat <- as.matrix(alra_dat,rownames=1)
+dca_dat <- fread("dca/GSE118068_embryonic/mean.tsv",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+dca_dat <- as.matrix(dca_dat,rownames=1)
+MAGIC_dat <- fread("MAGIC/GSE118068_embryonic_genebycell.tsv",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+MAGIC_dat <- as.matrix(MAGIClog_dat,rownames=1)
+
+AutoClass_dat <- fread("AutoClass/GSE118068_embryonic_genebycell_AC.txt",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+AutoClass_dat <- as.matrix(AutoClass_dat,rownames=1)
+ks_dat <- fread("knn_smoothing/GSE118068_embryonic_genebycell_ks.txt",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+ks_dat <- as.matrix(ks_dat,rownames=1)
+scRMDnorm_dat <- fread("scRMD/GSE118068_embryonic_genebycell_scRMDlognorm.txt",sep="\t",stringsAsFactors=FALSE)
+scRMDnorm_dat <- as.matrix(scRMDnorm_dat,rownames=1)
+
+afMF_dat <- fread("afMF/imputed_data/GSE118068_embryonic_sigma3_0_convergence_True.txt",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+afMF_dat <- as.matrix(afMF_dat,rownames=1)
+
+metadat <- readRDS("rawcount_rds/GSE118068_embryonic_rawnorm2.rds")
+metadat <- as.data.frame(metadat@colData)
+metadat <- metadat[colnames(raw_dat),]
+metadat$group <- metadat$Time
+metadat$cell <- metadat$Cell
+
+GeneSymbol <- bitr(rownames(raw_dat),fromType="ENSEMBL",toType="SYMBOL",OrgDb="org.Mm.eg.db")
+GeneSymbol <- GeneSymbol[!duplicated(GeneSymbol$SYMBOL),]
+GeneSymbol <- GeneSymbol[!duplicated(GeneSymbol$ENSEMBL),]
+
+raw_dat <- raw_dat[GeneSymbol$ENSEMBL,]
+rownames(raw_dat) <- GeneSymbol$SYMBOL
+MAGIClog_dat <- MAGIClog_dat[GeneSymbol$ENSEMBL,]
+rownames(MAGIClog_dat) <- GeneSymbol$SYMBOL
+alra_dat <- alra_dat[GeneSymbol$ENSEMBL,]
+rownames(alra_dat) <- GeneSymbol$SYMBOL
+dca_dat <- dca_dat[GeneSymbol$ENSEMBL,]
+rownames(dca_dat) <- GeneSymbol$SYMBOL
+MAGIC_dat <- MAGIC_dat[GeneSymbol$ENSEMBL,]
+rownames(MAGIC_dat) <- GeneSymbol$SYMBOL
+AutoClass_dat <- AutoClass_dat[GeneSymbol$ENSEMBL,]
+rownames(AutoClass_dat) <- GeneSymbol$SYMBOL
+ks_dat <- ks_dat[GeneSymbol$ENSEMBL,]
+rownames(ks_dat) <- GeneSymbol$SYMBOL
+scRMDnorm_dat <- scRMDnorm_dat[GeneSymbol$ENSEMBL,]
+rownames(scRMDnorm_dat) <- GeneSymbol$SYMBOL
+afMF_dat <- afMF_dat[GeneSymbol$ENSEMBL,]
+rownames(afMF_dat) <- GeneSymbol$SYMBOL
+raw_dat_keep <- raw_dat_keep[GeneSymbol$ENSEMBL,]
+rownames(raw_dat_keep) <- GeneSymbol$SYMBOL
+
+raw_dat <- CreateSeuratObject(counts=raw_dat,meta.data=metadat,min.cells=0,min.features=0)
+raw_dat <- NormalizeData(raw_dat)
+raw_dat <- as.matrix(raw_dat@assays$RNA@data)
+
+dca_dat <- log2(dca_dat)
+
+ks_dat <- CreateSeuratObject(counts=ks_dat,meta.data=metadat,min.cells=0,min.features=0)
+ks_dat <- NormalizeData(ks_dat)
+ks_dat <- as.matrix(ks_dat@assays$RNA@data)
+
+dat <- list(raw=raw_dat,ALRA=alra_dat,AutoClass=AutoClass_dat,DCA=dca_dat,kNN_smoothing=ks_dat,MAGIC=MAGIC_dat,MAGIC_log=MAGIClog_dat,scRMD=scRMDnorm_dat,afMF=afMF_dat)
+rm(raw_dat)
+rm(alra_dat)
+rm(AutoClass_dat)
+rm(ks_dat)
+rm(dca_dat)
+rm(MAGIC_dat)
+rm(MAGIClog_dat)
+rm(scRMDnorm_dat)
+rm(afMF_dat)
+
+colnames(dat$ALRA) <- colnames(dat$raw)
+dat <- lapply(dat,function(x) x[rownames(dat$DCA),rownames(metadat)])
+raw_dat_keep <- raw_dat_keep[rownames(dat$DCA),rownames(metadat)]
+
+cds <- new_cell_data_set(raw_dat_keep,cell_metadata=metadat)
+cds <- preprocess_cds(cds)
+cds <- reduce_dimension(cds)
+cds <- cluster_cells(cds)
+cds <- learn_graph(cds)
+cds <- order_cells(cds,root_pr_nodes=get_earliest_principal_node(cds,time_bin="E10"))
+tmp <- getCellOrder(cds,metadat)
+
+res5 <- lapply(dat,getCDS,metadat,time_bin="E10")
+res5[["monocle3"]] <- cds
+res5order <- lapply(res5,getCellOrder,metadat)
+res5_pt_m <- as.data.frame(lapply(res5order,evalSCC,"cellorder1","Timenum","spearman"))
+res5_pt_m <- as.data.frame(t(res5_pt_m))
+colnames(res5_pt_m) <- c("GSE118068_embryonic_pt")
+res5_pt_m
+
+#POS
+tmp1 <- as.data.frame(lapply(res5order,evalPOS_M3,"cellorder1","Timenum"))
+res5_pos_m <- as.data.frame(t(tmp1))
+colnames(res5_pos_m) <- c("GSE118068_embryonic_pos")
+res5_pos_m
+
+tmp_res <- list(order_dat=res5order,res_pt=res5_pt_m,res_pos=res5_pos_m)
+saveRDS(tmp_res,"/restricted/projectnb/casa/jh50/jinghan/others/SCI/EvalNotebook/results/SC_Pseudotime_Trajectory/GSE118068_embryonic_monocle3.rds")
+
+#slingshot
+sce <- SingleCellExperiment(assays=List(counts=raw_dat_keep))
+FQnorm <- function(counts){
+    rk <- apply(counts,2,rank,ties.method='min')
+    counts.sort <- apply(counts,2,sort)
+    refdist <- apply(counts.sort,1,median)
+    norm <- apply(rk,2,function(r){ refdist[r] })
+    rownames(norm) <- rownames(counts)
+    return(norm)
+}
+assays(sce)$norm <- FQnorm(assays(sce)$counts)
+sce <- log1p(assays(sce)$norm)
+dat[["slingshot"]] <- sce
+
+res5_ss <- lapply(dat,getSlingshot,metadat,startclu="E10",endclu=c("E18"))
+
+res5_scc_ss <- as.data.frame(lapply(res5_ss,evalSlingshot,"spearman","Timenum"))
+res5_scc_ss <- as.data.frame(t(res5_scc_ss))
+res5_scc_ss
+
+tmp <- as.data.frame(lapply(res5_ss,evalPOS,"Timenum",metadat))
+res5_pos_ss <- as.data.frame(t(tmp))
+res5_pos_ss
+
+tmp_res <- list(scc=res5_scc_ss,pos=res5_pos_ss)
+saveRDS(tmp_res,"results/SC_Pseudotime_Trajectory/GSE118068_embryonic_slingshot.rds")
+
+# DPT
+start_p <- which(metadat$cell_type=="E10")
+end_p <- which(metadat$cell_type=="E18")
+
+dpt_res <- lapply(dat[-c(5,9)],getDPT,tip_p=c(start_p[1],end_p[1]))
+
+## SCC and POS
+res1_pt_m <- as.data.frame(t(as.data.frame(lapply(dpt_res,eval_DPT_SCC,metadat,"Timenum","spearman"))))
+colnames(res1_pt_m) <- c("GSE118068_embryonic_pt")
+res1_pt_m
+
+res1_pos_m <- as.data.frame(t(as.data.frame(lapply(dpt_res,eval_DPT_POS,metadat,"Timenum",timeNum="Timenum"))))
+colnames(res1_pos_m) <- c("GSE118068_embryonic_pos")
+res1_pos_m
+
+
+tmp_res <- list(res_pt=res1_pt_m,res_pos=res1_pos_m)
+saveRDS(tmp_res,"results/SC_Pseudotime_Trajectory/GSE118068_embryonic_DPT.rds")
+```
+
+
+## GSE118068_postnatal(batch job)
+```{r}
+##raw
+raw_dat <- fread("rawcount_txt/GSE118068_postnatal_genebycell.txt",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+raw_dat <- as.matrix(raw_dat,rownames=1)
+raw_dat_keep <- raw_dat[,]
+
+##imputed
+MAGIClog_dat <- fread("MAGIC_log/GSE118068_postnatal_genebycell.tsv",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+MAGIClog_dat <- as.matrix(MAGIClog_dat,rownames=1)
+alra_dat <- fread("alra/GSE118068_postnatal_genebycell_alra.txt",sep="\t",stringsAsFactors=FALSE)
+alra_dat <- as.matrix(alra_dat,rownames=1)
+dca_dat <- fread("dca/GSE118068_postnatal/mean.tsv",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+dca_dat <- as.matrix(dca_dat,rownames=1)
+MAGIC_dat <- fread("MAGIC/GSE118068_postnatal_genebycell.tsv",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+MAGIC_dat <- as.matrix(MAGIClog_dat,rownames=1)
+AutoClass_dat <- fread("AutoClass/GSE118068_postnatal_genebycell_AC.txt",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+AutoClass_dat <- as.matrix(AutoClass_dat,rownames=1)
+ks_dat <- fread("knn_smoothing/GSE118068_postnatal_genebycell_ks.txt",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+ks_dat <- as.matrix(ks_dat,rownames=1)
+scRMDnorm_dat <- fread("scRMD/GSE118068_postnatal_genebycell_scRMDlognorm.txt",sep="\t",stringsAsFactors=FALSE)
+scRMDnorm_dat <- as.matrix(scRMDnorm_dat,rownames=1)
+
+afMF_dat <- fread("afMF/imputed_data/GSE118068_postnatal_sigma3_0_convergence_True.txt",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+afMF_dat <- as.matrix(afMF_dat,rownames=1)
+
+metadat <- readRDS("rawcount_rds/GSE118068_postnatal_rawnorm2.rds")
+metadat <- as.data.frame(metadat@colData)
+metadat <- metadat[colnames(raw_dat),]
+metadat$group <- metadat$Time
+metadat$cell <- metadat$Cell
+
+GeneSymbol <- bitr(rownames(raw_dat),fromType="ENSEMBL",toType="SYMBOL",OrgDb="org.Mm.eg.db")
+GeneSymbol <- GeneSymbol[!duplicated(GeneSymbol$SYMBOL),]
+GeneSymbol <- GeneSymbol[!duplicated(GeneSymbol$ENSEMBL),]
+
+raw_dat <- raw_dat[GeneSymbol$ENSEMBL,]
+rownames(raw_dat) <- GeneSymbol$SYMBOL
+MAGIClog_dat <- MAGIClog_dat[GeneSymbol$ENSEMBL,]
+rownames(MAGIClog_dat) <- GeneSymbol$SYMBOL
+alra_dat <- alra_dat[GeneSymbol$ENSEMBL,]
+rownames(alra_dat) <- GeneSymbol$SYMBOL
+dca_dat <- dca_dat[GeneSymbol$ENSEMBL,]
+rownames(dca_dat) <- GeneSymbol$SYMBOL
+MAGIC_dat <- MAGIC_dat[GeneSymbol$ENSEMBL,]
+rownames(MAGIC_dat) <- GeneSymbol$SYMBOL
+AutoClass_dat <- AutoClass_dat[GeneSymbol$ENSEMBL,]
+rownames(AutoClass_dat) <- GeneSymbol$SYMBOL
+ks_dat <- ks_dat[GeneSymbol$ENSEMBL,]
+rownames(ks_dat) <- GeneSymbol$SYMBOL
+scRMDnorm_dat <- scRMDnorm_dat[GeneSymbol$ENSEMBL,]
+rownames(scRMDnorm_dat) <- GeneSymbol$SYMBOL
+afMF_dat <- afMF_dat[GeneSymbol$ENSEMBL,]
+rownames(afMF_dat) <- GeneSymbol$SYMBOL
+raw_dat_keep <- raw_dat_keep[GeneSymbol$ENSEMBL,]
+rownames(raw_dat_keep) <- GeneSymbol$SYMBOL
+
+raw_dat <- CreateSeuratObject(counts=raw_dat,meta.data=metadat,min.cells=0,min.features=0)
+raw_dat <- NormalizeData(raw_dat)
+raw_dat <- as.matrix(raw_dat@assays$RNA@data)
+
+dca_dat <- log2(dca_dat)
+
+ks_dat <- CreateSeuratObject(counts=ks_dat,meta.data=metadat,min.cells=0,min.features=0)
+ks_dat <- NormalizeData(ks_dat)
+ks_dat <- as.matrix(ks_dat@assays$RNA@data)
+
+dat <- list(raw=raw_dat,ALRA=alra_dat,AutoClass=AutoClass_dat,DCA=dca_dat,kNN_smoothing=ks_dat,MAGIC=MAGIC_dat,MAGIC_log=MAGIClog_dat,scRMD=scRMDnorm_dat,afMF=afMF_dat)
+rm(raw_dat)
+rm(alra_dat)
+rm(AutoClass_dat)
+rm(ks_dat)
+rm(dca_dat)
+rm(MAGIC_dat)
+rm(MAGIClog_dat)
+rm(scRMDnorm_dat)
+rm(afMF_dat)
+
+colnames(dat$ALRA) <- colnames(dat$raw)
+dat <- lapply(dat,function(x) x[rownames(dat$DCA),rownames(metadat)])
+raw_dat_keep <- raw_dat_keep[rownames(dat$DCA),rownames(metadat)]
+
+cds <- new_cell_data_set(raw_dat_keep,cell_metadata=metadat)
+cds <- preprocess_cds(cds)
+cds <- reduce_dimension(cds)
+cds <- cluster_cells(cds)
+cds <- learn_graph(cds)
+cds <- order_cells(cds,root_pr_nodes=get_earliest_principal_node(cds,time_bin="P0"))
+tmp <- getCellOrder(cds,metadat)
+
+res6 <- lapply(dat[-which(names(dat)=="scRMD")],getCDS,metadat,time_bin="P0")
+res6[["monocle3"]] <- cds
+res6order <- lapply(res6,getCellOrder,metadat)
+res6_pt_m <- as.data.frame(lapply(res6order,evalSCC,"cellorder1","Timenum","spearman"))
+res6_pt_m <- as.data.frame(t(res6_pt_m))
+colnames(res6_pt_m) <- c("GSE118068_postnatal_pt")
+res6_pt_m
+
+#POS
+tmp1 <- as.data.frame(lapply(res6order,evalPOS_M3,"cellorder1","Timenum"))
+res6_pos_m <- as.data.frame(t(tmp1))
+colnames(res6_pos_m) <- c("GSE118068_postnatal_pos")
+res6_pos_m
+
+tmp_res <- list(order_dat=res6order,res_pt=res6_pt_m,res_pos=res6_pos_m)
+saveRDS(tmp_res,"results/SC_Pseudotime_Trajectory/GSE118068_postnatal_monocle3.rds")
+
+#slingshot
+sce <- SingleCellExperiment(assays=List(counts=raw_dat_keep))
+FQnorm <- function(counts){
+    rk <- apply(counts,2,rank,ties.method='min')
+    counts.sort <- apply(counts,2,sort)
+    refdist <- apply(counts.sort,1,median)
+    norm <- apply(rk,2,function(r){ refdist[r] })
+    rownames(norm) <- rownames(counts)
+    return(norm)
+}
+assays(sce)$norm <- FQnorm(assays(sce)$counts)
+sce <- log1p(assays(sce)$norm)
+dat[["slingshot"]] <- sce
+
+res6_ss <- lapply(dat,getSlingshot,metadat,startclu="P0",endclu=c("P14"))
+
+res6_scc_ss <- as.data.frame(lapply(res6_ss,evalSlingshot,"spearman","Timenum"))
+res6_scc_ss <- as.data.frame(t(res6_scc_ss))
+res6_scc_ss
+
+tmp <- as.data.frame(lapply(res6_ss,evalPOS,"Timenum",metadat))
+res6_pos_ss <- as.data.frame(t(tmp))
+res6_pos_ss
+
+tmp_res <- list(scc=res6_scc_ss,pos=res6_pos_ss)
+saveRDS(tmp_res,"results/SC_Pseudotime_Trajectory/GSE118068_postnatal_slingshot.rds")
+
+# DPT
+start_p <- which(metadat$cell_type=="P0")
+end_p <- which(metadat$cell_type=="P14")
+
+dpt_res <- lapply(dat[-c(5,9)],getDPT,tip_p=c(start_p[1],end_p[1]))
+
+## SCC and POS
+res1_pt_m <- as.data.frame(t(as.data.frame(lapply(dpt_res,eval_DPT_SCC,metadat,"Timenum","spearman"))))
+colnames(res1_pt_m) <- c("GSE118068_postnatal_pt")
+res1_pt_m
+
+res1_pos_m <- as.data.frame(t(as.data.frame(lapply(dpt_res,eval_DPT_POS,metadat,"Timenum",timeNum="Timenum"))))
+colnames(res1_pos_m) <- c("GSE118068_postnatal_pos")
+res1_pos_m
+
+
+tmp_res <- list(res_pt=res1_pt_m,res_pos=res1_pos_m)
+saveRDS(tmp_res,"results/SC_Pseudotime_Trajectory/GSE118068_postnatal_DPT.rds")
+```
+
+
+## GSE75748_sc_timecourse
+### preprocess data
+```{r message=FALSE, warning=FALSE}
+##raw
+raw_dat <- fread("rawcount_txt/GSE75748_sc_timecourse_genebycell.txt",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+raw_dat <- as.matrix(raw_dat,rownames=1)
+raw_dat_keep <- raw_dat[,]
+
+##imputed
+MAGIClog_dat <- fread("MAGIC_log/GSE75748_sc_timecourse_genebycell.tsv",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+MAGIClog_dat <- as.matrix(MAGIClog_dat,rownames=1)
+alra_dat <- fread("alra/GSE75748_sc_timecourse_genebycell_alra.txt",sep="\t",stringsAsFactors=FALSE)
+alra_dat <- as.matrix(alra_dat,rownames=1)
+dca_dat <- fread("dca/GSE75748_sc_timecourse/mean.tsv",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+dca_dat <- as.matrix(dca_dat,rownames=1)
+MAGIC_dat <- fread("MAGIC/GSE75748_sc_timecourse_genebycell.tsv",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+MAGIC_dat <- as.matrix(MAGIClog_dat,rownames=1)
+AutoClass_dat <- fread("AutoClass/GSE75748_sc_timecourse_genebycell_AC.txt",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+AutoClass_dat <- as.matrix(AutoClass_dat,rownames=1)
+ccImpute_dat <- fread("ccImpute/GSE75748_sc_timecourse_genebycell_cc.txt",sep="\t",stringsAsFactors=FALSE)
+ccImpute_dat <- as.matrix(ccImpute_dat,rownames=1)
+ks_dat <- fread("knn_smoothing/GSE75748_sc_timecourse_genebycell_ks.txt",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+ks_dat <- as.matrix(ks_dat,rownames=1)
+Iimpute_dat <- fread("I_Impute/GSE75748_sc_timecourse_genebycell_CImp.txt",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+Iimpute_dat <- as.matrix(Iimpute_dat,rownames=1)
+scRMDnorm_dat <- fread("scRMD/GSE75748_sc_timecourse_genebycell_scRMDlognorm.txt",sep="\t",stringsAsFactors=FALSE)
+scRMDnorm_dat <- as.matrix(scRMDnorm_dat,rownames=1)
+Bf_dat <- fread("Bfimpute/GSE75748_sc_timecourse_genebycell_Bfimpute_specc.txt",sep="\t",stringsAsFactors=FALSE)
+Bf_dat <- as.matrix(Bf_dat,rownames=1)
+
+afMF_dat <- fread("afMF/imputed_data/GSE75748_sc_timecourse_sigma3_0_convergence_True.txt",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+afMF_dat <- as.matrix(afMF_dat,rownames=1)
+
+metadat <- readRDS("rawcount_rds/GSE75748_sc_time_course_rawnorm2.rds")
+metadat <- as.data.frame(metadat@colData)
+metadat <- metadat[colnames(raw_dat),]
+
+metadat$TimeNum <- NA
+metadat[metadat$cell_type=="H9.00hb4s",]$TimeNum <- 1
+metadat[metadat$cell_type=="H9.12h",]$TimeNum <- 2
+metadat[metadat$cell_type=="H9.24h",]$TimeNum <- 3
+metadat[metadat$cell_type=="H9.36h",]$TimeNum <- 4
+metadat[metadat$cell_type=="H9.72h",]$TimeNum <- 5
+metadat[metadat$cell_type=="H9.96h",]$TimeNum <- 6
+metadat$group <- metadat$cell_type
+metadat$cell <- rownames(metadat)
+metadat$celltype <- metadat$TimeNum
+```
+
+normalized/log2 data
+```{r}
+raw_dat <- CreateSeuratObject(counts=raw_dat,meta.data=metadat,min.cells=0,min.features=0)
+raw_dat <- NormalizeData(raw_dat)
+raw_dat <- as.matrix(raw_dat@assays$RNA@data)
+
+dca_dat <- log2(dca_dat)
+
+ks_dat <- CreateSeuratObject(counts=ks_dat,meta.data=metadat,min.cells=0,min.features=0)
+ks_dat <- NormalizeData(ks_dat)
+ks_dat <- as.matrix(ks_dat@assays$RNA@data)
+
+Iimpute_dat <- log2(Iimpute_dat+min(Iimpute_dat[Iimpute_dat!=0]))
+```
+
+combine normalized data
+```{r}
+dat <- list(raw=raw_dat,ALRA=alra_dat,AutoClass=AutoClass_dat,Bfimpute=Bf_dat,ccImpute=ccImpute_dat,DCA=dca_dat,I_Impute=Iimpute_dat,kNN_smoothing=ks_dat,MAGIC=MAGIC_dat,MAGIC_log=MAGIClog_dat,scRMD=scRMDnorm_dat,afMF=afMF_dat)
+rm(raw_dat)
+rm(alra_dat)
+rm(AutoClass_dat)
+rm(Bf_dat)
+rm(ccImpute_dat)
+rm(Iimpute_dat)
+rm(ks_dat)
+rm(dca_dat)
+rm(MAGIC_dat)
+rm(MAGIClog_dat)
+rm(scRMDnorm_dat)
+
+rm(afMF_dat)
+
+colnames(dat$ALRA) <- colnames(dat$raw)
+dat <- lapply(dat,function(x) x[rownames(dat$DCA),rownames(metadat)])
+raw_dat_keep <- raw_dat_keep[rownames(dat$DCA),rownames(metadat)]
+```
+
+### evaluate
+#### monocle3
+ processing raw data
+```{r}
+cds <- new_cell_data_set(raw_dat_keep,cell_metadata=metadat)
+cds <- preprocess_cds(cds)
+cds <- reduce_dimension(cds)
+cds <- cluster_cells(cds)
+cds <- learn_graph(cds)
+cds <- order_cells(cds,root_pr_nodes=get_earliest_principal_node(cds,time_bin="H9.00hb4s"))
+tmp <- getCellOrder(cds,metadat)
+```
+
+```{r message=FALSE, warning=FALSE}
+res8 <- lapply(dat,getCDS,metadat,time_bin="H9.00hb4s")
+res8[["monocle3"]] <- cds
+res8order <- lapply(res8,getCellOrder,metadat)
+res8_pt_m <- as.data.frame(lapply(res8order,evalSCC,"cellorder1","TimeNum","spearman"))
+res8_pt_m <- as.data.frame(t(res8_pt_m))
+colnames(res8_pt_m) <- c("GSE75748_pt")
+res8_pt_m
+```
+
+POS
+```{r}
+tmp1 <- as.data.frame(lapply(res8order,evalPOS_M3,"cellorder1","TimeNum"))
+
+res8_pos_m <- as.data.frame(t(tmp1))
+colnames(res8_pos_m) <- c("GSE75748_pos")
+res8_pos_m
+```
+
+save results
+```{r}
+tmp_res <- list(order_dat=res8order,res_pt=res8_pt_m,res_pos=res8_pos_m)
+saveRDS(tmp_res,"results/SC_Pseudotime_Trajectory/GSE75748_monocle3.rds")
+```
+
+
+#### slingshot
+tutorial processing
+```{r}
+sce <- SingleCellExperiment(assays=List(counts=raw_dat_keep))
+FQnorm <- function(counts){
+    rk <- apply(counts,2,rank,ties.method='min')
+    counts.sort <- apply(counts,2,sort)
+    refdist <- apply(counts.sort,1,median)
+    norm <- apply(rk,2,function(r){ refdist[r] })
+    rownames(norm) <- rownames(counts)
+    return(norm)
+}
+assays(sce)$norm <- FQnorm(assays(sce)$counts)
+sce <- log1p(assays(sce)$norm)
+dat[["slingshot"]] <- sce
+```
+
+run(endclu)
+```{r message=FALSE, warning=FALSE}
+res8_ss <- lapply(dat,getSlingshot,metadat,startclu="H9.00hb4s",endclu=c("H9.96h"))
+
+res8_scc_ss <- as.data.frame(lapply(res8_ss,evalSlingshot,"spearman","TimeNum"))
+res8_scc_ss <- as.data.frame(t(res8_scc_ss))
+res8_scc_ss
+
+tmp <- as.data.frame(lapply(res8_ss,evalPOS,"TimeNum",metadat))
+res8_pos_ss <- as.data.frame(t(tmp))
+res8_pos_ss
+```
+
+save results
+```{r}
+tmp_res <- list(scc=res8_scc_ss,pos=res8_pos_ss)
+saveRDS(tmp_res,"results/SC_Pseudotime_Trajectory/GSE75748_slingshot.rds")
+```
+
+## GSE79578
+### preprocess data
+```{r message=FALSE, warning=FALSE}
+##raw
+raw_dat <- fread("rawcount_txt/GSE79578_genebycell.txt",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+raw_dat <- as.matrix(raw_dat,rownames=1)
+raw_dat_keep <- raw_dat[,]
+
+##imputed
+MAGIClog_dat <- fread("MAGIC_log/GSE79578_genebycell.tsv",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+MAGIClog_dat <- as.matrix(MAGIClog_dat,rownames=1)
+alra_dat <- fread("alra/GSE79578_genebycell_alra.txt",sep="\t",stringsAsFactors=FALSE)
+alra_dat <- as.matrix(alra_dat,rownames=1)
+dca_dat <- fread("dca/GSE79578/mean.tsv",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+dca_dat <- as.matrix(dca_dat,rownames=1)
+MAGIC_dat <- fread("MAGIC/GSE79578_genebycell.tsv",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+MAGIC_dat <- as.matrix(MAGIClog_dat,rownames=1)
+AutoClass_dat <- fread("AutoClass/GSE79578_genebycell_AC.txt",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+AutoClass_dat <- as.matrix(AutoClass_dat,rownames=1)
+ccImpute_dat <- fread("ccImpute/GSE79578_genebycell_cc.txt",sep="\t",stringsAsFactors=FALSE)
+ccImpute_dat <- as.matrix(ccImpute_dat,rownames=1)
+ks_dat <- fread("knn_smoothing/GSE79578_genebycell_ks.txt",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+ks_dat <- as.matrix(ks_dat,rownames=1)
+Iimpute_dat <- fread("I_Impute/GSE79578_genebycell_CImp.txt",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+Iimpute_dat <- as.matrix(Iimpute_dat,rownames=1)
+scRMDnorm_dat <- fread("scRMD/GSE79578_genebycell_scRMDlognorm.txt",sep="\t",stringsAsFactors=FALSE)
+scRMDnorm_dat <- as.matrix(scRMDnorm_dat,rownames=1)
+Bf_dat <- fread("Bfimpute/GSE79578_genebycell_Bfimpute_specc.txt",sep="\t",stringsAsFactors=FALSE)
+Bf_dat <- as.matrix(Bf_dat,rownames=1)
+
+afMF_dat <- fread("afMF/imputed_data/GSE79578_sigma3_0_convergence_True.txt",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+afMF_dat <- as.matrix(afMF_dat,rownames=1)
+
+metadat <- readRDS("rawcount_rds/GSE79578_rawnorm2.rds")
+metadat <- as.data.frame(metadat@colData)
+metadat <- metadat[colnames(raw_dat),]
+
+#metadat <- metadat[metadat$cell_type!="i2",]
+metadat$TimeNum <- NA
+metadat[metadat$cell_type=="i2",]$TimeNum <- 0
+metadat[metadat$cell_type=="h2",]$TimeNum <- 1
+metadat[metadat$cell_type=="h12",]$TimeNum <- 2
+metadat[metadat$cell_type=="h24",]$TimeNum <- 3
+metadat[metadat$cell_type=="h36",]$TimeNum <- 4
+metadat[metadat$cell_type=="h48",]$TimeNum <- 5
+metadat[metadat$cell_type=="h60",]$TimeNum <- 6
+metadat[metadat$cell_type=="h72",]$TimeNum <- 7
+metadat[metadat$cell_type=="h96",]$TimeNum <- 8
+metadat$group <- metadat$cell_type
+metadat$cell <- rownames(metadat)
+```
+
+normalized/log2 data
+```{r}
+raw_dat <- CreateSeuratObject(counts=raw_dat,meta.data=metadat,min.cells=0,min.features=0)
+raw_dat <- NormalizeData(raw_dat)
+raw_dat <- as.matrix(raw_dat@assays$RNA@data)
+
+dca_dat <- log2(dca_dat)
+
+ks_dat <- CreateSeuratObject(counts=ks_dat,meta.data=metadat,min.cells=0,min.features=0)
+ks_dat <- NormalizeData(ks_dat)
+ks_dat <- as.matrix(ks_dat@assays$RNA@data)
+
+Iimpute_dat <- log2(Iimpute_dat+min(Iimpute_dat[Iimpute_dat!=0]))
+```
+
+combine normalized data
+```{r}
+dat <- list(raw=raw_dat,ALRA=alra_dat,AutoClass=AutoClass_dat,Bfimpute=Bf_dat,ccImpute=ccImpute_dat,DCA=dca_dat,I_Impute=Iimpute_dat,kNN_smoothing=ks_dat,MAGIC=MAGIC_dat,MAGIC_log=MAGIClog_dat,scRMD=scRMDnorm_dat,afMF=afMF_dat)
+rm(raw_dat)
+rm(alra_dat)
+rm(AutoClass_dat)
+rm(Bf_dat)
+rm(ccImpute_dat)
+rm(Iimpute_dat)
+rm(ks_dat)
+rm(dca_dat)
+rm(MAGIC_dat)
+rm(MAGIClog_dat)
+rm(scRMDnorm_dat)
+
+rm(afMF_dat)
+
+colnames(dat$ALRA) <- colnames(dat$raw)
+dat <- lapply(dat,function(x) x[rownames(dat$DCA),rownames(metadat)])
+raw_dat_keep <- raw_dat_keep[rownames(dat$DCA),rownames(metadat)]
+```
+
+### evaluate
+#### monocle3
+tutorial processing raw data
+```{r}
+cds <- new_cell_data_set(raw_dat_keep,cell_metadata=metadat)
+cds <- preprocess_cds(cds)
+cds <- reduce_dimension(cds)
+cds <- cluster_cells(cds)
+cds <- learn_graph(cds)
+cds <- order_cells(cds,root_pr_nodes=get_earliest_principal_node(cds,time_bin="i2"))
+tmp <- getCellOrder(cds,metadat)
+```
+
+```{r message=FALSE, warning=FALSE}
+res9 <- lapply(dat,getCDS,metadat,time_bin="i2")
+res9[["monocle3"]] <- cds
+res9order <- lapply(res9,getCellOrder,metadat)
+res9_pt_m <- as.data.frame(lapply(res9order,evalSCC,"cellorder1","TimeNum","spearman"))
+res9_pt_m <- as.data.frame(t(res9_pt_m))
+colnames(res9_pt_m) <- c("GSE79578_pt")
+res9_pt_m
+```
+
+POS
+```{r}
+tmp1 <- as.data.frame(lapply(res9order,evalPOS_M3,"cellorder1","TimeNum"))
+
+res9_pos_m <- as.data.frame(t(tmp1))
+colnames(res9_pos_m) <- c("GSE79578_pos")
+res9_pos_m
+```
+
+save results
+```{r}
+tmp_res <- list(order_dat=res9order,res_pt=res9_pt_m,res_pos=res9_pos_m)
+saveRDS(tmp_res,"results/SC_Pseudotime_Trajectory/GSE79578_monocle3.rds")
+```
+
+
+#### slingshot
+tutorial processing
+```{r}
+sce <- SingleCellExperiment(assays=List(counts=raw_dat_keep))
+FQnorm <- function(counts){
+    rk <- apply(counts,2,rank,ties.method='min')
+    counts.sort <- apply(counts,2,sort)
+    refdist <- apply(counts.sort,1,median)
+    norm <- apply(rk,2,function(r){ refdist[r] })
+    rownames(norm) <- rownames(counts)
+    return(norm)
+}
+assays(sce)$norm <- FQnorm(assays(sce)$counts)
+sce <- log1p(assays(sce)$norm)
+dat[["slingshot"]] <- sce
+```
+
+run(endclu)
+```{r message=FALSE, warning=FALSE}
+res9_ss <- lapply(dat,getSlingshot,metadat,startclu="i2",endclu=c("h96"))
+
+res9_scc_ss <- as.data.frame(lapply(res9_ss,evalSlingshot,"spearman","TimeNum"))
+res9_scc_ss <- as.data.frame(t(res9_scc_ss))
+res9_scc_ss
+
+tmp <- as.data.frame(lapply(res9_ss,evalPOS,"TimeNum",metadat))
+res9_pos_ss <- as.data.frame(t(tmp))
+res9_pos_ss
+```
+
+save results
+```{r}
+tmp_res <- list(scc=res9_scc_ss,pos=res9_pos_ss)
+saveRDS(tmp_res,"results/SC_Pseudotime_Trajectory/GSE79578_slingshot.rds")
+```
+
+## GSE90047
+### preprocess data
+```{r message=FALSE, warning=FALSE}
+##raw
+raw_dat <- fread("rawcount_txt/GSE90047_genebycell.txt",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+raw_dat <- as.matrix(raw_dat,rownames=1)
+raw_dat_keep <- raw_dat[,]
+
+##imputed
+MAGIClog_dat <- fread("MAGIC_log/GSE90047_genebycell.tsv",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+MAGIClog_dat <- as.matrix(MAGIClog_dat,rownames=1)
+alra_dat <- fread("alra/GSE90047_genebycell_alra.txt",sep="\t",stringsAsFactors=FALSE)
+alra_dat <- as.matrix(alra_dat,rownames=1)
+dca_dat <- fread("dca/GSE90047/mean.tsv",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+dca_dat <- as.matrix(dca_dat,rownames=1)
+MAGIC_dat <- fread("MAGIC/GSE90047_genebycell.tsv",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+MAGIC_dat <- as.matrix(MAGIClog_dat,rownames=1)
+AutoClass_dat <- fread("AutoClass/GSE90047_genebycell_AC.txt",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+AutoClass_dat <- as.matrix(AutoClass_dat,rownames=1)
+ccImpute_dat <- fread("ccImpute/GSE90047_genebycell_cc.txt",sep="\t",stringsAsFactors=FALSE)
+ccImpute_dat <- as.matrix(ccImpute_dat,rownames=1)
+ks_dat <- fread("knn_smoothing/GSE90047_genebycell_ks.txt",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+ks_dat <- as.matrix(ks_dat,rownames=1)
+Iimpute_dat <- fread("I_Impute/GSE90047_genebycell_CImp.txt",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+Iimpute_dat <- as.matrix(Iimpute_dat,rownames=1)
+scRMDnorm_dat <- fread("scRMD/GSE90047_genebycell_scRMDlognorm.txt",sep="\t",stringsAsFactors=FALSE)
+scRMDnorm_dat <- as.matrix(scRMDnorm_dat,rownames=1)
+Bf_dat <- fread("Bfimpute/GSE90047_genebycell_Bfimpute_specc.txt",sep="\t",stringsAsFactors=FALSE)
+Bf_dat <- as.matrix(Bf_dat,rownames=1)
+
+afMF_dat <- fread("afMF/imputed_data/GSE90047_sigma3_0_convergence_True.txt",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+afMF_dat <- as.matrix(afMF_dat,rownames=1)
+
+metadat <- readRDS("rawcount_rds/GSE90047_rawnorm2.rds")
+metadat <- as.data.frame(metadat@colData)
+metadat <- metadat[colnames(raw_dat),]
+
+metadat <- metadat[!metadat$cell_type%in%c("CD","CE","TD","TE","TUE","UE"),]
+metadat$TimeNum <- NA
+metadat[metadat$cell_type=="E10.5D",]$TimeNum <- 0
+metadat[metadat$cell_type=="E11.5D",]$TimeNum <- 1
+metadat[metadat$cell_type=="E11.5E",]$TimeNum <- 1
+metadat[metadat$cell_type=="E12.5D",]$TimeNum <- 2
+metadat[metadat$cell_type=="E12.5E",]$TimeNum <- 2
+metadat[metadat$cell_type=="E13.5D",]$TimeNum <- 3
+metadat[metadat$cell_type=="E13.5E",]$TimeNum <- 3
+metadat[metadat$cell_type=="E14.5D",]$TimeNum <- 4
+metadat[metadat$cell_type=="E14.5E",]$TimeNum <- 4
+metadat[metadat$cell_type=="E15.5D",]$TimeNum <- 5
+metadat[metadat$cell_type=="E15.5E",]$TimeNum <- 5
+metadat[metadat$cell_type=="E17.5D",]$TimeNum <- 6
+metadat[metadat$cell_type=="E17.5E",]$TimeNum <- 6
+metadat$group <- as.character(metadat$TimeNum)
+metadat$cell <- rownames(metadat)
+
+GeneSymbol <- bitr(rownames(raw_dat),fromType="ENSEMBL",toType="SYMBOL",OrgDb="org.Mm.eg.db")
+GeneSymbol <- GeneSymbol[!duplicated(GeneSymbol$SYMBOL),]
+GeneSymbol <- GeneSymbol[!duplicated(GeneSymbol$ENSEMBL),]
+
+raw_dat <- raw_dat[GeneSymbol$ENSEMBL,]
+rownames(raw_dat) <- GeneSymbol$SYMBOL
+afMF_dat <- afMF_dat[GeneSymbol$ENSEMBL,]
+rownames(afMF_dat) <- GeneSymbol$SYMBOL
+AutoClass_dat <- AutoClass_dat[GeneSymbol$ENSEMBL,]
+rownames(AutoClass_dat) <- GeneSymbol$SYMBOL
+alra_dat <- alra_dat[GeneSymbol$ENSEMBL,]
+rownames(alra_dat) <- GeneSymbol$SYMBOL
+Bf_dat <- Bf_dat[GeneSymbol$ENSEMBL,]
+rownames(Bf_dat) <- GeneSymbol$SYMBOL
+ccImpute_dat <- ccImpute_dat[GeneSymbol$ENSEMBL,]
+rownames(ccImpute_dat) <- GeneSymbol$SYMBOL
+dca_dat <- dca_dat[GeneSymbol$ENSEMBL,]
+rownames(dca_dat) <- GeneSymbol$SYMBOL
+Iimpute_dat <- Iimpute_dat[GeneSymbol$ENSEMBL,]
+rownames(Iimpute_dat) <- GeneSymbol$SYMBOL
+ks_dat <- ks_dat[GeneSymbol$ENSEMBL,]
+rownames(ks_dat) <- GeneSymbol$SYMBOL
+MAGIC_dat <- MAGIC_dat[GeneSymbol$ENSEMBL,]
+rownames(MAGIC_dat) <- GeneSymbol$SYMBOL
+MAGIClog_dat <- MAGIClog_dat[GeneSymbol$ENSEMBL,]
+rownames(MAGIClog_dat) <- GeneSymbol$SYMBOL
+scRMDnorm_dat <- scRMDnorm_dat[GeneSymbol$ENSEMBL,]
+rownames(scRMDnorm_dat) <- GeneSymbol$SYMBOL
+raw_dat_keep <- raw_dat_keep[GeneSymbol$ENSEMBL,]
+rownames(raw_dat_keep) <- GeneSymbol$SYMBOL
+```
+
+normalized/log2 data
+```{r}
+raw_dat <- CreateSeuratObject(counts=raw_dat,meta.data=metadat,min.cells=0,min.features=0)
+raw_dat <- NormalizeData(raw_dat)
+raw_dat <- as.matrix(raw_dat@assays$RNA@data)
+
+dca_dat <- log2(dca_dat)
+
+ks_dat <- CreateSeuratObject(counts=ks_dat,meta.data=metadat,min.cells=0,min.features=0)
+ks_dat <- NormalizeData(ks_dat)
+ks_dat <- as.matrix(ks_dat@assays$RNA@data)
+
+Iimpute_dat <- log2(Iimpute_dat+min(Iimpute_dat[Iimpute_dat!=0]))
+```
+
+combine normalized data
+```{r}
+dat <- list(raw=raw_dat,ALRA=alra_dat,AutoClass=AutoClass_dat,Bfimpute=Bf_dat,ccImpute=ccImpute_dat,DCA=dca_dat,I_Impute=Iimpute_dat,kNN_smoothing=ks_dat,MAGIC=MAGIC_dat,MAGIC_log=MAGIClog_dat,scRMD=scRMDnorm_dat,afMF=afMF_dat)
+rm(raw_dat)
+rm(alra_dat)
+rm(AutoClass_dat)
+rm(Bf_dat)
+rm(ccImpute_dat)
+rm(Iimpute_dat)
+rm(ks_dat)
+rm(dca_dat)
+rm(MAGIC_dat)
+rm(MAGIClog_dat)
+rm(scRMDnorm_dat)
+
+rm(afMF_dat)
+
+colnames(dat$ALRA) <- colnames(dat$raw)
+dat <- lapply(dat,function(x) x[rownames(dat$DCA),rownames(metadat)])
+raw_dat_keep <- raw_dat_keep[rownames(dat$DCA),rownames(metadat)]
+```
+
+### evaluate
+#### monocle3
+tutorial processing raw data
+```{r}
+cds <- new_cell_data_set(raw_dat_keep,cell_metadata=metadat)
+cds <- preprocess_cds(cds)
+cds <- reduce_dimension(cds)
+cds <- cluster_cells(cds)
+cds <- learn_graph(cds)
+cds <- order_cells(cds,root_pr_nodes=get_earliest_principal_node(cds,time_bin="0"))
+tmp <- getCellOrder(cds,metadat)
+```
+
+```{r message=FALSE, warning=FALSE}
+res10 <- lapply(dat,getCDS,metadat,time_bin="0")
+res10[["monocle3"]] <- cds
+res10order <- lapply(res10,getCellOrder,metadat)
+res10_pt_m <- as.data.frame(lapply(res10order,evalSCC,"cellorder1","TimeNum","spearman"))
+res10_pt_m <- as.data.frame(t(res10_pt_m))
+colnames(res10_pt_m) <- c("GSE90047_pt")
+res10_pt_m
+```
+
+POS
+```{r}
+tmp1 <- as.data.frame(lapply(res10order,evalPOS_M3,"cellorder1","TimeNum"))
+
+res10_pos_m <- as.data.frame(t(tmp1))
+colnames(res10_pos_m) <- c("GSE90047_pos")
+res10_pos_m
+```
+
+save results
+```{r}
+tmp_res <- list(order_dat=res10order,res_pt=res10_pt_m,res_pos=res10_pos_m)
+saveRDS(tmp_res,"results/SC_Pseudotime_Trajectory/GSE90047_monocle3.rds")
+```
+
+
+#### slingshot
+tutorial processing
+```{r}
+sce <- SingleCellExperiment(assays=List(counts=raw_dat_keep))
+FQnorm <- function(counts){
+    rk <- apply(counts,2,rank,ties.method='min')
+    counts.sort <- apply(counts,2,sort)
+    refdist <- apply(counts.sort,1,median)
+    norm <- apply(rk,2,function(r){ refdist[r] })
+    rownames(norm) <- rownames(counts)
+    return(norm)
+}
+assays(sce)$norm <- FQnorm(assays(sce)$counts)
+sce <- log1p(assays(sce)$norm)
+dat[["slingshot"]] <- sce
+```
+
+run(endclu)
+```{r message=FALSE, warning=FALSE}
+res10_ss <- lapply(dat,getSlingshot,metadat,startclu="0",endclu=c("6"))
+
+res10_scc_ss <- as.data.frame(lapply(res10_ss,evalSlingshot,"spearman","TimeNum"))
+res10_scc_ss <- as.data.frame(t(res10_scc_ss))
+res10_scc_ss
+
+tmp <- as.data.frame(lapply(res10_ss,evalPOS,"TimeNum",metadat))
+res10_pos_ss <- as.data.frame(t(tmp))
+res10_pos_ss
+```
+
+save results
+```{r}
+tmp_res <- list(scc=res10_scc_ss,pos=res10_pos_ss)
+saveRDS(tmp_res,"results/SC_Pseudotime_Trajectory/GSE90047_slingshot.rds")
+```
+
+## summary and visualize
+### pseudotime
+#### monocle3
+##### SCC
+read data
+```{r}
+tmp <- list.files("results/SC_Pseudotime_Trajectory/")
+tmp <- tmp[grep("monocle3",tmp)]
+
+#res <- data.frame()
+res_ls <- list()
+for(x in tmp){
+    tmppath <- paste0("results/SC_Pseudotime_Trajectory/",x)
+    res1 <- readRDS(tmppath)
+    res1 <- as.data.frame(t(res1$res_pt))
+    #res <- rbind(res,res1)
+    res_ls[[x]] <- res1
+}
+res_ls[["GSE118068_embryonic_monocle3.rds"]]$Bfimpute <- NA
+res_ls[["GSE118068_embryonic_monocle3.rds"]]$ccImpute <- NA
+res_ls[["GSE118068_embryonic_monocle3.rds"]]$I_Impute <- NA
+res_ls[["GSE118068_embryonic_monocle3.rds"]] <- res_ls[["GSE118068_embryonic_monocle3.rds"]][,colnames(res_ls[["cellmix1_monocle3.rds"]])]
+
+res_ls[["GSE118068_postnatal_monocle3.rds"]]$Bfimpute <- NA
+res_ls[["GSE118068_postnatal_monocle3.rds"]]$ccImpute <- NA
+res_ls[["GSE118068_postnatal_monocle3.rds"]]$I_Impute <- NA
+res_ls[["GSE118068_postnatal_monocle3.rds"]]$scRMD <- NA
+res_ls[["GSE118068_postnatal_monocle3.rds"]] <- res_ls[["GSE118068_postnatal_monocle3.rds"]][,colnames(res_ls[["cellmix1_monocle3.rds"]])]
+
+res <- data.frame()
+for(x in names(res_ls)){
+    res <- rbind(res,res_ls[[x]])
+}
+
+#res <- res[-nrow(res),]
+res
+```
+
+process data
+```{r}
+md_raw <- median(res$raw)
+res_diff <- as.data.frame(apply(res[,-1],2,function(x) x-res[,1] ))
+res_diff$data <- rownames(res)
+res_melt <- data.table::melt(res_diff,id.vars=c("data"))
+head(res_melt)
+
+res_melt$Type <- "Deep learning based"
+res_melt[res_melt$variable%in%c("ccImpute","I_Impute","kNN_smoothing","MAGIC","MAGIC_log"),]$Type <- "Model or smoothing based"
+res_melt[res_melt$variable%in%c("ALRA","Bfimpute","afMF","scRMD"),]$Type <- "Matrix based"
+res_melt[res_melt$variable%in%c("monocle3"),]$Type <- "Monocle3"
+res_melt$Type <- factor(res_melt$Type,levels=c("Matrix based","Model or smoothing based","Deep learning based","Monocle3"))
+
+#rank by cor coefficient diff
+mdv <- res_melt %>% group_by(variable) %>% summarise(md=median(value,na.rm=TRUE))
+rank1 <- mdv[order(mdv$md),]$variable
+res_melt$Method <- factor(res_melt$variable,levels=c("afMF","ALRA","AutoClass","Bfimpute","ccImpute","DCA","I_Impute","kNN_smoothing","MAGIC","MAGIC_log","scRMD","monocle3"))
+res_melt$variable <- factor(res_melt$variable,levels=rank1)
+neg_md <- sum(mdv$md<=0)
+
+#performed tests
+pv <- apply(res[,-1],2,function(x) wilcox.test(res[,1],x,alternative="less",paired=TRUE)$p.value )
+pv_sig <- sapply(pv,getPsig)
+pv_sig <- pv_sig[rank1]
+```
+
+box plot
+```{r}
+tmp_bp <- res_melt[,]
+tmp_bp$value <- ifelse(tmp_bp$value<(-0.5),-0.5,tmp_bp$value)
+
+mono_scc_bp <- ggboxplot(tmp_bp,x="variable",y="value",fill="Type",ylab="SCC Difference",xlab="Method",title="Monocle3 Pseudotime-Real Time SCC Difference")+geom_hline(yintercept=0,linetype="dashed")+geom_vline(xintercept=neg_md+0.5,linetype="dashed")+annotate(geom="text",x=c(1:length(pv_sig)),y=1,label=pv_sig,size=7)+annotate(geom="text",x=length(pv_sig)+2.3,y=0.06,label=paste0("Raw(Median=",round(md_raw,2),")"),size=4.5)+coord_cartesian(xlim=c(1,length(pv_sig)+3.5))+theme(plot.title=element_text(size=16),legend.title=element_text(size=14),legend.text=element_text(size=13),axis.title=element_text(size=18),axis.text.x=element_text(angle=90,size=15),axis.text.y=element_text(size=15))+scale_fill_brewer(palette="Set2")
+mono_scc_bp
+```
+
+heatmap
+```{r}
+tmp_hm <- res_melt[,]
+colnames(tmp_hm)[3] <- "SCC_Difference"
+mono_scc_hm <- ggplot(tmp_hm,aes(variable,data,fill=SCC_Difference))+geom_tile()+scale_fill_gradient2(low="blue",mid="white",high="red",midpoint=0)+geom_vline(xintercept=neg_md+0.5,linetype="dashed")+xlab("Method")+ylab("Datasets")+ggtitle("Monocle3 Pseudotime-Real Time SCC Difference")+theme(plot.title=element_text(size=16),legend.title=element_text(size=14),legend.text=element_text(size=13),axis.title=element_text(size=18),axis.text.x=element_text(angle=90,size=15),axis.text.y=element_text(size=10))
+mono_scc_hm
+```
+
+##### POS
+read data
+```{r}
+tmp <- list.files("results/SC_Pseudotime_Trajectory/")
+tmp <- tmp[grep("monocle3",tmp)]
+
+#res <- data.frame()
+res_ls <- list()
+for(x in tmp){
+    tmppath <- paste0("results/SC_Pseudotime_Trajectory/",x)
+    res1 <- readRDS(tmppath)
+    res1 <- as.data.frame(t(res1$res_pos))
+    #res <- rbind(res,res1)
+    res_ls[[x]] <- res1
+}
+res_ls[["GSE118068_embryonic_monocle3.rds"]]$Bfimpute <- NA
+res_ls[["GSE118068_embryonic_monocle3.rds"]]$ccImpute <- NA
+res_ls[["GSE118068_embryonic_monocle3.rds"]]$I_Impute <- NA
+res_ls[["GSE118068_embryonic_monocle3.rds"]] <- res_ls[["GSE118068_embryonic_monocle3.rds"]][,colnames(res_ls[["cellmix1_monocle3.rds"]])]
+
+res_ls[["GSE118068_postnatal_monocle3.rds"]]$Bfimpute <- NA
+res_ls[["GSE118068_postnatal_monocle3.rds"]]$ccImpute <- NA
+res_ls[["GSE118068_postnatal_monocle3.rds"]]$I_Impute <- NA
+res_ls[["GSE118068_postnatal_monocle3.rds"]]$scRMD <- NA
+res_ls[["GSE118068_postnatal_monocle3.rds"]] <- res_ls[["GSE118068_postnatal_monocle3.rds"]][,colnames(res_ls[["cellmix1_monocle3.rds"]])]
+
+res <- data.frame()
+for(x in names(res_ls)){
+    res <- rbind(res,res_ls[[x]])
+}
+
+rownames(res)[3:8] <- c("cellmix2_pos1","cellmix2_pos2","cellmix3_pos1","cellmix3_pos2","cellmix4_pos1","cellmix4_pos2")
+res
+```
+
+process data
+```{r}
+md_raw <- median(res$raw)
+res_diff <- as.data.frame(apply(res[,-1],2,function(x) x-res[,1] ))
+res_diff$data <- rownames(res)
+res_melt <- data.table::melt(res_diff,id.vars=c("data"))
+
+res_melt$Type <- "Deep learning based"
+res_melt[res_melt$variable%in%c("ccImpute","I_Impute","kNN_smoothing","MAGIC","MAGIC_log"),]$Type <- "Model or smoothing based"
+res_melt[res_melt$variable%in%c("ALRA","Bfimpute","afMF","scRMD"),]$Type <- "Matrix based"
+res_melt[res_melt$variable%in%c("monocle3"),]$Type <- "Monocle3"
+res_melt$Type <- factor(res_melt$Type,levels=c("Matrix based","Model or smoothing based","Deep learning based","Monocle3"))
+
+head(res_melt)
+
+#rank by cor coefficient diff
+mdv <- res_melt %>% dplyr::group_by(variable) %>% dplyr::summarise(md=median(value,na.rm=TRUE))
+rank1 <- mdv[order(mdv$md),]$variable
+res_melt$Method <- factor(res_melt$variable,levels=c("afMF","ALRA","AutoClass","Bfimpute","ccImpute","DCA","I_Impute","kNN_smoothing","MAGIC","MAGIC_log","scRMD","monocle3"))
+res_melt$variable <- factor(res_melt$variable,levels=rank1)
+neg_md <- sum(mdv$md<=0)
+
+#performed tests
+pv <- apply(res[,-1],2,function(x) wilcox.test(res[,1],x,alternative="less",paired=TRUE)$p.value )
+pv_sig <- sapply(pv,getPsig)
+pv_sig <- pv_sig[rank1]
+```
+
+box plot
+```{r}
+tmp_bp <- res_melt[,]
+tmp_bp$value <- ifelse(tmp_bp$value<(-0.5),-0.5,tmp_bp$value)
+
+mono_pos_bp <- ggboxplot(tmp_bp,x="variable",y="value",fill="Type",ylab="SCC Difference",xlab="Method",title="Monocle3 POS Difference")+geom_hline(yintercept=0,linetype="dashed")+geom_vline(xintercept=neg_md+0.5,linetype="dashed")+annotate(geom="text",x=c(1:length(pv_sig)),y=1,label=pv_sig,size=7)+annotate(geom="text",x=length(pv_sig)+2.3,y=0.06,label=paste0("Raw(Median=",round(md_raw,2),")"),size=4.5)+coord_cartesian(xlim=c(1,length(pv_sig)+3.5))+theme(plot.title=element_text(size=16),legend.title=element_text(size=14),legend.text=element_text(size=13),axis.title=element_text(size=18),axis.text.x=element_text(angle=90,size=15),axis.text.y=element_text(size=15))+scale_fill_brewer(palette="Set2")
+mono_pos_bp
+```
+
+heatmap
+```{r}
+tmp_hm <- res_melt[,]
+colnames(tmp_hm)[3] <- "SCC_Difference"
+mono_pos_hm <- ggplot(tmp_hm,aes(variable,data,fill=SCC_Difference))+geom_tile()+scale_fill_gradient2(low="blue",mid="white",high="red",midpoint=0)+geom_vline(xintercept=neg_md+0.5,linetype="dashed")+xlab("Method")+ylab("Datasets")+ggtitle("Monocle3 POS Difference")+theme(plot.title=element_text(size=16),legend.title=element_text(size=14),legend.text=element_text(size=13),axis.title=element_text(size=18),axis.text.x=element_text(angle=90,size=15),axis.text.y=element_text(size=10))
+mono_pos_hm
+```
+
+#### slingshot
+read data
+```{r}
+tmp <- list.files("results/SC_Pseudotime_Trajectory/")
+tmp <- tmp[grep("slingshot",tmp)]
+
+res_scc_ls <- list()
+res_pos_ls <- list()
+for(x in tmp){
+    tmppath <- paste0("results/SC_Pseudotime_Trajectory/",x)
+    res1 <- readRDS(tmppath)
+    res1_scc <- as.data.frame(t(res1$scc))
+    res1_pos <- as.data.frame(t(res1$pos))
+    res_scc_ls[[x]] <- res1_scc
+    res_pos_ls[[x]] <- res1_pos
+}
+
+res_scc <- data.frame()
+res_pos <- data.frame()
+for(x in names(res_scc_ls)){
+    res_scc <- rbind(res_scc,res_scc_ls[[x]])
+    res_pos <- rbind(res_pos,res_pos_ls[[x]])
+}
+
+rownames(res_scc) <- c("cellmix1_1","cellmix1_2","cellmix2_1","cellmix2_2","cellmix3_1","cellmix3_2","cellmix4_1","cellmix4_2","GSE75748","GSE79578","GSE90047")
+rownames(res_pos) <- c("cellmix1_1","cellmix1_2","cellmix2_1","cellmix2_2","cellmix3_1","cellmix3_2","cellmix4_1","cellmix4_2","GSE75748","GSE79578","GSE90047")
+res_scc
+#res_pos
+```
+
+##### SCC
+process data
+```{r}
+md_raw <- median(res_scc$raw)
+res_diff <- as.data.frame(apply(res_scc[,-1],2,function(x) x-res_scc[,1] ))
+res_diff$data <- rownames(res_scc)
+res_melt <- data.table::melt(res_diff,id.vars=c("data"))
+
+res_melt$Type <- "Deep learning based"
+res_melt[res_melt$variable%in%c("ccImpute","I_Impute","kNN_smoothing","MAGIC","MAGIC_log"),]$Type <- "Model or smoothing based"
+res_melt[res_melt$variable%in%c("ALRA","Bfimpute","afMF","scRMD"),]$Type <- "Matrix based"
+res_melt[res_melt$variable%in%c("slingshot"),]$Type <- "Slingshot"
+res_melt$Type <- factor(res_melt$Type,levels=c("Matrix based","Model or smoothing based","Deep learning based","Slingshot"))
+
+head(res_melt)
+
+#rank by cor coefficient diff
+mdv <- res_melt %>% dplyr::group_by(variable) %>% dplyr::summarise(md=median(value,na.rm=TRUE))
+rank1 <- mdv[order(mdv$md),]$variable
+res_melt$Method <- factor(res_melt$variable,levels=c("afMF","ALRA","AutoClass","Bfimpute","ccImpute","DCA","I_Impute","kNN_smoothing","MAGIC","MAGIC_log","scRMD","slingshot"))
+res_melt$variable <- factor(res_melt$variable,levels=rank1)
+neg_md <- sum(mdv$md<=0)
+
+#performed tests
+pv <- apply(res_scc[,-1],2,function(x) wilcox.test(res_scc[,1],x,alternative="less",paired=TRUE)$p.value )
+pv_sig <- sapply(pv,getPsig)
+pv_sig <- pv_sig[rank1]
+```
+
+box plot
+```{r}
+tmp_bp <- res_melt[,]
+tmp_bp$value <- ifelse(tmp_bp$value>(0.3),0.3,tmp_bp$value)
+
+ss_scc_bp <- ggboxplot(tmp_bp,x="variable",y="value",fill="Type",ylab="SCC Difference",xlab="Method",title="Slingshot Pseudotime-Real Time SCC Difference")+geom_hline(yintercept=0,linetype="dashed")+geom_vline(xintercept=neg_md+0.5,linetype="dashed")+annotate(geom="text",x=c(1:length(pv_sig)),y=0.1,label=pv_sig,size=7)+annotate(geom="text",x=length(pv_sig)+2.3,y=0.05,label=paste0("Raw(Median=",round(md_raw,2),")"),size=4.5)+coord_cartesian(xlim=c(1,length(pv_sig)+3.5))+theme(plot.title=element_text(size=16),legend.title=element_text(size=14),legend.text=element_text(size=13),axis.title=element_text(size=18),axis.text.x=element_text(angle=90,size=15),axis.text.y=element_text(size=15))+scale_fill_brewer(palette="Set2")
+ss_scc_bp
+```
+
+##### POS
+process data
+```{r}
+md_raw <- median(res_pos$raw)
+res_diff <- as.data.frame(apply(res_pos[,-1],2,function(x) x-res_pos[,1] ))
+res_diff$data <- rownames(res_pos)
+res_melt <- data.table::melt(res_diff,id.vars=c("data"))
+
+res_melt$Type <- "Deep learning based"
+res_melt[res_melt$variable%in%c("ccImpute","I_Impute","kNN_smoothing","MAGIC","MAGIC_log"),]$Type <- "Model or smoothing based"
+res_melt[res_melt$variable%in%c("ALRA","Bfimpute","afMF","scRMD"),]$Type <- "Matrix based"
+res_melt[res_melt$variable%in%c("slingshot"),]$Type <- "Slingshot"
+res_melt$Type <- factor(res_melt$Type,levels=c("Matrix based","Model or smoothing based","Deep learning based","Slingshot"))
+
+head(res_melt)
+
+#rank by cor coefficient diff
+mdv <- res_melt %>% dplyr::group_by(variable) %>% dplyr::summarise(md=median(value,na.rm=TRUE))
+rank1 <- mdv[order(mdv$md),]$variable
+res_melt$Method <- factor(res_melt$variable,levels=c("afMF","ALRA","AutoClass","Bfimpute","ccImpute","DCA","I_Impute","kNN_smoothing","MAGIC","MAGIC_log","scRMD","slingshot"))
+res_melt$variable <- factor(res_melt$variable,levels=rank1)
+neg_md <- sum(mdv$md<=0)
+
+#performed tests
+pv <- apply(res_pos[,-1],2,function(x) wilcox.test(res_pos[,1],x,alternative="less",paired=TRUE)$p.value )
+pv_sig <- sapply(pv,getPsig)
+pv_sig <- pv_sig[rank1]
+```
+
+box plot
+```{r}
+tmp_bp <- res_melt[,]
+#tmp_bp$value <- ifelse(tmp_bp$value<(-0.5),-0.5,tmp_bp$value)
+ss_pos_bp <- ggboxplot(tmp_bp,x="variable",y="value",fill="Type",ylab="SCC Difference",xlab="Method",title="Slingshot POS Difference")+geom_hline(yintercept=0,linetype="dashed")+geom_vline(xintercept=neg_md+0.5,linetype="dashed")+annotate(geom="text",x=c(1:length(pv_sig)),y=0.1,label=pv_sig,size=7)+annotate(geom="text",x=length(pv_sig)+2.3,y=0.06,label=paste0("Raw(Median=",round(md_raw,2),")"),size=4.5)+coord_cartesian(xlim=c(1,length(pv_sig)+3.5))+theme(plot.title=element_text(size=16),legend.title=element_text(size=14),legend.text=element_text(size=13),axis.title=element_text(size=18),axis.text.x=element_text(angle=90,size=15),axis.text.y=element_text(size=15))+scale_fill_brewer(palette="Set2")
+ss_pos_bp
+```
+
+
+#### DPT
+##### SCC
+read data
+```{r}
+tmp <- list.files("results/SC_Pseudotime_Trajectory/")
+tmp <- tmp[grep("DPT",tmp)]
+tmp <- tmp[grep("cellmix",tmp)]
+
+res <- data.frame()
+#res_ls <- list()
+for(x in tmp){
+    tmppath <- paste0("results/SC_Pseudotime_Trajectory/",x)
+    res1 <- readRDS(tmppath)
+    res1 <- as.data.frame(t(res1$res_pt))
+    res <- rbind(res,res1)
+    #res_ls[[x]] <- res1
+}
+
+res
+```
+
+process data
+```{r}
+md_raw <- median(res$raw)
+res_diff <- as.data.frame(apply(res[,-1],2,function(x) x-res[,1] ))
+res_diff$data <- rownames(res)
+res_melt <- data.table::melt(res_diff,id.vars=c("data"))
+
+res_melt$Type <- "Deep learning based"
+res_melt[res_melt$variable%in%c("ccImpute","I_Impute","kNN_smoothing","MAGIC","MAGIC_log"),]$Type <- "Model or smoothing based"
+res_melt[res_melt$variable%in%c("ALRA","Bfimpute","afMF","scRMD"),]$Type <- "Matrix based"
+res_melt$Type <- factor(res_melt$Type,levels=c("Matrix based","Model or smoothing based","Deep learning based"))
+
+head(res_melt)
+
+#rank by cor coefficient diff
+mdv <- res_melt %>% dplyr::group_by(variable) %>% dplyr::summarise(md=median(value,na.rm=TRUE))
+rank1 <- mdv[order(mdv$md),]$variable
+res_melt$Method <- factor(res_melt$variable,levels=c("afMF","ALRA","AutoClass","Bfimpute","ccImpute","DCA","I_Impute","MAGIC","MAGIC_log","scRMD"))
+res_melt$variable <- factor(res_melt$variable,levels=rank1)
+neg_md <- sum(mdv$md<=0)
+
+#performed tests
+pv <- apply(res[,-1],2,function(x) wilcox.test(res[,1],x,alternative="less",paired=TRUE)$p.value )
+pv_sig <- sapply(pv,getPsig)
+pv_sig <- pv_sig[rank1]
+```
+
+box plot
+```{r}
+tmp_bp <- res_melt[,]
+tmp_bp$value <- ifelse(tmp_bp$value<(-0.5),-0.5,tmp_bp$value)
+
+dpt_scc_bp <- ggboxplot(tmp_bp,x="variable",y="value",fill="Type",ylab="SCC Difference",xlab="Method",title="DPT Pseudotime-Real Time SCC Difference")+geom_hline(yintercept=0,linetype="dashed")+geom_vline(xintercept=neg_md+0.5,linetype="dashed")+annotate(geom="text",x=c(1:length(pv_sig)),y=0.4,label=pv_sig,size=7)+annotate(geom="text",x=length(pv_sig)+2.3,y=0.04,label=paste0("Raw(Median=",round(md_raw,2),")"),size=4.5)+coord_cartesian(xlim=c(1,length(pv_sig)+3.3))+theme(plot.title=element_text(size=16),legend.title=element_text(size=14),legend.text=element_text(size=13),axis.title=element_text(size=18),axis.text.x=element_text(angle=90,size=15),axis.text.y=element_text(size=15))+scale_fill_brewer(palette="Set2")
+dpt_scc_bp
+```
+
+heatmap
+```{r}
+tmp_hm <- res_melt[,]
+tmp_hm$value <- ifelse(tmp_hm$value<(-0.5),-0.5,tmp_hm$value)
+colnames(tmp_hm)[3] <- "SCC_Difference"
+dpt_scc_hm <- ggplot(tmp_hm,aes(variable,data,fill=SCC_Difference))+geom_tile()+scale_fill_gradient2(low="blue",mid="white",high="red",midpoint=0)+geom_vline(xintercept=neg_md+0.5,linetype="dashed")+xlab("Method")+ylab("Datasets")+ggtitle("DPT Pseudotime-Real Time SCC Difference")+theme(plot.title=element_text(size=16),legend.title=element_text(size=14),legend.text=element_text(size=13),axis.title=element_text(size=18),axis.text.x=element_text(angle=90,size=15),axis.text.y=element_text(size=12))
+dpt_scc_hm
+```
+
+##### POS
+read data
+```{r}
+tmp <- list.files("results/SC_Pseudotime_Trajectory/")
+tmp <- tmp[grep("DPT",tmp)]
+tmp <- tmp[grep("cellmix",tmp)]
+
+res <- data.frame()
+#res_ls <- list()
+for(x in tmp){
+    tmppath <- paste0("results/SC_Pseudotime_Trajectory/",x)
+    res1 <- readRDS(tmppath)
+    res1 <- as.data.frame(t(res1$res_pos))
+    res <- rbind(res,res1)
+    #res_ls[[x]] <- res1
+}
+
+res
+```
+
+process data
+```{r}
+md_raw <- median(res$raw)
+res_diff <- as.data.frame(apply(res[,-1],2,function(x) x-res[,1] ))
+res_diff$data <- rownames(res)
+res_melt <- data.table::melt(res_diff,id.vars=c("data"))
+
+res_melt$Type <- "Deep learning based"
+res_melt[res_melt$variable%in%c("ccImpute","I_Impute","kNN_smoothing","MAGIC","MAGIC_log"),]$Type <- "Model or smoothing based"
+res_melt[res_melt$variable%in%c("ALRA","Bfimpute","afMF","scRMD"),]$Type <- "Matrix based"
+res_melt$Type <- factor(res_melt$Type,levels=c("Matrix based","Model or smoothing based","Deep learning based"))
+
+head(res_melt)
+
+#rank by cor coefficient diff
+mdv <- res_melt %>% dplyr::group_by(variable) %>% dplyr::summarise(md=median(value,na.rm=TRUE))
+rank1 <- mdv[order(mdv$md),]$variable
+res_melt$Method <- factor(res_melt$variable,levels=c("afMF","ALRA","AutoClass","Bfimpute","ccImpute","DCA","I_Impute","MAGIC","MAGIC_log","scRMD"))
+res_melt$variable <- factor(res_melt$variable,levels=rank1)
+neg_md <- sum(mdv$md<=0)
+
+#performed tests
+pv <- apply(res[,-1],2,function(x) wilcox.test(res[,1],x,alternative="less",paired=TRUE)$p.value )
+pv_sig <- sapply(pv,getPsig)
+pv_sig <- pv_sig[rank1]
+```
+
+box plot
+```{r}
+tmp_bp <- res_melt[,]
+tmp_bp$value <- ifelse(tmp_bp$value<(-0.5),-0.5,tmp_bp$value)
+
+dpt_pos_bp <- ggboxplot(tmp_bp,x="variable",y="value",fill="Type",ylab="SCC Difference",xlab="Method",title="DPT POS Difference")+geom_hline(yintercept=0,linetype="dashed")+geom_vline(xintercept=neg_md+0.5,linetype="dashed")+annotate(geom="text",x=c(1:length(pv_sig)),y=0.4,label=pv_sig,size=7)+annotate(geom="text",x=length(pv_sig)+2.3,y=0.04,label=paste0("Raw(Median=",round(md_raw,2),")"),size=4.5)+coord_cartesian(xlim=c(1,length(pv_sig)+3.3))+theme(plot.title=element_text(size=16),legend.title=element_text(size=14),legend.text=element_text(size=13),axis.title=element_text(size=18),axis.text.x=element_text(angle=90,size=15),axis.text.y=element_text(size=15))+scale_fill_brewer(palette="Set2")
+dpt_pos_bp
+```
+
+heatmap
+```{r}
+tmp_hm <- res_melt[,]
+tmp_hm$value <- ifelse(tmp_hm$value<(-0.5),-0.5,tmp_hm$value)
+colnames(tmp_hm)[3] <- "SCC_Difference"
+dpt_pos_hm <- ggplot(tmp_hm,aes(variable,data,fill=SCC_Difference))+geom_tile()+scale_fill_gradient2(low="blue",mid="white",high="red",midpoint=0)+geom_vline(xintercept=neg_md+0.5,linetype="dashed")+xlab("Method")+ylab("Datasets")+ggtitle("DPT POS Difference")+theme(plot.title=element_text(size=16),legend.title=element_text(size=14),legend.text=element_text(size=13),axis.title=element_text(size=18),axis.text.x=element_text(angle=90,size=15),axis.text.y=element_text(size=12))
+dpt_pos_hm
+```
+
+### trajectory
+#### slingshot
+read data
+```{r}
+tmp <- list.files("results/SC_Pseudotime_Trajectory/")
+tmp <- tmp[grep("slingshot",tmp)]
+tmp <- tmp[grep("cellmix",tmp)]
+
+#cellmix1
+tmppath <- paste0("results/SC_Pseudotime_Trajectory/",tmp[1])
+res1 <- readRDS(tmppath)
+d_name <- strsplit(tmp[1],"_slingshot")[[1]][1]
+
+res_tb <- as.data.frame(t(res1$overlap_table))
+rownames(res_tb) <- paste0(rownames(res_tb),"_",d_name)
+res_tb <- res_tb[,grep("1|2",colnames(res_tb))]
+
+res_ovlp <- as.data.frame(t(res1$overlap))
+rownames(res_ovlp) <- paste0(rownames(res_ovlp),"_",d_name)
+
+res_fovlp <- as.data.frame(t(res1$f_overlap))
+rownames(res_fovlp) <- paste0(rownames(res_fovlp),"_",d_name)
+
+for(x in tmp[2:4]){
+    tmppath <- paste0("results/SC_Pseudotime_Trajectory/",x)
+    res1 <- readRDS(tmppath)
+    d_name <- strsplit(x,"_slingshot")[[1]][1]
+    
+    res1_tb <- as.data.frame(t(res1$overlap_table))
+    rownames(res1_tb) <- paste0(rownames(res1_tb),"_",d_name)
+    res1_tb <- res1_tb[,colnames(res_tb)]
+    res_tb <- rbind(res_tb,res1_tb)
+    
+    res1_ovlp <- as.data.frame(t(res1$overlap))
+    rownames(res1_ovlp) <- paste0(rownames(res1_ovlp),"_",d_name)
+    res1_ovlp <- res1_ovlp[,colnames(res_ovlp)]
+    res_ovlp <- rbind(res_ovlp,res1_ovlp)
+    
+    res1_fovlp <- as.data.frame(t(res1$f_overlap))
+    rownames(res1_fovlp) <- paste0(rownames(res1_fovlp),"_",d_name)
+    res1_fovlp <- res1_fovlp[,colnames(res_fovlp)]
+    res_fovlp <- rbind(res_fovlp,res1_fovlp)
+}
+
+res_tb
+res_ovlp
+res_fovlp
+```
+
+##### process data
+```{r}
+#scc
+md_raw <- median(res_ovlp$raw)
+res_ovlp_diff <- as.data.frame(apply(res_ovlp[,-1],2,function(x) x-res_ovlp[,1] ))
+res_ovlp_diff$data <- rownames(res_ovlp)
+res_ovlp_diff_melt <- data.table::melt(res_ovlp_diff,id.vars=c("data"))
+
+res_ovlp_diff_melt$Type <- "Deep learning based"
+res_ovlp_diff_melt[res_ovlp_diff_melt$variable%in%c("ccImpute","I_Impute","kNN_smoothing","MAGIC","MAGIC_log"),]$Type <- "Model or smoothing based"
+res_ovlp_diff_melt[res_ovlp_diff_melt$variable%in%c("ALRA","Bfimpute","afMF","scRMD"),]$Type <- "Matrix based"
+res_ovlp_diff_melt[res_ovlp_diff_melt$variable%in%c("slingshot"),]$Type <- "Slingshot"
+res_ovlp_diff_melt$Type <- factor(res_ovlp_diff_melt$Type,levels=c("Matrix based","Model or smoothing based","Deep learning based","Slingshot"))
+
+head(res_ovlp_diff_melt)
+
+#rank by cor coefficient diff
+mdv <- res_ovlp_diff_melt %>% dplyr::group_by(variable) %>% dplyr::summarise(md=median(value))
+rank1 <- mdv[order(mdv$md),]$variable
+res_ovlp_diff_melt$Method <- factor(res_ovlp_diff_melt$variable,levels=c("afMF","ALRA","AutoClass","Bfimpute","ccImpute","DCA","I_Impute","kNN_smoothing","MAGIC","MAGIC_log","scRMD","slingshot"))
+res_ovlp_diff_melt$variable <- factor(res_ovlp_diff_melt$variable,levels=rank1)
+neg_md <- sum(mdv$md<=0)
+
+#performed tests
+pv <- apply(res_ovlp[,-1],2,function(x) wilcox.test(res_ovlp[,1],x,alternative="less",paired=TRUE)$p.value )
+pv_sig <- sapply(pv,getPsig)
+pv_sig <- pv_sig[as.character(rank1)]
+```
+
+box plot
+```{r}
+tmp_bp <- res_ovlp_diff_melt[,]
+
+ss_ovlp_bp <- ggboxplot(tmp_bp,x="variable",y="value",fill="Type",ylab="Overlap Rate Difference",xlab="Method",title="Slingshot Trajectory Ovelap Rate Difference")+geom_hline(yintercept=0,linetype="dashed")+annotate(geom="text",x=c(1:length(pv_sig)),y=0.02,label=pv_sig,size=7)+annotate(geom="text",x=length(pv_sig)+2.3,y=0.01,label=paste0("Raw(Median=",round(md_raw,2),")"),size=4.5)+coord_cartesian(xlim=c(1,length(pv_sig)+3.5))+theme(plot.title=element_text(size=16),legend.title=element_text(size=14),legend.text=element_text(size=13),axis.title=element_text(size=18),axis.text.x=element_text(angle=90,size=15),axis.text.y=element_text(size=15))+scale_fill_brewer(palette="Set2")
+ss_ovlp_bp
+```
+
+heatmap
+```{r}
+tmp_hm <- res_ovlp_diff_melt[,]
+#tmp_hm[tmp_hm$value>=0.2,]$value <- 0.2
+#tmp_hm[tmp_hm$value<=(-0.2),]$value <- (-0.2)
+colnames(tmp_hm)[3] <- "Overlap_Rate_Difference"
+ss_ovlp_hm <- ggplot(tmp_hm,aes(variable,data,fill=Overlap_Rate_Difference))+geom_tile()+scale_fill_gradient2(low="blue",mid="white",high="red",midpoint=0)+xlab("Method")+ylab("Datasets")+ggtitle("Slingshot Trajectory Ovelap Rate Difference")+theme(plot.title=element_text(size=16),legend.title=element_text(size=14),legend.text=element_text(size=13),axis.title=element_text(size=18),axis.text.x=element_text(angle=90,size=15),axis.text.y=element_text(size=10))
+ss_ovlp_hm
+```
+
+#### DPT
+read data
+```{r}
+d1 <- readRDS("results/SC_Pseudotime_Trajectory/cellmix1_DPT.rds")
+d2 <- readRDS("results/SC_Pseudotime_Trajectory/cellmix2_DPT.rds")
+d3 <- readRDS("results/SC_Pseudotime_Trajectory/cellmix3_DPT.rds")
+d4 <- readRDS("results/SC_Pseudotime_Trajectory/cellmix4_DPT.rds")
+
+res1 <- d1$res_branch
+res2 <- d2$res_branch
+res3 <- d3$res_branch
+res4 <- d4$res_branch
+```
+
+```{r}
+##LV cluster
+rownames(res1) <- c("Hacc","Hpur","ARI","NMI")
+
+res_branch <- data.frame()
+res_branch_median <- data.frame()
+for(i in 1:2){
+    tmp1 <- res1[i,1]-res1[i,-1]
+    tmp2 <- res2[i,1]-res2[i,-1]
+    tmp3 <- res3[i,1]-res3[i,-1]
+    tmp4 <- res4[i,1]-res4[i,-1]
+    tmp <- rbind(tmp1,tmp2,tmp3,tmp4)
+    rownames(tmp) <- paste0(rownames(res1)[i],"_",c("cellmix1","cellmix2","cellmix3","cellmix4"))
+    tmp_median <- apply(tmp,2,median)
+    res_branch <- rbind(res_branch,tmp)
+    res_branch_median <- rbind(res_branch_median,tmp_median)
+}
+
+for(i in 3:4){
+    tmp1 <- res1[i,-1]-res1[i,1]
+    tmp2 <- res2[i,-1]-res2[i,1]
+    tmp3 <- res3[i,-1]-res3[i,1]
+    tmp4 <- res4[i,-1]-res4[i,1]
+    tmp <- rbind(tmp1,tmp2,tmp3,tmp4)
+    rownames(tmp) <- paste0(rownames(res1)[i],"_",c("cellmix1","cellmix2","cellmix3","cellmix4"))
+    tmp_median <- apply(tmp,2,median)
+    res_branch <- rbind(res_branch,tmp)
+    res_branch_median <- rbind(res_branch_median,tmp_median)
+}
+
+res_branch_median <- as.data.frame(t(res_branch_median))
+rownames(res_branch_median) <- colnames(res1)[-1]
+colnames(res_branch_median) <- c("Hacc","Hpur","ARI","NMI")
+
+res_branch_median$method <- rownames(res_branch_median)
+res_branch_median_melt <- data.table::melt(res_branch_median,id.vars=c("method"))
+colnames(res_branch_median_melt)[2:3] <- c("Metrics","Metrics_Difference")
+head(res_branch_median_melt)
+
+res_branch$Metrics_Datasets <- rownames(res_branch)
+res_branch$Metrics <- sapply(rownames(res_branch),function(x) strsplit(x,"\\_")[[1]][1] )
+res_branch_melt <- data.table::melt(res_branch,id.vars=c("Metrics_Datasets","Metrics"))
+colnames(res_branch_melt)[3:4] <- c("method","Metrics_Difference")
+head(res_branch_melt)
+```
+
+heatmap(median metrics)
+```{r}
+rank1 <- apply(res_branch_median[,-ncol(res_branch_median)],2,rank)
+rank1 <- apply(rank1,1,median)
+rank1 <- names(rank1[order(rank1)])
+res_branch_median_melt$Method <- factor(res_branch_median_melt$method,levels=unique(res_branch_median_melt$method[order(res_branch_median_melt$method)]))
+res_branch_median_melt$method <- factor(res_branch_median_melt$method,levels=rank1)
+
+tmp_hm <- res_branch_median_melt[,]
+tmp_hm[tmp_hm$Metrics_Difference<(-0.2),]$Metrics_Difference <- -0.2
+clu_4metric_dpt_hm <- ggplot(tmp_hm,aes(method,Metrics,fill=Metrics_Difference))+geom_tile()+scale_fill_gradient2(low="blue",mid="white",high="red",midpoint=0)+ggtitle("DPT Predicted Branches Evaluation Metrics(Values of Difference)")+xlab("Method")+theme(plot.title=element_text(size=16),legend.title=element_text(size=15),legend.text=element_text(size=14),axis.title=element_text(size=18),axis.text.x=element_text(angle=90,size=14),axis.text.y=element_text(size=14))#+geom_vline(xintercept=neg_md+0.5,linetype="dashed")
+clu_4metric_dpt_hm
+```
+
+
+# combine plots
+## main
+```{r fig.height=9, fig.width=11}
+p1 <- ggarrange(dpt_scc_bp,dpt_pos_bp,clu_4metric_dpt_hm,ncol=3,nrow=1,labels="AUTO")
+p2 <- ggarrange(dpt_DCplots,ncol=1,nrow=1,labels=c("D"))
+ggarrange(p1,p2,nrow=2,ncol=1,heights=c(1,3))
+```
+
+## supp1
+```{r fig.height=1.5,fig.width=5}
+ggarrange(dpt_scc_hm,dpt_pos_hm,ncol=2,nrow=1,labels="AUTO")
+```
+
+## supp2
+```{r fig.height=16, fig.width=9}
+dpt_DCplots_supp
+```
+
+## supp3
+```{r fig.height=10, fig.width=9}
+p1 <- ggarrange(mono_scc_bp,mono_pos_bp,ncol=2,nrow=1,labels="AUTO")
+p2 <- ggarrange(cellmix4_PCA_main6,ncol=1,nrow=1,labels=c("C"))
+p3 <- ggarrange(cellmix4_PCA_main6_pt,ncol=1,nrow=1,labels=c("D"))
+ggarrange(p1,p2,p3,nrow=3,ncol=1,heights=c(1.2,2,2))
+```
+
+## supp4
+```{r fig.height=5,fig.width=9}
+ggarrange(ss_scc_bp,ss_pos_bp,ss_ovlp_bp,ss_ovlp_hm,nrow=2,ncol=2,labels="AUTO")
+```

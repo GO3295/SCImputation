@@ -1,0 +1,676 @@
+---
+title: "CellChat"
+output: html_notebook
+---
+
+load library
+```{r message=FALSE, warning=FALSE}
+library(Seurat)
+library(SingleCellExperiment)
+library(scran)
+library(SeuratData)
+library(edgeR)
+library(limma)
+library(clusterProfiler)
+library(data.table)
+library(SingleCellExperiment)
+library(SummarizedExperiment)
+library(muscat)
+library(pROC)
+library(igraph)
+library(mclust)
+library(cluster)
+library(SCINA)
+library(caret)
+library(MAST)
+library(AUCell)
+library(HGNChelper)
+library(SeuratDisk)
+library(monocle3)
+library(ggpubr)
+library(slingshot)
+library(grDevices)
+library(RColorBrewer)
+library(randomForest)
+library(caTools)
+library(mltools)
+library(stringr)
+library(reldist)
+library(aricode)
+library(TSCAN)
+library(reshape2)
+library(pheatmap)
+library(philentropy)
+library(rawr)
+library(splatter)
+library(combinat)
+library(Hmisc)
+library(CellChat)
+```
+
+read and write out as txt
+```{r}
+dat <- readRDS("test_CellChat/Mariana_Heart_DNMT3A_WT_FlorianLeuschner_25.08.22.Rds")
+
+dat_out <- as.matrix(dat@assays$RNA@counts)
+write.table(dat_out,"rawcount_txt/CellChat_DNMT3A.txt",quote=FALSE,sep="\t")
+```
+
+# test CellChat(raw lognorm)
+read in
+```{r}
+dat <- readRDS("test_CellChat/Mariana_Heart_DNMT3A_WT_FlorianLeuschner_25.08.22.Rds")
+dat <- NormalizeData(dat)
+dat$samples <- as.factor(dat$sample)
+
+CHIP <- subset(dat,condition=="DNMT3A")
+NoCHIP <- subset(dat,condition=="WT")
+
+data.input <- CHIP@assays$RNA@data # normalized data matrix
+meta <- CHIP@meta.data
+cellchatCHIP <- createCellChat(object=data.input,meta=meta,group.by="celltypes")
+
+data.input <- NoCHIP@assays$RNA@data # normalized data matrix
+meta <- NoCHIP@meta.data
+cellchatNoCHIP <- createCellChat(object=data.input,meta=meta,group.by="celltypes")
+
+CellChatDB <- CellChatDB.mouse # use CellChatDB.mouse if running on mouse data
+# use all CellChatDB except for "Non-protein Signaling" for cell-cell communication analysis
+CellChatDB.use <- subsetDB(CellChatDB)
+cellchatCHIP@DB <- CellChatDB.use
+cellchatNoCHIP@DB <- CellChatDB.use
+```
+
+pre-process
+```{r}
+cellchatCHIP <- subsetData(cellchatCHIP) # This step is necessary even if using the whole database
+cellchatNoCHIP <- subsetData(cellchatNoCHIP) # This step is necessary even if using the whole database
+future::plan("multisession",workers=4) # do parallel
+cellchatCHIP <- identifyOverExpressedGenes(cellchatCHIP)
+cellchatCHIP <- identifyOverExpressedInteractions(cellchatCHIP)
+cellchatNoCHIP <- identifyOverExpressedGenes(cellchatNoCHIP)
+cellchatNoCHIP <- identifyOverExpressedInteractions(cellchatNoCHIP)
+```
+
+get results(~30-40min)
+```{r}
+cellchatCHIP <- computeCommunProb(cellchatCHIP,type="triMean")
+cellchatNoCHIP <- computeCommunProb(cellchatNoCHIP,type="triMean")
+#df.net <- subsetCommunication(cellchatCHIP,sources.use=c("Monocytes","FB"),targets.use=c("Monocytes","FB"))
+cellchatCHIP <- computeCommunProbPathway(cellchatCHIP)
+cellchatNoCHIP <- computeCommunProbPathway(cellchatNoCHIP)
+cellchatCHIP <- aggregateNet(cellchatCHIP)
+cellchatNoCHIP <- aggregateNet(cellchatNoCHIP)
+
+saveRDS(cellchatCHIP,"test_CellChat/DNMT3A_CHIP_Raw.rds")
+saveRDS(cellchatNoCHIP,"test_CellChat/DNMT3A_NoCHIP_Raw.rds")
+```
+
+all int plots
+```{r}
+groupSize <- as.numeric(table(cellchatCHIP@idents))
+par(mfrow = c(1,2), xpd=TRUE)
+netVisual_circle(cellchatCHIP@net$count,vertex.weight=groupSize,weight.scale=T,label.edge=F,title.name="Number of interactions")
+netVisual_circle(cellchatCHIP@net$weight,vertex.weight=groupSize,weight.scale=T,label.edge=F,title.name="Interaction weights/strength")
+```
+
+
+results and plots in original paper
+network plot
+```{r}
+cellchatCHIP <- readRDS("test_CellChat/DNMT3A_CHIP_Raw.rds")
+cellchatNoCHIP <- readRDS("test_CellChat/DNMT3A_NoCHIP_Raw.rds")
+
+pathways.show <- c("EGF") 
+
+#netVisual_aggregate(cellchatNoCHIP,signaling=pathways.show,sources.use=c("Monocytes"))
+# Circle plot
+netVisual_aggregate(cellchatNoCHIP,signaling=pathways.show,layout="circle",sources.use=c("Monocytes"))
+
+#netVisual_aggregate(cellchatCHIP,signaling=pathways.show,sources.use=c("Monocytes"))
+# Circle plot
+netVisual_aggregate(cellchatCHIP,signaling=pathways.show,layout="circle",sources.use=c("Monocytes"))
+```
+
+bubble plot
+```{r}
+pairLR.use <- data.frame(interaction_name=c("NAMPT_ITGA5_ITGB1","RETN_TLR4","IL1B_IL1R1_IL1RAP","CCL3_CCR5","CCL3_CCR1","CCL4_CCR5","HBEGF_ERBB2_ERBB4","HBEGF_ERBB4","HBEGF_EGFR_ERBB2","HBEGF_EGFR","AREG_EGFR_ERBB2","AREG_EGFR"))
+netVisual_bubble(cellchatNoCHIP,sources.use=c("Monocytes"),targets.use=c("FB"),pairLR.use=pairLR.use,thresh=1)
+netVisual_bubble(cellchatCHIP,sources.use=c("Monocytes"),targets.use=c("FB"),pairLR.use=pairLR.use,thresh=1)
+```
+
+ranknet
+```{r}
+object.list <- list(NO_CHIP=cellchatNoCHIP,CHIP=cellchatCHIP)
+cellchat <- mergeCellChat(object.list,add.names=names(object.list),cell.prefix=TRUE)
+
+gg1 <- rankNet(cellchat,mode="comparison",sources.use="Monocytes",targets.use="FB",stacked=T,do.stat=FALSE,thresh=0.05,cutoff.pvalue=0.05,signaling=c('NPR2','IL1','EGF','RESISTIN','CCL','IGF','PARS','COMPLEMENT','SEMA4A'))
+gg2 <- rankNet(cellchat,mode="comparison",sources.use="Monocytes",targets.use="FB",stacked=F,do.stat=FALSE,thresh=0.05,cutoff.pvalue=0.05,signaling=c('NPR2','IL1','EGF','RESISTIN','CCL','IGF','PARS','COMPLEMENT','SEMA4A'))
+gg1+gg2
+```
+
+total interactions and p values
+```{r}
+cellchatNoCHIP@net$count
+cellchatNoCHIP@net$weight
+sum(cellchatNoCHIP@net$pval<0.05)
+```
+
+
+# test CellChat(afMF)
+read in
+```{r}
+dat <- readRDS("test_CellChat/Mariana_Heart_DNMT3A_WT_FlorianLeuschner_25.08.22.Rds")
+dat <- NormalizeData(dat)
+dat$samples <- as.factor(dat$sample)
+
+CHIP <- subset(dat,condition=="DNMT3A")
+NoCHIP <- subset(dat,condition=="WT")
+
+data.input <- CHIP@assays$RNA@data # normalized data matrix
+meta <- CHIP@meta.data
+cellchatCHIP <- createCellChat(object=data.input,meta=meta,group.by="celltypes")
+
+data.input <- NoCHIP@assays$RNA@data # normalized data matrix
+meta <- NoCHIP@meta.data
+cellchatNoCHIP <- createCellChat(object=data.input,meta=meta,group.by="celltypes")
+
+CellChatDB <- CellChatDB.mouse # use CellChatDB.mouse if running on mouse data
+# use all CellChatDB except for "Non-protein Signaling" for cell-cell communication analysis
+CellChatDB.use <- subsetDB(CellChatDB)
+cellchatCHIP@DB <- CellChatDB.use
+cellchatNoCHIP@DB <- CellChatDB.use
+```
+
+pre-process
+```{r}
+cellchatCHIP <- subsetData(cellchatCHIP) # This step is necessary even if using the whole database
+cellchatNoCHIP <- subsetData(cellchatNoCHIP) # This step is necessary even if using the whole database
+future::plan("multisession",workers=4) # do parallel
+cellchatCHIP <- identifyOverExpressedGenes(cellchatCHIP)
+cellchatCHIP <- identifyOverExpressedInteractions(cellchatCHIP)
+cellchatNoCHIP <- identifyOverExpressedGenes(cellchatNoCHIP)
+cellchatNoCHIP <- identifyOverExpressedInteractions(cellchatNoCHIP)
+```
+
+get results
+```{r}
+cellchatCHIP <- computeCommunProb(cellchatCHIP,type="triMean")
+cellchatNoCHIP <- computeCommunProb(cellchatNoCHIP,type="triMean")
+#df.net <- subsetCommunication(cellchatCHIP,sources.use=c("Monocytes","FB"),targets.use=c("Monocytes","FB"))
+cellchatCHIP <- computeCommunProbPathway(cellchatCHIP)
+cellchatNoCHIP <- computeCommunProbPathway(cellchatNoCHIP)
+cellchatCHIP <- aggregateNet(cellchatCHIP)
+cellchatNoCHIP <- aggregateNet(cellchatNoCHIP)
+
+saveRDS(cellchatCHIP,"test_CellChat/DNMT3A_CHIP_Raw.rds")
+saveRDS(cellchatNoCHIP,"test_CellChat/DNMT3A_NoCHIP_Raw.rds")
+```
+
+all int plots
+```{r}
+groupSize <- as.numeric(table(cellchatCHIP@idents))
+par(mfrow = c(1,2), xpd=TRUE)
+netVisual_circle(cellchatCHIP@net$count,vertex.weight=groupSize,weight.scale=T,label.edge=F,title.name="Number of interactions")
+netVisual_circle(cellchatCHIP@net$weight,vertex.weight=groupSize,weight.scale=T,label.edge=F,title.name="Interaction weights/strength")
+```
+
+
+results and plots in original paper
+network plot
+```{r}
+cellchatCHIP_afMF <- readRDS("test_CellChat/DNMT3A_CHIP_afMF.rds")
+cellchatNoCHIP_afMF <- readRDS("test_CellChat/DNMT3A_NoCHIP_afMF.rds")
+
+pathways.show <- c("EGF") 
+
+#netVisual_aggregate(cellchatNoCHIP,signaling=pathways.show,sources.use=c("Monocytes"))
+# Circle plot
+netVisual_aggregate(cellchatNoCHIP_afMF,signaling=pathways.show,layout="circle",sources.use=c("Monocytes"))
+
+#netVisual_aggregate(cellchatCHIP,signaling=pathways.show,sources.use=c("Monocytes"))
+# Circle plot
+netVisual_aggregate(cellchatCHIP_afMF,signaling=pathways.show,layout="circle",sources.use=c("Monocytes"))
+
+```
+
+bubble plot
+```{r fig.height=2, fig.width=1.5}
+pairLR.use <- data.frame(interaction_name=c("NAMPT_ITGA5_ITGB1","RETN_TLR4","IL1B_IL1R1_IL1RAP","CCL3_CCR5","CCL3_CCR1","CCL4_CCR5","HBEGF_ERBB2_ERBB4","HBEGF_ERBB4","HBEGF_EGFR_ERBB2","HBEGF_EGFR","AREG_EGFR_ERBB2","AREG_EGFR"))
+netVisual_bubble(cellchatNoCHIP_afMF,sources.use=c("Monocytes"),targets.use=c("FB"),pairLR.use=pairLR.use,thresh=1)
+netVisual_bubble(cellchatCHIP_afMF,sources.use=c("Monocytes"),targets.use=c("FB"),pairLR.use=pairLR.use,thresh=1)
+#netVisual_bubble(cellchatCHIP,sources.use=c("Monocytes"),targets.use=c("FB"))
+```
+
+ranknet
+```{r}
+object.list <- list(NO_CHIP=cellchatNoCHIP_afMF,CHIP=cellchatCHIP_afMF)
+cellchat_afMF <- mergeCellChat(object.list,add.names=names(object.list),cell.prefix=TRUE)
+
+gg1 <- rankNet(cellchat_afMF,mode="comparison",sources.use="Monocytes",targets.use="FB",stacked=T,do.stat=FALSE,thresh=0.05,cutoff.pvalue=0.05,signaling=c('NPR2','IL1','EGF','RESISTIN','CCL','IGF','PARS','COMPLEMENT','SEMA4A'))
+gg2 <- rankNet(cellchat_afMF,mode="comparison",sources.use="Monocytes",targets.use="FB",stacked=F,do.stat=FALSE,thresh=0.05,cutoff.pvalue=0.05,signaling=c('NPR2','IL1','EGF','RESISTIN','CCL','IGF','PARS','COMPLEMENT','SEMA4A'))
+gg1+gg2
+```
+
+
+total interactions and p values
+```{r}
+cellchatNoCHIP_afMF@net$count
+cellchatNoCHIP_afMF@net$weight
+sum(cellchatNoCHIP_afMF@net$pval<0.05)
+```
+
+
+# test CellChat(ALRA)
+read in
+```{r}
+dat <- readRDS("test_CellChat/Mariana_Heart_DNMT3A_WT_FlorianLeuschner_25.08.22.Rds")
+dat <- NormalizeData(dat)
+dat$samples <- as.factor(dat$sample)
+
+CHIP <- subset(dat,condition=="DNMT3A")
+NoCHIP <- subset(dat,condition=="WT")
+
+data.input <- CHIP@assays$RNA@data # normalized data matrix
+meta <- CHIP@meta.data
+cellchatCHIP <- createCellChat(object=data.input,meta=meta,group.by="celltypes")
+
+data.input <- NoCHIP@assays$RNA@data # normalized data matrix
+meta <- NoCHIP@meta.data
+cellchatNoCHIP <- createCellChat(object=data.input,meta=meta,group.by="celltypes")
+
+CellChatDB <- CellChatDB.mouse # use CellChatDB.mouse if running on mouse data
+# use all CellChatDB except for "Non-protein Signaling" for cell-cell communication analysis
+CellChatDB.use <- subsetDB(CellChatDB)
+cellchatCHIP@DB <- CellChatDB.use
+cellchatNoCHIP@DB <- CellChatDB.use
+```
+
+pre-process
+```{r}
+cellchatCHIP <- subsetData(cellchatCHIP) # This step is necessary even if using the whole database
+cellchatNoCHIP <- subsetData(cellchatNoCHIP) # This step is necessary even if using the whole database
+future::plan("multisession",workers=4) # do parallel
+cellchatCHIP <- identifyOverExpressedGenes(cellchatCHIP)
+cellchatCHIP <- identifyOverExpressedInteractions(cellchatCHIP)
+cellchatNoCHIP <- identifyOverExpressedGenes(cellchatNoCHIP)
+cellchatNoCHIP <- identifyOverExpressedInteractions(cellchatNoCHIP)
+```
+
+get results
+```{r}
+cellchatCHIP <- computeCommunProb(cellchatCHIP,type="triMean")
+cellchatNoCHIP <- computeCommunProb(cellchatNoCHIP,type="triMean")
+#df.net <- subsetCommunication(cellchatCHIP,sources.use=c("Monocytes","FB"),targets.use=c("Monocytes","FB"))
+cellchatCHIP <- computeCommunProbPathway(cellchatCHIP)
+cellchatNoCHIP <- computeCommunProbPathway(cellchatNoCHIP)
+cellchatCHIP <- aggregateNet(cellchatCHIP)
+cellchatNoCHIP <- aggregateNet(cellchatNoCHIP)
+
+saveRDS(cellchatCHIP,"test_CellChat/DNMT3A_CHIP_Raw.rds")
+saveRDS(cellchatNoCHIP,"test_CellChat/DNMT3A_NoCHIP_Raw.rds")
+```
+
+all int plots
+```{r}
+groupSize <- as.numeric(table(cellchatCHIP@idents))
+par(mfrow = c(1,2), xpd=TRUE)
+netVisual_circle(cellchatCHIP@net$count,vertex.weight=groupSize,weight.scale=T,label.edge=F,title.name="Number of interactions")
+netVisual_circle(cellchatCHIP@net$weight,vertex.weight=groupSize,weight.scale=T,label.edge=F,title.name="Interaction weights/strength")
+```
+
+
+results and plots in original paper
+network plot
+```{r}
+cellchatCHIP_ALRA <- readRDS("test_CellChat/DNMT3A_CHIP_ALRA.rds")
+cellchatNoCHIP_ALRA <- readRDS("test_CellChat/DNMT3A_NoCHIP_ALRA.rds")
+
+pathways.show <- c("EGF") 
+
+#netVisual_aggregate(cellchatNoCHIP,signaling=pathways.show,sources.use=c("Monocytes"))
+# Circle plot
+netVisual_aggregate(cellchatNoCHIP_ALRA,signaling=pathways.show,layout="circle",sources.use=c("Monocytes"))
+
+#netVisual_aggregate(cellchatCHIP,signaling=pathways.show,sources.use=c("Monocytes"))
+# Circle plot
+netVisual_aggregate(cellchatCHIP_ALRA,signaling=pathways.show,layout="circle",sources.use=c("Monocytes"))
+
+```
+
+bubble plot
+```{r fig.height=2, fig.width=1.5}
+pairLR.use <- data.frame(interaction_name=c("NAMPT_ITGA5_ITGB1","RETN_TLR4","IL1B_IL1R1_IL1RAP","CCL3_CCR5","CCL3_CCR1","CCL4_CCR5","HBEGF_ERBB2_ERBB4","HBEGF_ERBB4","HBEGF_EGFR_ERBB2","HBEGF_EGFR","AREG_EGFR_ERBB2","AREG_EGFR"))
+netVisual_bubble(cellchatNoCHIP_ALRA,sources.use=c("Monocytes"),targets.use=c("FB"),pairLR.use=pairLR.use,thresh=1)
+netVisual_bubble(cellchatCHIP_ALRA,sources.use=c("Monocytes"),targets.use=c("FB"),pairLR.use=pairLR.use,thresh=1)
+#netVisual_bubble(cellchatCHIP,sources.use=c("Monocytes"),targets.use=c("FB"))
+```
+
+ranknet
+```{r}
+object.list <- list(NO_CHIP=cellchatNoCHIP_afMF,CHIP=cellchatCHIP_afMF)
+cellchat_afMF <- mergeCellChat(object.list,add.names=names(object.list),cell.prefix=TRUE)
+
+gg1 <- rankNet(cellchat_afMF,mode="comparison",sources.use="Monocytes",targets.use="FB",stacked=T,do.stat=FALSE,thresh=0.05,cutoff.pvalue=0.05,signaling=c('NPR2','IL1','EGF','RESISTIN','CCL','IGF','PARS','COMPLEMENT','SEMA4A'))
+gg2 <- rankNet(cellchat_afMF,mode="comparison",sources.use="Monocytes",targets.use="FB",stacked=F,do.stat=FALSE,thresh=0.05,cutoff.pvalue=0.05,signaling=c('NPR2','IL1','EGF','RESISTIN','CCL','IGF','PARS','COMPLEMENT','SEMA4A'))
+gg1+gg2
+```
+
+
+total interactions and p values
+```{r}
+cellchatNoCHIP_afMF@net$count
+cellchatNoCHIP_afMF@net$weight
+sum(cellchatNoCHIP_afMF@net$pval<0.05)
+```
+
+# test CellChat(MAGIC)
+read in
+```{r}
+dat <- readRDS("test_CellChat/Mariana_Heart_DNMT3A_WT_FlorianLeuschner_25.08.22.Rds")
+dat$samples <- as.factor(dat$sample)
+
+imputed_dat <- fread("imputed/alra/CellChat_DNMT3A_alra.txt",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+imputed_dat <- as.matrix(imputed_dat,rownames=1)
+colnames(imputed_dat) <- colnames(dat)
+
+dat <- CreateSeuratObject(imputed_dat,meta.data=dat@meta.data,min.cells=0,min.features=0)
+
+CHIP <- subset(dat,condition=="DNMT3A")
+NoCHIP <- subset(dat,condition=="WT")
+
+data.input <- CHIP@assays$RNA@counts # already normalized data matrix
+meta <- CHIP@meta.data
+cellchatCHIP <- createCellChat(object=data.input,meta=meta,group.by="celltypes")
+
+data.input <- NoCHIP@assays$RNA@counts # already normalized data matrix
+meta <- NoCHIP@meta.data
+cellchatNoCHIP <- createCellChat(object=data.input,meta=meta,group.by="celltypes")
+
+CellChatDB <- CellChatDB.mouse # use CellChatDB.mouse if running on mouse data
+# use all CellChatDB except for "Non-protein Signaling" for cell-cell communication analysis
+CellChatDB.use <- subsetDB(CellChatDB)
+cellchatCHIP@DB <- CellChatDB.use
+cellchatNoCHIP@DB <- CellChatDB.use
+```
+
+pre-process
+```{r}
+cellchatCHIP <- subsetData(cellchatCHIP) # This step is necessary even if using the whole database
+cellchatNoCHIP <- subsetData(cellchatNoCHIP) # This step is necessary even if using the whole database
+future::plan("multisession",workers=4) # do parallel
+cellchatCHIP <- identifyOverExpressedGenes(cellchatCHIP)
+cellchatCHIP <- identifyOverExpressedInteractions(cellchatCHIP)
+cellchatNoCHIP <- identifyOverExpressedGenes(cellchatNoCHIP)
+cellchatNoCHIP <- identifyOverExpressedInteractions(cellchatNoCHIP)
+```
+
+get results(batch job)
+```{r}
+cellchatCHIP <- computeCommunProb(cellchatCHIP,type="triMean")
+cellchatNoCHIP <- computeCommunProb(cellchatNoCHIP,type="triMean")
+#df.net <- subsetCommunication(cellchatCHIP,sources.use=c("Monocytes","FB"),targets.use=c("Monocytes","FB"))
+cellchatCHIP <- computeCommunProbPathway(cellchatCHIP)
+cellchatNoCHIP <- computeCommunProbPathway(cellchatNoCHIP)
+cellchatCHIP <- aggregateNet(cellchatCHIP)
+cellchatNoCHIP <- aggregateNet(cellchatNoCHIP)
+
+saveRDS(cellchatCHIP,"test_CellChat/DNMT3A_CHIP_ALRA.rds")
+saveRDS(cellchatNoCHIP,"test_CellChat/DNMT3A_NoCHIP_ALRA.rds")
+```
+
+all int plots
+```{r}
+groupSize <- as.numeric(table(cellchatCHIP@idents))
+par(mfrow = c(1,2), xpd=TRUE)
+netVisual_circle(cellchatCHIP@net$count,vertex.weight=groupSize,weight.scale=T,label.edge=F,title.name="Number of interactions")
+netVisual_circle(cellchatCHIP@net$weight,vertex.weight=groupSize,weight.scale=T,label.edge=F,title.name="Interaction weights/strength")
+```
+
+
+results and plots in original paper
+network plot
+```{r}
+cellchatCHIP <- readRDS("test_CellChat/DNMT3A_CHIP_MAGIC.rds")
+cellchatNoCHIP <- readRDS("test_CellChat/DNMT3A_NoCHIP_MAGIC.rds")
+
+pathways.show <- c("EGF") 
+
+#netVisual_aggregate(cellchatNoCHIP,signaling=pathways.show,idents.use=c("Monocytes","FB"))
+# Circle plot
+netVisual_aggregate(cellchatNoCHIP,signaling=pathways.show,layout="circle",sources.use=c("Monocytes"))
+
+#netVisual_aggregate(cellchatCHIP,signaling=pathways.show,idents.use=c("Monocytes","FB"))
+# Circle plot
+netVisual_aggregate(cellchatCHIP,signaling=pathways.show,layout="circle",sources.use=c("Monocytes"))
+```
+
+bubble plot
+```{r}
+pairLR.use <- data.frame(interaction_name=c("NAMPT_ITGA5_ITGB1","RETN_TLR4","IL1B_IL1R1_IL1RAP","CCL3_CCR5","CCL3_CCR1","CCL4_CCR5","HBEGF_ERBB2_ERBB4","HBEGF_ERBB4","HBEGF_EGFR_ERBB2","HBEGF_EGFR","AREG_EGFR_ERBB2","AREG_EGFR"))
+netVisual_bubble(cellchatCHIP,sources.use=c("Monocytes"),targets.use=c("FB"),pairLR.use=pairLR.use,thresh=1)
+netVisual_bubble(cellchatNoCHIP,sources.use=c("Monocytes"),targets.use=c("FB"),pairLR.use=pairLR.use,thresh=1)
+#netVisual_bubble(cellchatCHIP,sources.use=c("Monocytes"),targets.use=c("FB"))
+```
+
+# test CellChat(AutoClass)
+read in
+```{r}
+dat <- readRDS("test_CellChat/Mariana_Heart_DNMT3A_WT_FlorianLeuschner_25.08.22.Rds")
+dat$samples <- as.factor(dat$sample)
+
+imputed_dat <- fread("imputed/alra/CellChat_DNMT3A_alra.txt",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+imputed_dat <- as.matrix(imputed_dat,rownames=1)
+colnames(imputed_dat) <- colnames(dat)
+
+dat <- CreateSeuratObject(imputed_dat,meta.data=dat@meta.data,min.cells=0,min.features=0)
+
+CHIP <- subset(dat,condition=="DNMT3A")
+NoCHIP <- subset(dat,condition=="WT")
+
+data.input <- CHIP@assays$RNA@counts # already normalized data matrix
+meta <- CHIP@meta.data
+cellchatCHIP <- createCellChat(object=data.input,meta=meta,group.by="celltypes")
+
+data.input <- NoCHIP@assays$RNA@counts # already normalized data matrix
+meta <- NoCHIP@meta.data
+cellchatNoCHIP <- createCellChat(object=data.input,meta=meta,group.by="celltypes")
+
+CellChatDB <- CellChatDB.mouse # use CellChatDB.mouse if running on mouse data
+# use all CellChatDB except for "Non-protein Signaling" for cell-cell communication analysis
+CellChatDB.use <- subsetDB(CellChatDB)
+cellchatCHIP@DB <- CellChatDB.use
+cellchatNoCHIP@DB <- CellChatDB.use
+```
+
+pre-process
+```{r}
+cellchatCHIP <- subsetData(cellchatCHIP) # This step is necessary even if using the whole database
+cellchatNoCHIP <- subsetData(cellchatNoCHIP) # This step is necessary even if using the whole database
+future::plan("multisession",workers=4) # do parallel
+cellchatCHIP <- identifyOverExpressedGenes(cellchatCHIP)
+cellchatCHIP <- identifyOverExpressedInteractions(cellchatCHIP)
+cellchatNoCHIP <- identifyOverExpressedGenes(cellchatNoCHIP)
+cellchatNoCHIP <- identifyOverExpressedInteractions(cellchatNoCHIP)
+```
+
+get results(use batch job)
+```{r}
+cellchatCHIP <- computeCommunProb(cellchatCHIP,type="triMean")
+cellchatNoCHIP <- computeCommunProb(cellchatNoCHIP,type="triMean")
+#df.net <- subsetCommunication(cellchatCHIP,sources.use=c("Monocytes","FB"),targets.use=c("Monocytes","FB"))
+cellchatCHIP <- computeCommunProbPathway(cellchatCHIP)
+cellchatNoCHIP <- computeCommunProbPathway(cellchatNoCHIP)
+cellchatCHIP <- aggregateNet(cellchatCHIP)
+cellchatNoCHIP <- aggregateNet(cellchatNoCHIP)
+
+saveRDS(cellchatCHIP,"test_CellChat/DNMT3A_CHIP_ALRA.rds")
+saveRDS(cellchatNoCHIP,"test_CellChat/DNMT3A_NoCHIP_ALRA.rds")
+```
+
+all int plots
+```{r}
+groupSize <- as.numeric(table(cellchatCHIP@idents))
+par(mfrow = c(1,2), xpd=TRUE)
+netVisual_circle(cellchatCHIP@net$count,vertex.weight=groupSize,weight.scale=T,label.edge=F,title.name="Number of interactions")
+netVisual_circle(cellchatCHIP@net$weight,vertex.weight=groupSize,weight.scale=T,label.edge=F,title.name="Interaction weights/strength")
+```
+
+
+results and plots in original paper
+network plot
+```{r}
+cellchatCHIP <- readRDS("test_CellChat/DNMT3A_CHIP_AC.rds")
+cellchatNoCHIP <- readRDS("test_CellChat/DNMT3A_NoCHIP_AC.rds")
+
+pathways.show <- c("EGF") 
+
+#netVisual_aggregate(cellchatNoCHIP,signaling=pathways.show,idents.use=c("Monocytes","FB"))
+# Circle plot
+netVisual_aggregate(cellchatNoCHIP,signaling=pathways.show,layout="circle",sources.use=c("Monocytes"))
+
+#netVisual_aggregate(cellchatCHIP,signaling=pathways.show,idents.use=c("Monocytes","FB"))
+# Circle plot
+netVisual_aggregate(cellchatCHIP,signaling=pathways.show,layout="circle",sources.use=c("Monocytes"))
+
+
+#netVisual_aggregate(cellchatNoCHIP,signaling=pathways.show)
+#netVisual_aggregate(cellchatCHIP,signaling=pathways.show)
+```
+
+bubble plot
+```{r}
+pairLR.use <- data.frame(interaction_name=c("NAMPT_ITGA5_ITGB1","RETN_TLR4","IL1B_IL1R1_IL1RAP","CCL3_CCR5","CCL3_CCR1","CCL4_CCR5","HBEGF_ERBB2_ERBB4","HBEGF_ERBB4","HBEGF_EGFR_ERBB2","HBEGF_EGFR","AREG_EGFR_ERBB2","AREG_EGFR"))
+netVisual_bubble(cellchatCHIP,sources.use=c("Monocytes"),targets.use=c("FB"),pairLR.use=pairLR.use,thresh=1)
+netVisual_bubble(cellchatNoCHIP,sources.use=c("Monocytes"),targets.use=c("FB"),pairLR.use=pairLR.use,thresh=1)
+#netVisual_bubble(cellchatCHIP,sources.use=c("Monocytes"),targets.use=c("FB"))
+```
+
+
+# Analysis
+read data
+```{r}
+cellchatCHIP <- readRDS("test_CellChat/DNMT3A_CHIP_Raw.rds")
+cellchatNoCHIP <- readRDS("test_CellChat/DNMT3A_NoCHIP_Raw.rds")
+object.list <- list(NO_CHIP=cellchatNoCHIP,CHIP=cellchatCHIP)
+cellchat <- mergeCellChat(object.list,add.names=names(object.list),cell.prefix=TRUE)
+
+cellchatCHIP_afMF <- readRDS("test_CellChat/DNMT3A_CHIP_afMF.rds")
+cellchatNoCHIP_afMF <- readRDS("test_CellChat/DNMT3A_NoCHIP_afMF.rds")
+object.list <- list(NO_CHIP=cellchatNoCHIP_afMF,CHIP=cellchatCHIP_afMF)
+cellchat_afMF <- mergeCellChat(object.list,add.names=names(object.list),cell.prefix=TRUE)
+
+cellchatCHIP_ALRA <- readRDS("test_CellChat/DNMT3A_CHIP_ALRA.rds")
+cellchatNoCHIP_ALRA <- readRDS("test_CellChat/DNMT3A_NoCHIP_ALRA.rds")
+object.list <- list(NO_CHIP=cellchatNoCHIP_ALRA,CHIP=cellchatCHIP_ALRA)
+cellchat_ALRA <- mergeCellChat(object.list,add.names=names(object.list),cell.prefix=TRUE)
+
+cellchatCHIP_MAGIC <- readRDS("test_CellChat/DNMT3A_CHIP_MAGIC.rds")
+cellchatNoCHIP_MAGIC <- readRDS("test_CellChat/DNMT3A_NoCHIP_MAGIC.rds")
+object.list <- list(NO_CHIP=cellchatNoCHIP_MAGIC,CHIP=cellchatCHIP_MAGIC)
+cellchat_MAGIC <- mergeCellChat(object.list,add.names=names(object.list),cell.prefix=TRUE)
+
+cellchatCHIP_MAGIClog <- readRDS("test_CellChat/DNMT3A_CHIP_MAGIClog.rds")
+cellchatNoCHIP_MAGIClog <- readRDS("test_CellChat/DNMT3A_NoCHIP_MAGIClog.rds")
+object.list <- list(NO_CHIP=cellchatNoCHIP_MAGIClog,CHIP=cellchatCHIP_MAGIClog)
+cellchat_MAGIClog <- mergeCellChat(object.list,add.names=names(object.list),cell.prefix=TRUE)
+
+cellchatCHIP_AC <- readRDS("test_CellChat/DNMT3A_CHIP_AC.rds")
+cellchatNoCHIP_AC <- readRDS("test_CellChat/DNMT3A_NoCHIP_AC.rds")
+object.list <- list(NO_CHIP=cellchatNoCHIP_AC,CHIP=cellchatCHIP_AC)
+cellchat_AC <- mergeCellChat(object.list,add.names=names(object.list),cell.prefix=TRUE)
+```
+
+network
+```{r}
+pathways.show <- c("EGF") 
+
+p1 <- netVisual_aggregate(cellchatNoCHIP,signaling=pathways.show,layout="circle",sources.use=c("Monocytes"))
+p2 <- netVisual_aggregate(cellchatCHIP,signaling=pathways.show,layout="circle",sources.use=c("Monocytes"))
+p3 <- netVisual_aggregate(cellchatNoCHIP_afMF,signaling=pathways.show,layout="circle",sources.use=c("Monocytes"))
+p4 <- netVisual_aggregate(cellchatCHIP_afMF,signaling=pathways.show,layout="circle",sources.use=c("Monocytes"))
+p5 <- netVisual_aggregate(cellchatNoCHIP_ALRA,signaling=pathways.show,layout="circle",sources.use=c("Monocytes"))
+p6 <- netVisual_aggregate(cellchatCHIP_ALRA,signaling=pathways.show,layout="circle",sources.use=c("Monocytes"))
+p7 <- netVisual_aggregate(cellchatNoCHIP_AC,signaling=pathways.show,layout="circle",sources.use=c("Monocytes"))
+p8 <- netVisual_aggregate(cellchatCHIP_AC,signaling=pathways.show,layout="circle",sources.use=c("Monocytes"))
+p9 <- netVisual_aggregate(cellchatNoCHIP_MAGIC,signaling=pathways.show,layout="circle",sources.use=c("Monocytes"))
+p10 <- netVisual_aggregate(cellchatCHIP_MAGIC,signaling=pathways.show,layout="circle",sources.use=c("Monocytes"))
+p11 <- netVisual_aggregate(cellchatNoCHIP_MAGIClog,signaling=pathways.show,layout="circle",sources.use=c("Monocytes"))
+p12 <- netVisual_aggregate(cellchatCHIP_MAGIClog,signaling=pathways.show,layout="circle",sources.use=c("Monocytes"))
+
+
+```
+
+bubble plot
+```{r fig.width=2.8}
+pairLR.use <- data.frame(interaction_name=c("NAMPT_ITGA5_ITGB1","RETN_TLR4","IL1B_IL1R1_IL1RAP","CCL3_CCR5","CCL3_CCR1","CCL4_CCR5","HBEGF_ERBB2_ERBB4","HBEGF_ERBB4","HBEGF_EGFR_ERBB2","HBEGF_EGFR","AREG_EGFR_ERBB2","AREG_EGFR"))
+
+p1 <- netVisual_bubble(cellchatNoCHIP,sources.use=c("Monocytes"),targets.use=c("FB"),pairLR.use=pairLR.use,thresh=1)
+p2 <- netVisual_bubble(cellchatCHIP,sources.use=c("Monocytes"),targets.use=c("FB"),pairLR.use=pairLR.use,thresh=1)
+p3 <- netVisual_bubble(cellchatNoCHIP_afMF,sources.use=c("Monocytes"),targets.use=c("FB"),pairLR.use=pairLR.use,thresh=1)
+p4 <- netVisual_bubble(cellchatCHIP_afMF,sources.use=c("Monocytes"),targets.use=c("FB"),pairLR.use=pairLR.use,thresh=1)
+p5 <- netVisual_bubble(cellchatNoCHIP_ALRA,sources.use=c("Monocytes"),targets.use=c("FB"),pairLR.use=pairLR.use,thresh=1)
+p6 <- netVisual_bubble(cellchatCHIP_ALRA,sources.use=c("Monocytes"),targets.use=c("FB"),pairLR.use=pairLR.use,thresh=1)
+p7 <- netVisual_bubble(cellchatNoCHIP_AC,sources.use=c("Monocytes"),targets.use=c("FB"),pairLR.use=pairLR.use,thresh=1)
+p8 <- netVisual_bubble(cellchatCHIP_AC,sources.use=c("Monocytes"),targets.use=c("FB"),pairLR.use=pairLR.use,thresh=1)
+p9 <- netVisual_bubble(cellchatNoCHIP_MAGIC,sources.use=c("Monocytes"),targets.use=c("FB"),pairLR.use=pairLR.use,thresh=1)
+p10 <- netVisual_bubble(cellchatCHIP_MAGIC,sources.use=c("Monocytes"),targets.use=c("FB"),pairLR.use=pairLR.use,thresh=1)
+p11 <- netVisual_bubble(cellchatNoCHIP_MAGIClog,sources.use=c("Monocytes"),targets.use=c("FB"),pairLR.use=pairLR.use,thresh=1)
+p12 <- netVisual_bubble(cellchatCHIP_MAGIClog,sources.use=c("Monocytes"),targets.use=c("FB"),pairLR.use=pairLR.use,thresh=1)
+p1|p2
+p3|p4
+p5|p6
+p7|p8
+p9|p10
+p11|p12
+```
+
+ranknet
+```{r fig.width=5}
+gg1 <- rankNet(cellchat,mode="comparison",sources.use="Monocytes",targets.use="FB",stacked=T,do.stat=FALSE,thresh=0.05,cutoff.pvalue=0.05,signaling=c('NPR2','IL1','EGF','RESISTIN','CCL','IGF','PARS','COMPLEMENT','SEMA4A'))
+gg2 <- rankNet(cellchat,mode="comparison",sources.use="Monocytes",targets.use="FB",stacked=F,do.stat=FALSE,thresh=0.05,cutoff.pvalue=0.05,signaling=c('NPR2','IL1','EGF','RESISTIN','CCL','IGF','PARS','COMPLEMENT','SEMA4A'))
+gg1+gg2
+
+gg3 <- rankNet(cellchat_afMF,mode="comparison",sources.use="Monocytes",targets.use="FB",stacked=T,do.stat=FALSE,thresh=0.05,cutoff.pvalue=0.05,signaling=c('NPR2','IL1','EGF','RESISTIN','CCL','IGF','PARS','COMPLEMENT','SEMA4A'))
+gg4 <- rankNet(cellchat_afMF,mode="comparison",sources.use="Monocytes",targets.use="FB",stacked=F,do.stat=FALSE,thresh=0.05,cutoff.pvalue=0.05,signaling=c('NPR2','IL1','EGF','RESISTIN','CCL','IGF','PARS','COMPLEMENT','SEMA4A'))
+gg3+gg4
+
+gg5 <- rankNet(cellchat_ALRA,mode="comparison",sources.use="Monocytes",targets.use="FB",stacked=T,do.stat=FALSE,thresh=0.05,cutoff.pvalue=0.05,signaling=c('NPR2','IL1','EGF','RESISTIN','CCL','IGF','PARS','COMPLEMENT','SEMA4A'))
+gg6 <- rankNet(cellchat_ALRA,mode="comparison",sources.use="Monocytes",targets.use="FB",stacked=F,do.stat=FALSE,thresh=0.05,cutoff.pvalue=0.05,signaling=c('NPR2','IL1','EGF','RESISTIN','CCL','IGF','PARS','COMPLEMENT','SEMA4A'))
+gg5+gg6
+
+gg7 <- rankNet(cellchat_AC,mode="comparison",sources.use="Monocytes",targets.use="FB",stacked=T,do.stat=FALSE,thresh=0.05,cutoff.pvalue=0.05,signaling=c('NPR2','IL1','EGF','RESISTIN','CCL','IGF','PARS','COMPLEMENT','SEMA4A'))
+gg8 <- rankNet(cellchat_AC,mode="comparison",sources.use="Monocytes",targets.use="FB",stacked=F,do.stat=FALSE,thresh=0.05,cutoff.pvalue=0.05,signaling=c('NPR2','IL1','EGF','RESISTIN','CCL','IGF','PARS','COMPLEMENT','SEMA4A'))
+gg7+gg8
+
+gg9 <- rankNet(cellchat_MAGIC,mode="comparison",sources.use="Monocytes",targets.use="FB",stacked=T,do.stat=FALSE,thresh=0.05,cutoff.pvalue=0.05,signaling=c('NPR2','IL1','EGF','RESISTIN','CCL','IGF','PARS','COMPLEMENT','SEMA4A'))
+gg10 <- rankNet(cellchat_MAGIC,mode="comparison",sources.use="Monocytes",targets.use="FB",stacked=F,do.stat=FALSE,thresh=0.05,cutoff.pvalue=0.05,signaling=c('NPR2','IL1','EGF','RESISTIN','CCL','IGF','PARS','COMPLEMENT','SEMA4A'))
+gg9+gg10
+
+gg11 <- rankNet(cellchat_MAGIClog,mode="comparison",sources.use="Monocytes",targets.use="FB",stacked=T,do.stat=FALSE,thresh=0.05,cutoff.pvalue=0.05,signaling=c('NPR2','IL1','EGF','RESISTIN','CCL','IGF','PARS','COMPLEMENT','SEMA4A'))
+gg12 <- rankNet(cellchat_MAGIClog,mode="comparison",sources.use="Monocytes",targets.use="FB",stacked=F,do.stat=FALSE,thresh=0.05,cutoff.pvalue=0.05,signaling=c('NPR2','IL1','EGF','RESISTIN','CCL','IGF','PARS','COMPLEMENT','SEMA4A'))
+gg11+gg12
+```
+
+numbers of interactions
+```{r fig.height=4.5, fig.width=2.5}
+#all
+df_NumInt <- data.frame(Method=rep(c("Raw","afMF","ALRA","AutoClass","MAGIC","MAGIC_log"),each=2),Type=rep(c("NO_CHIP","CHIP"),6),Number=c(sum(cellchatNoCHIP@net$pval<0.05),sum(cellchatCHIP@net$pval<0.05),sum(cellchatNoCHIP_afMF@net$pval<0.05),sum(cellchatCHIP_afMF@net$pval<0.05),sum(cellchatNoCHIP_ALRA@net$pval<0.05),sum(cellchatCHIP_ALRA@net$pval<0.05),sum(cellchatNoCHIP_AC@net$pval<0.05),sum(cellchatCHIP_AC@net$pval<0.05),sum(cellchatNoCHIP_MAGIC@net$pval<0.05),sum(cellchatCHIP_MAGIC@net$pval<0.05),sum(cellchatNoCHIP_MAGIClog@net$pval<0.05),sum(cellchatCHIP_MAGIClog@net$pval<0.05)))
+
+NumInt_all <- ggbarplot(df_NumInt,x="Method",y="Number",fill="Type",palette="npg",position=position_dodge(0.9))+theme(axis.text.x=element_text(angle=90))+xlab("Method")+ylab("Interactions(P<0.05),n")+ggtitle("All Interactions(P<0.05)")#+coord_cartesian(ylim=c(0.6,1))
+
+#monocytes
+df_NumInt <- data.frame(Method=rep(c("Raw","afMF","ALRA","AutoClass","MAGIC","MAGIC_log"),each=2),Type=rep(c("NO_CHIP","CHIP"),6),Number=c(sum(cellchatNoCHIP@net$pval['Monocytes',,]<0.05),sum(cellchatCHIP@net$pval['Monocytes',,]<0.05),sum(cellchatNoCHIP_afMF@net$pval['Monocytes',,]<0.05),sum(cellchatCHIP_afMF@net$pval['Monocytes',,]<0.05),sum(cellchatNoCHIP_ALRA@net$pval['Monocytes',,]<0.05),sum(cellchatCHIP_ALRA@net$pval['Monocytes',,]<0.05),sum(cellchatNoCHIP_AC@net$pval['Monocytes',,]<0.05),sum(cellchatCHIP_AC@net$pval['Monocytes',,]<0.05),sum(cellchatNoCHIP_MAGIC@net$pval['Monocytes',,]<0.05),sum(cellchatCHIP_MAGIC@net$pval['Monocytes',,]<0.05),sum(cellchatNoCHIP_MAGIClog@net$pval['Monocytes',,]<0.05),sum(cellchatCHIP_MAGIClog@net$pval['Monocytes',,]<0.05)))
+
+NumInt_mono <- ggbarplot(df_NumInt,x="Method",y="Number",fill="Type",palette="npg",position=position_dodge(0.9))+theme(axis.text.x=element_text(angle=90))+xlab("Method")+ylab("Interactions(P<0.05),n")+ggtitle("From-Monocyte Interactions(P<0.05)")#+coord_cartesian(ylim=c(0.6,1))
+
+##percentages
+df_NumInt <- data.frame(Method=rep(c("Raw","afMF","ALRA","AutoClass","MAGIC","MAGIC_log"),each=2),Type=rep(c("NO_CHIP","CHIP"),6),PCT=c(sum(cellchatNoCHIP@net$pval<0.05)/(dim(cellchatNoCHIP@net$pval)[1]*dim(cellchatNoCHIP@net$pval)[2]*dim(cellchatNoCHIP@net$pval)[3]),sum(cellchatCHIP@net$pval<0.05)/(dim(cellchatCHIP@net$pval)[1]*dim(cellchatCHIP@net$pval)[2]*dim(cellchatCHIP@net$pval)[3]),sum(cellchatNoCHIP_afMF@net$pval<0.05)/(dim(cellchatNoCHIP_afMF@net$pval)[1]*dim(cellchatNoCHIP_afMF@net$pval)[2]*dim(cellchatNoCHIP_afMF@net$pval)[3]),sum(cellchatCHIP_afMF@net$pval<0.05)/(dim(cellchatCHIP_afMF@net$pval)[1]*dim(cellchatCHIP_afMF@net$pval)[2]*dim(cellchatCHIP_afMF@net$pval)[3]),sum(cellchatNoCHIP_ALRA@net$pval<0.05)/(dim(cellchatNoCHIP_ALRA@net$pval)[1]*dim(cellchatNoCHIP_ALRA@net$pval)[2]*dim(cellchatNoCHIP_ALRA@net$pval)[3]),sum(cellchatCHIP_ALRA@net$pval<0.05)/(dim(cellchatCHIP_ALRA@net$pval)[1]*dim(cellchatCHIP_ALRA@net$pval)[2]*dim(cellchatCHIP_ALRA@net$pval)[3]),sum(cellchatNoCHIP_AC@net$pval<0.05)/(dim(cellchatNoCHIP_AC@net$pval)[1]*dim(cellchatNoCHIP_AC@net$pval)[2]*dim(cellchatNoCHIP_AC@net$pval)[3]),sum(cellchatCHIP_AC@net$pval<0.05)/(dim(cellchatCHIP_AC@net$pval)[1]*dim(cellchatCHIP_AC@net$pval)[2]*dim(cellchatCHIP_AC@net$pval)[3]),sum(cellchatNoCHIP_MAGIC@net$pval<0.05)/(dim(cellchatNoCHIP_MAGIC@net$pval)[1]*dim(cellchatNoCHIP_MAGIC@net$pval)[2]*dim(cellchatNoCHIP_MAGIC@net$pval)[3]),sum(cellchatCHIP_MAGIC@net$pval<0.05)/(dim(cellchatCHIP_MAGIC@net$pval)[1]*dim(cellchatCHIP_MAGIC@net$pval)[2]*dim(cellchatCHIP_MAGIC@net$pval)[3]),sum(cellchatNoCHIP_MAGIClog@net$pval<0.05)/(dim(cellchatNoCHIP_MAGIClog@net$pval)[1]*dim(cellchatNoCHIP_MAGIClog@net$pval)[2]*dim(cellchatNoCHIP_MAGIClog@net$pval)[3]),sum(cellchatCHIP_MAGIClog@net$pval<0.05)/(dim(cellchatCHIP_MAGIClog@net$pval)[1]*dim(cellchatCHIP_MAGIClog@net$pval)[2]*dim(cellchatCHIP_MAGIClog@net$pval)[3])))
+
+Pct_all <- ggbarplot(df_NumInt,x="Method",y="PCT",fill="Type",palette="npg",position=position_dodge(0.9))+theme(axis.text.x=element_text(angle=90))+xlab("Method")+ylab("Interactions(P<0.05),%")+ggtitle("% of All P<0.05 Interactions")#+coord_cartesian(ylim=c(0.6,1))
+
+ggarrange(NumInt_all,Pct_all,NumInt_mono,ncol=1,nrow=3,labels="AUTO")
+```
+
+
+
