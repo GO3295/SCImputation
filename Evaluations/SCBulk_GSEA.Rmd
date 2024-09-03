@@ -1,0 +1,3640 @@
+---
+title: "GSEA"
+output: html_notebook
+---
+
+load library
+```{r message=FALSE, warning=FALSE}
+library(Seurat)
+library(ggplot2)
+library(SingleCellExperiment)
+library(scran)
+library(SeuratData)
+library(edgeR)
+library(limma)
+library(clusterProfiler)
+library(data.table)
+library(SingleCellExperiment)
+library(SummarizedExperiment)
+library(muscat)
+library(pROC)
+library(igraph)
+library(mclust)
+library(cluster)
+library(SCINA)
+library(caret)
+library(robCompositions)
+library(easyCODA)
+library(MAST)
+library(AUCell)
+library(HGNChelper)
+library(SeuratDisk)
+library(scmap)
+library(monocle3)
+library(ggpubr)
+library(slingshot)
+library(grDevices)
+library(RColorBrewer)
+library(randomForest)
+library(caTools)
+library(mltools)
+#library(stringr)
+library(reldist)
+library(aricode)
+library(TSCAN)
+library(reshape2)
+library(pheatmap)
+library(philentropy)
+library(SCeQTL)
+library(eQTLsingle)
+library(rawr)
+library(splatter)
+library(combinat)
+
+selected_palette <- c("aquamarine4","azure4","powderblue","burlywood","coral","cornflowerblue","cyan3","darkgoldenrod2","darkorange3","peachpuff","royalblue","khaki2","plum1","lightsalmon")
+selected_palette2 <- c("plum1","aquamarine4","azure4","powderblue","burlywood","coral","cornflowerblue","cyan3","darkgoldenrod2","darkorange3","peachpuff","royalblue")
+```
+
+functions
+```{r}
+getGSEA <- function(x,gname,ont,organism,bulkres,keytype="SYMBOL"){
+    print("start")
+    names(x) <- gname
+    tmp <- sort(x,decreasing=TRUE)
+    tmp <- gseGO(geneList=tmp,ont=ont,OrgDb=organism,keyType=keytype,pvalueCutoff=1)
+    tmp@result$log10Psign <- ifelse(tmp@result$NES>0,-log10(tmp@result$pvalue),log10(tmp@result$pvalue))
+    tmp@result <- tmp@result[rownames(bulkres@result),]
+    rownames(tmp@result) <- rownames(bulkres@result)
+    tmp@result[is.na(tmp@result$log10Psign),"log10Psign"] <- 0
+    return(tmp)
+}
+
+getPsig <- function(x){
+    if(x>0.1){
+        return(" ")
+    }else if(x<=0.0005){
+        return("***")
+    }else if(x<=0.005){
+        return("**")
+    }else if(x<=0.05){
+        return("*")
+    }else if(x<=0.1){
+        return(".")
+    }
+}
+```
+
+
+# mixture sample(with R 4.2.1)
+## GSE75748
+### sc RST
+```{r}
+DE_res <- readRDS("results/SC_Bulk_DEresults/Bulk_SC_SpearCor_DEresults_RST_GSE75748.rds")
+Compare_names <- unique(sapply(names(DE_res),function(x) strsplit(x,"bulk|sc")[[1]][2] ))
+```
+
+#### sign -log10P
+```{r message=FALSE}
+res_enrich <- list()
+organism <- "org.Hs.eg.db"
+
+for(y in Compare_names){
+    bulkname <- paste0("bulk",y)
+    scname <- paste0("sc",y)
+    bulkres <- DE_res[[bulkname]]
+    scres <- DE_res[[scname]]
+    bulk_GSEA <- bulkres$signlogP
+    names(bulk_GSEA) <- rownames(bulkres)
+    bulk_GSEA <- sort(bulk_GSEA,decreasing=TRUE)
+    bulk_GSEA <- gseGO(geneList=bulk_GSEA,ont="ALL",OrgDb=organism,keyType="SYMBOL",pvalueCutoff=1)
+    bulk_GSEA@result$log10Psign <- ifelse(bulk_GSEA@result$NES>0,-log10(bulk_GSEA@result$pvalue),log10(bulk_GSEA@result$pvalue))
+    
+    #SC
+    tmp <- scres[,grep("signlogP",colnames(scres))]
+    res1 <- apply(tmp,2,getGSEA,rownames(scres),"ALL",organism,bulk_GSEA)
+    
+    #results
+    res1_1 <- as.data.frame(lapply(res1,function(x) cor.test(x@result$log10Psign,bulk_GSEA@result$log10Psign,method="spearman")$estimate ) )
+    res1_2 <- as.data.frame(lapply(res1,function(x) cor.test(x@result[bulk_GSEA@result$pvalue<=0.05,]$log10Psign,bulk_GSEA@result[bulk_GSEA@result$pvalue<=0.05,]$log10Psign,method="spearman")$estimate ) )
+    res1_3 <- as.data.frame(lapply(res1,function(x) cor.test(x@result[bulk_GSEA@result$pvalue<=0.005,]$log10Psign,bulk_GSEA@result[bulk_GSEA@result$pvalue<=0.005,]$log10Psign,method="spearman")$estimate ) )
+    res_all <- rbind(res1_1,res1_2,res1_3)
+    res_all <- as.data.frame(t(res_all))
+    
+    res1_cut <- lapply(res1,function(x) x@result[,c("ONTOLOGY","NES","pvalue","p.adjust","log10Psign")] )
+    
+    #save to list
+    res_enrich[[bulkname]] <- bulk_GSEA
+    res_enrich[[scname]] <- res1_cut
+    res_enrich[[paste0("result",y)]] <- res_all
+}
+
+saveRDS(res_enrich,"results/SC_Bulk_DE_GSEAenrichment/GSEAenrich_GSE75748celltype_scRST_signlog10P.rds")
+```
+
+### sc MAST
+```{r}
+DE_res <- readRDS("results/SC_Bulk_DEresults/Bulk_SC_SpearCor_DEresults_MAST_GSE75748.rds")
+Compare_names <- unique(sapply(names(DE_res),function(x) strsplit(x,"bulk|sc")[[1]][2] ))
+```
+
+#### sign -log10P
+```{r message=FALSE}
+res_enrich <- list()
+organism <- "org.Hs.eg.db"
+
+for(y in Compare_names){
+    bulkname <- paste0("bulk",y)
+    scname <- paste0("sc",y)
+    bulkres <- DE_res[[bulkname]]
+    scres <- DE_res[[scname]]
+    bulk_GSEA <- bulkres$signlogP
+    names(bulk_GSEA) <- rownames(bulkres)
+    bulk_GSEA <- sort(bulk_GSEA,decreasing=TRUE)
+    bulk_GSEA <- gseGO(geneList=bulk_GSEA,ont="ALL",OrgDb=organism,keyType="SYMBOL",pvalueCutoff=1)
+    bulk_GSEA@result$log10Psign <- ifelse(bulk_GSEA@result$NES>0,-log10(bulk_GSEA@result$pvalue),log10(bulk_GSEA@result$pvalue))
+    
+    #SC
+    tmp <- scres[,grep("signlogP",colnames(scres))]
+    res1 <- apply(tmp,2,getGSEA,rownames(scres),"ALL",organism,bulk_GSEA)
+    
+    #results
+    res1_1 <- as.data.frame(lapply(res1,function(x) cor.test(x@result$log10Psign,bulk_GSEA@result$log10Psign,method="spearman")$estimate ) )
+    res1_2 <- as.data.frame(lapply(res1,function(x) cor.test(x@result[bulk_GSEA@result$pvalue<=0.05,]$log10Psign,bulk_GSEA@result[bulk_GSEA@result$pvalue<=0.05,]$log10Psign,method="spearman")$estimate ) )
+    res1_3 <- as.data.frame(lapply(res1,function(x) cor.test(x@result[bulk_GSEA@result$pvalue<=0.005,]$log10Psign,bulk_GSEA@result[bulk_GSEA@result$pvalue<=0.005,]$log10Psign,method="spearman")$estimate ) )
+    res_all <- rbind(res1_1,res1_2,res1_3)
+    res_all <- as.data.frame(t(res_all))
+    
+    res1_cut <- lapply(res1,function(x) x@result[,c("ONTOLOGY","NES","pvalue","p.adjust","log10Psign")] )
+    
+    #save to list
+    res_enrich[[bulkname]] <- bulk_GSEA
+    res_enrich[[scname]] <- res1_cut
+    res_enrich[[paste0("result",y)]] <- res_all
+}
+
+saveRDS(res_enrich,"results/SC_Bulk_DE_GSEAenrichment/GSEAenrich_GSE75748celltype_MAST_signlog10P.rds")
+```
+
+#### logFC
+```{r}
+res_enrich <- list()
+organism <- "org.Hs.eg.db"
+
+for(y in Compare_names){
+    bulkname <- paste0("bulk",y)
+    scname <- paste0("sc",y)
+    bulkres <- DE_res[[bulkname]]
+    scres <- DE_res[[scname]]
+    bulk_GSEA <- bulkres$logFC
+    names(bulk_GSEA) <- rownames(bulkres)
+    bulk_GSEA <- sort(bulk_GSEA,decreasing=TRUE)
+    bulk_GSEA <- gseGO(geneList=bulk_GSEA,ont="ALL",OrgDb=organism,keyType="SYMBOL",pvalueCutoff=1)
+    bulk_GSEA@result$log10Psign <- ifelse(bulk_GSEA@result$NES>0,-log10(bulk_GSEA@result$pvalue),log10(bulk_GSEA@result$pvalue))
+    
+    #SC
+    tmp <- scres[,grep("logFC",colnames(scres))]
+    res1 <- apply(tmp,2,getGSEA,rownames(scres),"ALL",organism,bulk_GSEA)
+    
+    #results
+    res1_1 <- as.data.frame(lapply(res1,function(x) cor.test(x@result$log10Psign,bulk_GSEA@result$log10Psign,method="spearman")$estimate ) )
+    res1_2 <- as.data.frame(lapply(res1,function(x) cor.test(x@result[bulk_GSEA@result$pvalue<=0.05,]$log10Psign,bulk_GSEA@result[bulk_GSEA@result$pvalue<=0.05,]$log10Psign,method="spearman")$estimate ) )
+    res1_3 <- as.data.frame(lapply(res1,function(x) cor.test(x@result[bulk_GSEA@result$pvalue<=0.005,]$log10Psign,bulk_GSEA@result[bulk_GSEA@result$pvalue<=0.005,]$log10Psign,method="spearman")$estimate ) )
+    res_all <- rbind(res1_1,res1_2,res1_3)
+    res_all <- as.data.frame(t(res_all))
+    
+    #save to list
+    res_enrich[[bulkname]] <- bulk_GSEA
+    res_enrich[[scname]] <- res1
+    res_enrich[[paste0("result",y)]] <- res_all
+}
+
+saveRDS(res_enrich,"results/SC_Bulk_DE_GSEAenrichment/GSEAenrich_GSE75748celltype_MAST_logFC.rds")
+```
+
+## GSE81861
+### sc RST
+```{r}
+DE_res <- readRDS("results/SC_Bulk_DEresults/Bulk_SC_SpearCor_DEresults_RST_GSE81861.rds")
+Compare_names <- unique(sapply(names(DE_res),function(x) strsplit(x,"bulk|sc")[[1]][2] ))
+```
+
+#### sign -log10P
+```{r message=FALSE}
+res_enrich <- list()
+organism <- "org.Hs.eg.db"
+
+for(y in Compare_names){
+    bulkname <- paste0("bulk",y)
+    scname <- paste0("sc",y)
+    bulkres <- DE_res[[bulkname]]
+    scres <- DE_res[[scname]]
+    bulk_GSEA <- bulkres$signlogP
+    names(bulk_GSEA) <- rownames(bulkres)
+    bulk_GSEA <- sort(bulk_GSEA,decreasing=TRUE)
+    bulk_GSEA <- gseGO(geneList=bulk_GSEA,ont="ALL",OrgDb=organism,keyType="SYMBOL",pvalueCutoff=1)
+    bulk_GSEA@result$log10Psign <- ifelse(bulk_GSEA@result$NES>0,-log10(bulk_GSEA@result$pvalue),log10(bulk_GSEA@result$pvalue))
+    
+    #SC
+    tmp <- scres[,grep("signlogP",colnames(scres))]
+    res1 <- apply(tmp,2,getGSEA,rownames(scres),"ALL",organism,bulk_GSEA)
+    
+    #results
+    res1_1 <- as.data.frame(lapply(res1,function(x) cor.test(x@result$log10Psign,bulk_GSEA@result$log10Psign,method="spearman")$estimate ) )
+    res1_2 <- as.data.frame(lapply(res1,function(x) cor.test(x@result[bulk_GSEA@result$pvalue<=0.05,]$log10Psign,bulk_GSEA@result[bulk_GSEA@result$pvalue<=0.05,]$log10Psign,method="spearman")$estimate ) )
+    res1_3 <- as.data.frame(lapply(res1,function(x) cor.test(x@result[bulk_GSEA@result$pvalue<=0.005,]$log10Psign,bulk_GSEA@result[bulk_GSEA@result$pvalue<=0.005,]$log10Psign,method="spearman")$estimate ) )
+    res_all <- rbind(res1_1,res1_2,res1_3)
+    res_all <- as.data.frame(t(res_all))
+    
+    res1_cut <- lapply(res1,function(x) x@result[,c("ONTOLOGY","NES","pvalue","p.adjust","log10Psign")] )
+    
+    #save to list
+    res_enrich[[bulkname]] <- bulk_GSEA
+    res_enrich[[scname]] <- res1_cut
+    res_enrich[[paste0("result",y)]] <- res_all
+}
+
+saveRDS(res_enrich,"results/SC_Bulk_DE_GSEAenrichment/GSEAenrich_GSE81861_scRST_signlog10P.rds")
+```
+
+### sc MAST
+```{r}
+DE_res <- readRDS("results/SC_Bulk_DEresults/Bulk_SC_SpearCor_DEresults_MAST_GSE81861.rds")
+Compare_names <- unique(sapply(names(DE_res),function(x) strsplit(x,"bulk|sc")[[1]][2] ))
+```
+
+#### sign -log10P
+```{r}
+res_enrich <- list()
+organism <- "org.Hs.eg.db"
+res_enrich_all <- readRDS("results/SC_Bulk_DE_GSEAenrichment/GSEAenrich_GSE81861_MAST_signlog10P.rds")
+
+for(y in Compare_names){
+    bulkname <- paste0("bulk",y)
+    scname <- paste0("sc",y)
+    scres <- DE_res[[scname]]
+    bulk_GSEA <- res_enrich_all[[bulkname]]
+    
+    #SC
+    tmp <- scres[,"afMF.signlogP"]
+    res1 <- getGSEA(tmp,rownames(scres),"ALL",organism,bulk_GSEA)
+    
+    #results
+    res1_1 <- cor.test(res1@result$log10Psign,bulk_GSEA@result$log10Psign,method="spearman")$estimate
+    res1_2 <- cor.test(res1@result[bulk_GSEA@result$pvalue<=0.05,]$log10Psign,bulk_GSEA@result[bulk_GSEA@result$pvalue<=0.05,]$log10Psign,method="spearman")$estimate
+    res1_3 <- cor.test(res1@result[bulk_GSEA@result$pvalue<=0.005,]$log10Psign,bulk_GSEA@result[bulk_GSEA@result$pvalue<=0.005,]$log10Psign,method="spearman")$estimate
+    res_all <- c(res1_1,res1_2,res1_3)
+    
+    res1_cut <- res1@result[,c("ONTOLOGY","NES","pvalue","p.adjust","log10Psign")]
+    
+    #save to list
+    res_enrich[[scname]] <- res1_cut
+    res_enrich[[paste0("result",y)]] <- res_all
+}
+
+for(x in Compare_names){
+    sc_name <- paste0("sc",x)
+    res_name <- paste0("result",x)
+    res_enrich_all[[sc_name]]$afMF.signlogP <- res_enrich[[sc_name]]
+    res_enrich_all[[res_name]] <- rbind(res_enrich_all[[res_name]],res_enrich[[res_name]])
+    rownames(res_enrich_all[[res_name]])[nrow(res_enrich_all[[res_name]])] <- "afMF.signlogP"
+}
+
+saveRDS(res_enrich_all,"results/SC_Bulk_DE_GSEAenrichment/GSEAenrich_GSE81861_MAST_signlog10P.rds")
+```
+
+#### logFC
+```{r}
+res_enrich <- list()
+organism <- "org.Hs.eg.db"
+res_enrich_all <- readRDS("results/SC_Bulk_DE_GSEAenrichment/GSEAenrich_GSE81861_MAST_logFC.rds")
+
+for(y in Compare_names){
+    bulkname <- paste0("bulk",y)
+    scname <- paste0("sc",y)
+    scres <- DE_res[[scname]]
+    bulk_GSEA <- res_enrich_all[[bulkname]]
+    
+    #SC
+    tmp <- scres[,"afMF.logFC"]
+    res1 <- getGSEA(tmp,rownames(scres),"ALL",organism,bulk_GSEA)
+    
+    #results
+    res1_1 <- cor.test(res1@result$log10Psign,bulk_GSEA@result$log10Psign,method="spearman")$estimate
+    res1_2 <- cor.test(res1@result[bulk_GSEA@result$pvalue<=0.05,]$log10Psign,bulk_GSEA@result[bulk_GSEA@result$pvalue<=0.05,]$log10Psign,method="spearman")$estimate
+    res1_3 <- cor.test(res1@result[bulk_GSEA@result$pvalue<=0.005,]$log10Psign,bulk_GSEA@result[bulk_GSEA@result$pvalue<=0.005,]$log10Psign,method="spearman")$estimate
+    res_all <- c(res1_1,res1_2,res1_3)
+    
+    res1_cut <- res1@result[,c("ONTOLOGY","NES","pvalue","p.adjust","log10Psign")]
+    
+    #save to list
+    res_enrich[[scname]] <- res1_cut
+    res_enrich[[paste0("result",y)]] <- res_all
+}
+
+for(x in Compare_names){
+    sc_name <- paste0("sc",x)
+    res_name <- paste0("result",x)
+    res_enrich_all[[sc_name]]$afMF.logFC <- res_enrich[[sc_name]]
+    res_enrich_all[[res_name]] <- rbind(res_enrich_all[[res_name]],res_enrich[[res_name]])
+    rownames(res_enrich_all[[res_name]])[nrow(res_enrich_all[[res_name]])] <- "afMF.logFC"
+}
+
+saveRDS(res_enrich_all,"results/SC_Bulk_DE_GSEAenrichment/GSEAenrich_GSE81861_MAST_logFC.rds")
+```
+
+
+## cellbench
+### sc RST
+```{r}
+DE_res <- readRDS("results/SC_Bulk_DEresults/Bulk_SC_SpearCor_DEresults_RST_cellbench.rds")
+Compare_names <- unique(sapply(names(DE_res),function(x) strsplit(x,"bulk|sc")[[1]][2] ))
+```
+
+#### sign -log10P
+```{r message=FALSE}
+res_enrich <- list()
+organism <- "org.Hs.eg.db"
+
+for(y in Compare_names){
+    bulkname <- paste0("bulk",y)
+    scname <- paste0("sc",y)
+    bulkres <- DE_res[[bulkname]]
+    scres <- DE_res[[scname]]
+    bulk_GSEA <- bulkres$signlogP
+    names(bulk_GSEA) <- rownames(bulkres)
+    bulk_GSEA <- sort(bulk_GSEA,decreasing=TRUE)
+    bulk_GSEA <- gseGO(geneList=bulk_GSEA,ont="ALL",OrgDb=organism,keyType="SYMBOL",pvalueCutoff=1)
+    bulk_GSEA@result$log10Psign <- ifelse(bulk_GSEA@result$NES>0,-log10(bulk_GSEA@result$pvalue),log10(bulk_GSEA@result$pvalue))
+    
+    #SC
+    tmp <- scres[,grep("signlogP",colnames(scres))]
+    res1 <- apply(tmp,2,getGSEA,rownames(scres),"ALL",organism,bulk_GSEA)
+    
+    #results
+    res1_1 <- as.data.frame(lapply(res1,function(x) cor.test(x@result$log10Psign,bulk_GSEA@result$log10Psign,method="spearman")$estimate ) )
+    res1_2 <- as.data.frame(lapply(res1,function(x) cor.test(x@result[bulk_GSEA@result$pvalue<=0.05,]$log10Psign,bulk_GSEA@result[bulk_GSEA@result$pvalue<=0.05,]$log10Psign,method="spearman")$estimate ) )
+    res1_3 <- as.data.frame(lapply(res1,function(x) cor.test(x@result[bulk_GSEA@result$pvalue<=0.005,]$log10Psign,bulk_GSEA@result[bulk_GSEA@result$pvalue<=0.005,]$log10Psign,method="spearman")$estimate ) )
+    res_all <- rbind(res1_1,res1_2,res1_3)
+    res_all <- as.data.frame(t(res_all))
+    
+    res1_cut <- lapply(res1,function(x) x@result[,c("ONTOLOGY","NES","pvalue","p.adjust","log10Psign")] )
+    
+    #save to list
+    res_enrich[[bulkname]] <- bulk_GSEA
+    res_enrich[[scname]] <- res1_cut
+    res_enrich[[paste0("result",y)]] <- res_all
+}
+
+saveRDS(res_enrich,"results/SC_Bulk_DE_GSEAenrichment/GSEAenrich_GSE81861_scRST_signlog10P.rds")
+```
+
+### sc MAST
+```{r}
+DE_res <- readRDS("results/SC_Bulk_DEresults/Bulk_SC_SpearCor_DEresults_MAST_cellbench.rds")
+Compare_names <- unique(sapply(names(DE_res),function(x) strsplit(x,"bulk|sc")[[1]][2] ))
+```
+
+#### sign -log10P
+```{r}
+res_enrich <- list()
+organism <- "org.Hs.eg.db"
+res_enrich_all <- readRDS("results/SC_Bulk_DE_GSEAenrichment/GSEAenrich_cellbench_MAST_signlog10P.rds")
+
+for(y in Compare_names){
+    bulkname <- paste0("bulk",y)
+    scname <- paste0("sc",y)
+    scres <- DE_res[[scname]]
+    bulk_GSEA <- res_enrich_all[[bulkname]]
+    
+    #SC
+    tmp <- scres[,"afMF.signlogP"]
+    res1 <- getGSEA(tmp,rownames(scres),"ALL",organism,bulk_GSEA)
+    
+    #results
+    res1_1 <- cor.test(res1@result$log10Psign,bulk_GSEA@result$log10Psign,method="spearman")$estimate
+    res1_2 <- cor.test(res1@result[bulk_GSEA@result$pvalue<=0.05,]$log10Psign,bulk_GSEA@result[bulk_GSEA@result$pvalue<=0.05,]$log10Psign,method="spearman")$estimate
+    res1_3 <- cor.test(res1@result[bulk_GSEA@result$pvalue<=0.005,]$log10Psign,bulk_GSEA@result[bulk_GSEA@result$pvalue<=0.005,]$log10Psign,method="spearman")$estimate
+    res_all <- c(res1_1,res1_2,res1_3)
+    
+    res1_cut <- res1@result[,c("ONTOLOGY","NES","pvalue","p.adjust","log10Psign")]
+    
+    #save to list
+    res_enrich[[scname]] <- res1_cut
+    res_enrich[[paste0("result",y)]] <- res_all
+}
+
+for(x in Compare_names){
+    sc_name <- paste0("sc",x)
+    res_name <- paste0("result",x)
+    res_enrich_all[[sc_name]]$afMF.signlogP <- res_enrich[[sc_name]]
+    res_enrich_all[[res_name]] <- rbind(res_enrich_all[[res_name]],res_enrich[[res_name]])
+    rownames(res_enrich_all[[res_name]])[nrow(res_enrich_all[[res_name]])] <- "afMF.signlogP"
+}
+
+saveRDS(res_enrich_all,"results/SC_Bulk_DE_GSEAenrichment/GSEAenrich_cellbench_MAST_signlog10P.rds")
+```
+
+#### logFC
+```{r}
+res_enrich <- list()
+organism <- "org.Hs.eg.db"
+res_enrich_all <- readRDS("results/SC_Bulk_DE_GSEAenrichment/GSEAenrich_cellbench_MAST_logFC.rds")
+
+for(y in Compare_names){
+    bulkname <- paste0("bulk",y)
+    scname <- paste0("sc",y)
+    scres <- DE_res[[scname]]
+    bulk_GSEA <- res_enrich_all[[bulkname]]
+    
+    #SC
+    tmp <- scres[,"afMF.logFC"]
+    res1 <- getGSEA(tmp,rownames(scres),"ALL",organism,bulk_GSEA)
+    
+    #results
+    res1_1 <- cor.test(res1@result$log10Psign,bulk_GSEA@result$log10Psign,method="spearman")$estimate
+    res1_2 <- cor.test(res1@result[bulk_GSEA@result$pvalue<=0.05,]$log10Psign,bulk_GSEA@result[bulk_GSEA@result$pvalue<=0.05,]$log10Psign,method="spearman")$estimate
+    res1_3 <- cor.test(res1@result[bulk_GSEA@result$pvalue<=0.005,]$log10Psign,bulk_GSEA@result[bulk_GSEA@result$pvalue<=0.005,]$log10Psign,method="spearman")$estimate
+    res_all <- c(res1_1,res1_2,res1_3)
+    
+    res1_cut <- res1@result[,c("ONTOLOGY","NES","pvalue","p.adjust","log10Psign")]
+    
+    #save to list
+    res_enrich[[scname]] <- res1_cut
+    res_enrich[[paste0("result",y)]] <- res_all
+}
+
+for(x in Compare_names){
+    sc_name <- paste0("sc",x)
+    res_name <- paste0("result",x)
+    res_enrich_all[[sc_name]]$afMF.logFC <- res_enrich[[sc_name]]
+    res_enrich_all[[res_name]] <- rbind(res_enrich_all[[res_name]],res_enrich[[res_name]])
+    rownames(res_enrich_all[[res_name]])[nrow(res_enrich_all[[res_name]])] <- "afMF.logFC"
+}
+
+saveRDS(res_enrich_all,"results/SC_Bulk_DE_GSEAenrichment/GSEAenrich_cellbench_MAST_logFC.rds")
+```
+
+# purified sample(with R 3.6.2)
+## Angelidis2019_alvmac
+### sc RST
+```{r}
+DE_res <- readRDS("results/SC_Bulk_DEresults/Bulk_SC_SpearCor_DEresults_RST_Angelidis2019_alvmac.rds")
+Compare_names <- unique(sapply(names(DE_res),function(x) strsplit(x,"bulk|sc")[[1]][2] ))
+```
+
+#### sign -log10P
+```{r message=FALSE, warning=FALSE}
+res_enrich <- list()
+organism <- "org.Mm.eg.db"
+
+for(y in Compare_names){
+    bulkname <- paste0("bulk",y)
+    scname <- paste0("sc",y)
+    bulkres <- DE_res[[bulkname]]
+    scres <- DE_res[[scname]]
+    bulk_GSEA <- bulkres$signlogP
+    names(bulk_GSEA) <- rownames(bulkres)
+    
+    bulk_GSEA <- sort(bulk_GSEA,decreasing=TRUE)
+    bulk_GSEA <- gseGO(geneList=bulk_GSEA,ont="ALL",OrgDb=organism,keyType="SYMBOL",pvalueCutoff=1)
+    bulk_GSEA@result$log10Psign <- ifelse(bulk_GSEA@result$NES>0,-log10(bulk_GSEA@result$pvalue),log10(bulk_GSEA@result$pvalue))
+    
+    #SC
+    tmp <- scres[,grep("signlogP",colnames(scres))]
+    #tmp <- tmp[GeneSymbol$SYMBOL,]
+    #rownames(tmp) <- GeneSymbol$ENSEMBL
+    res1 <- apply(tmp,2,getGSEA,rownames(tmp),"ALL",organism,bulk_GSEA)
+    
+    #results
+    res1_1 <- as.data.frame(lapply(res1,function(x) cor.test(x@result$log10Psign,bulk_GSEA@result$log10Psign,method="spearman")$estimate ) )
+    res1_2 <- as.data.frame(lapply(res1,function(x) cor.test(x@result[bulk_GSEA@result$pvalue<=0.05,]$log10Psign,bulk_GSEA@result[bulk_GSEA@result$pvalue<=0.05,]$log10Psign,method="spearman")$estimate ) )
+    res1_3 <- as.data.frame(lapply(res1,function(x) cor.test(x@result[bulk_GSEA@result$pvalue<=0.005,]$log10Psign,bulk_GSEA@result[bulk_GSEA@result$pvalue<=0.005,]$log10Psign,method="spearman")$estimate ) )
+    res_all <- rbind(res1_1,res1_2,res1_3)
+    res_all <- as.data.frame(t(res_all))
+    
+    res1_cut <- lapply(res1,function(x) x@result[,c("ONTOLOGY","NES","pvalue","p.adjust","log10Psign")] )
+    
+    #save to list
+    res_enrich[[bulkname]] <- bulk_GSEA
+    res_enrich[[scname]] <- res1_cut
+    res_enrich[[paste0("result",y)]] <- res_all
+}
+
+saveRDS(res_enrich,"results/SC_Bulk_DE_GSEAenrichment/GSEAenrich_Angelidis2019_alvmac_scRST_signlog10P.rds")
+```
+
+### sc MAST
+```{r}
+DE_res <- readRDS("results/SC_Bulk_DEresults/Bulk_SC_SpearCor_DEresults_MAST_Angelidis2019_alvmac.rds")
+Compare_names <- unique(sapply(names(DE_res),function(x) strsplit(x,"bulk|sc")[[1]][2] ))
+```
+
+#### sign -log10P
+```{r message=FALSE}
+res_enrich <- list()
+organism <- "org.Mm.eg.db"
+
+for(y in Compare_names){
+    bulkname <- paste0("bulk",y)
+    scname <- paste0("sc",y)
+    bulkres <- DE_res[[bulkname]]
+    scres <- DE_res[[scname]]
+    bulk_GSEA <- bulkres$signlogP
+    names(bulk_GSEA) <- rownames(bulkres)
+    bulk_GSEA <- sort(bulk_GSEA,decreasing=TRUE)
+    bulk_GSEA <- gseGO(geneList=bulk_GSEA,ont="ALL",OrgDb=organism,keyType="SYMBOL",pvalueCutoff=1)
+    bulk_GSEA@result$log10Psign <- ifelse(bulk_GSEA@result$NES>0,-log10(bulk_GSEA@result$pvalue),log10(bulk_GSEA@result$pvalue))
+    
+    #SC
+    tmp <- scres[,grep("signlogP",colnames(scres))]
+    res1 <- apply(tmp,2,getGSEA,rownames(scres),"ALL",organism,bulk_GSEA)
+    
+    #results
+    res1_1 <- as.data.frame(lapply(res1,function(x) cor.test(x@result$log10Psign,bulk_GSEA@result$log10Psign,method="spearman")$estimate ) )
+    res1_2 <- as.data.frame(lapply(res1,function(x) cor.test(x@result[bulk_GSEA@result$pvalue<=0.05,]$log10Psign,bulk_GSEA@result[bulk_GSEA@result$pvalue<=0.05,]$log10Psign,method="spearman")$estimate ) )
+    res1_3 <- as.data.frame(lapply(res1,function(x) cor.test(x@result[bulk_GSEA@result$pvalue<=0.005,]$log10Psign,bulk_GSEA@result[bulk_GSEA@result$pvalue<=0.005,]$log10Psign,method="spearman")$estimate ) )
+    res_all <- rbind(res1_1,res1_2,res1_3)
+    res_all <- as.data.frame(t(res_all))
+    
+    res1_cut <- lapply(res1,function(x) x@result[,c("ONTOLOGY","NES","pvalue","p.adjust","log10Psign")] )
+    
+    #save to list
+    res_enrich[[bulkname]] <- bulk_GSEA
+    res_enrich[[scname]] <- res1_cut
+    res_enrich[[paste0("result",y)]] <- res_all
+}
+
+saveRDS(res_enrich,"results/SC_Bulk_DE_GSEAenrichment/GSEAenrich_Angelidis2019_alvmac_MAST_signlog10P.rds")
+```
+
+#### logFC
+```{r}
+res_enrich <- list()
+organism <- "org.Mm.eg.db"
+
+for(y in Compare_names){
+    bulkname <- paste0("bulk",y)
+    scname <- paste0("sc",y)
+    bulkres <- DE_res[[bulkname]]
+    scres <- DE_res[[scname]]
+    bulk_GSEA <- bulkres$logFC
+    names(bulk_GSEA) <- rownames(bulkres)
+    bulk_GSEA <- sort(bulk_GSEA,decreasing=TRUE)
+    bulk_GSEA <- gseGO(geneList=bulk_GSEA,ont="ALL",OrgDb=organism,keyType="SYMBOL",pvalueCutoff=1)
+    bulk_GSEA@result$log10Psign <- ifelse(bulk_GSEA@result$NES>0,-log10(bulk_GSEA@result$pvalue),log10(bulk_GSEA@result$pvalue))
+    
+    #SC
+    tmp <- scres[,grep("logFC",colnames(scres))]
+    res1 <- apply(tmp,2,getGSEA,rownames(scres),"ALL",organism,bulk_GSEA)
+    
+    #results
+    res1_1 <- as.data.frame(lapply(res1,function(x) cor.test(x@result$log10Psign,bulk_GSEA@result$log10Psign,method="spearman")$estimate ) )
+    res1_2 <- as.data.frame(lapply(res1,function(x) cor.test(x@result[bulk_GSEA@result$pvalue<=0.05,]$log10Psign,bulk_GSEA@result[bulk_GSEA@result$pvalue<=0.05,]$log10Psign,method="spearman")$estimate ) )
+    res1_3 <- as.data.frame(lapply(res1,function(x) cor.test(x@result[bulk_GSEA@result$pvalue<=0.005,]$log10Psign,bulk_GSEA@result[bulk_GSEA@result$pvalue<=0.005,]$log10Psign,method="spearman")$estimate ) )
+    res_all <- rbind(res1_1,res1_2,res1_3)
+    res_all <- as.data.frame(t(res_all))
+    
+    #save to list
+    res_enrich[[bulkname]] <- bulk_GSEA
+    res_enrich[[scname]] <- res1
+    res_enrich[[paste0("result",y)]] <- res_all
+}
+
+saveRDS(res_enrich,"results/SC_Bulk_DE_GSEAenrichment/GSEAenrich_Angelidis2019_alvmac_MAST_logFC.rds")
+```
+
+### PBlimma
+```{r}
+DE_res <- readRDS("results/SC_Bulk_DEresults/Bulk_SC_SpearCor_DEresults_PBlimma_Angelidis2019_alvmac.rds")
+Compare_names <- unique(sapply(names(DE_res),function(x) strsplit(x,"bulk|sc")[[1]][2] ))
+```
+
+#### sign -log10P
+```{r message=FALSE}
+res_enrich <- list()
+organism <- "org.Mm.eg.db"
+
+for(y in Compare_names){
+    bulkname <- paste0("bulk",y)
+    scname <- paste0("sc",y)
+    bulkres <- DE_res[[bulkname]]
+    scres <- DE_res[[scname]]
+    bulk_GSEA <- bulkres$signlogP
+    names(bulk_GSEA) <- rownames(bulkres)
+    bulk_GSEA <- sort(bulk_GSEA,decreasing=TRUE)
+    bulk_GSEA <- gseGO(geneList=bulk_GSEA,ont="ALL",OrgDb=organism,keyType="SYMBOL",pvalueCutoff=1)
+    bulk_GSEA@result$log10Psign <- ifelse(bulk_GSEA@result$NES>0,-log10(bulk_GSEA@result$pvalue),log10(bulk_GSEA@result$pvalue))
+    
+    #SC
+    tmp <- scres[,grep("signlogP",colnames(scres))]
+    res1 <- apply(tmp,2,getGSEA,rownames(scres),"ALL",organism,bulk_GSEA)
+    
+    #results
+    res1_1 <- as.data.frame(lapply(res1,function(x) cor.test(x@result$log10Psign,bulk_GSEA@result$log10Psign,method="spearman")$estimate ) )
+    res1_2 <- as.data.frame(lapply(res1,function(x) cor.test(x@result[bulk_GSEA@result$pvalue<=0.05,]$log10Psign,bulk_GSEA@result[bulk_GSEA@result$pvalue<=0.05,]$log10Psign,method="spearman")$estimate ) )
+    res1_3 <- as.data.frame(lapply(res1,function(x) cor.test(x@result[bulk_GSEA@result$pvalue<=0.005,]$log10Psign,bulk_GSEA@result[bulk_GSEA@result$pvalue<=0.005,]$log10Psign,method="spearman")$estimate ) )
+    res_all <- rbind(res1_1,res1_2,res1_3)
+    res_all <- as.data.frame(t(res_all))
+    
+    res1_cut <- lapply(res1,function(x) x@result[,c("ONTOLOGY","NES","pvalue","p.adjust","log10Psign")] )
+    
+    #save to list
+    res_enrich[[bulkname]] <- bulk_GSEA
+    res_enrich[[scname]] <- res1_cut
+    res_enrich[[paste0("result",y)]] <- res_all
+}
+
+saveRDS(res_enrich,"results/SC_Bulk_DE_GSEAenrichment/GSEAenrich_Angelidis2019_alvmac_PBlimma_signlog10P.rds")
+```
+
+#### logFC
+```{r}
+res_enrich <- list()
+organism <- "org.Mm.eg.db"
+
+for(y in Compare_names){
+    bulkname <- paste0("bulk",y)
+    scname <- paste0("sc",y)
+    bulkres <- DE_res[[bulkname]]
+    scres <- DE_res[[scname]]
+    bulk_GSEA <- bulkres$logFC
+    names(bulk_GSEA) <- rownames(bulkres)
+    bulk_GSEA <- sort(bulk_GSEA,decreasing=TRUE)
+    bulk_GSEA <- gseGO(geneList=bulk_GSEA,ont="ALL",OrgDb=organism,keyType="SYMBOL",pvalueCutoff=1)
+    bulk_GSEA@result$log10Psign <- ifelse(bulk_GSEA@result$NES>0,-log10(bulk_GSEA@result$pvalue),log10(bulk_GSEA@result$pvalue))
+    
+    #SC
+    tmp <- scres[,grep("logFC",colnames(scres))]
+    res1 <- apply(tmp,2,getGSEA,rownames(scres),"ALL",organism,bulk_GSEA)
+    
+    #results
+    res1_1 <- as.data.frame(lapply(res1,function(x) cor.test(x@result$log10Psign,bulk_GSEA@result$log10Psign,method="spearman")$estimate ) )
+    res1_2 <- as.data.frame(lapply(res1,function(x) cor.test(x@result[bulk_GSEA@result$pvalue<=0.05,]$log10Psign,bulk_GSEA@result[bulk_GSEA@result$pvalue<=0.05,]$log10Psign,method="spearman")$estimate ) )
+    res1_3 <- as.data.frame(lapply(res1,function(x) cor.test(x@result[bulk_GSEA@result$pvalue<=0.005,]$log10Psign,bulk_GSEA@result[bulk_GSEA@result$pvalue<=0.005,]$log10Psign,method="spearman")$estimate ) )
+    res_all <- rbind(res1_1,res1_2,res1_3)
+    res_all <- as.data.frame(t(res_all))
+    
+    #save to list
+    res_enrich[[bulkname]] <- bulk_GSEA
+    res_enrich[[scname]] <- res1
+    res_enrich[[paste0("result",y)]] <- res_all
+}
+
+saveRDS(res_enrich,"results/SC_Bulk_DE_GSEAenrichment/GSEAenrich_Angelidis2019_alvmac_PBlimma_logFC.rds")
+```
+
+
+## Angelidis2019_pneumo
+### sc RST
+```{r}
+DE_res <- readRDS("results/SC_Bulk_DEresults/Bulk_SC_SpearCor_DEresults_RST_Angelidis2019_pneumo.rds")
+Compare_names <- unique(sapply(names(DE_res),function(x) strsplit(x,"bulk|sc")[[1]][2] ))
+```
+
+#### sign -log10P
+```{r message=FALSE, warning=FALSE}
+res_enrich <- list()
+organism <- "org.Mm.eg.db"
+
+for(y in Compare_names){
+    bulkname <- paste0("bulk",y)
+    scname <- paste0("sc",y)
+    bulkres <- DE_res[[bulkname]]
+    scres <- DE_res[[scname]]
+    bulk_GSEA <- bulkres$signlogP
+    names(bulk_GSEA) <- rownames(bulkres)
+    
+    bulk_GSEA <- sort(bulk_GSEA,decreasing=TRUE)
+    bulk_GSEA <- gseGO(geneList=bulk_GSEA,ont="ALL",OrgDb=organism,keyType="SYMBOL",pvalueCutoff=1)
+    bulk_GSEA@result$log10Psign <- ifelse(bulk_GSEA@result$NES>0,-log10(bulk_GSEA@result$pvalue),log10(bulk_GSEA@result$pvalue))
+    
+    #SC
+    tmp <- scres[,grep("signlogP",colnames(scres))]
+    #tmp <- tmp[GeneSymbol$SYMBOL,]
+    #rownames(tmp) <- GeneSymbol$ENSEMBL
+    res1 <- apply(tmp,2,getGSEA,rownames(tmp),"ALL",organism,bulk_GSEA)
+    
+    #results
+    res1_1 <- as.data.frame(lapply(res1,function(x) cor.test(x@result$log10Psign,bulk_GSEA@result$log10Psign,method="spearman")$estimate ) )
+    res1_2 <- as.data.frame(lapply(res1,function(x) cor.test(x@result[bulk_GSEA@result$pvalue<=0.05,]$log10Psign,bulk_GSEA@result[bulk_GSEA@result$pvalue<=0.05,]$log10Psign,method="spearman")$estimate ) )
+    res1_3 <- as.data.frame(lapply(res1,function(x) cor.test(x@result[bulk_GSEA@result$pvalue<=0.005,]$log10Psign,bulk_GSEA@result[bulk_GSEA@result$pvalue<=0.005,]$log10Psign,method="spearman")$estimate ) )
+    res_all <- rbind(res1_1,res1_2,res1_3)
+    res_all <- as.data.frame(t(res_all))
+    
+    res1_cut <- lapply(res1,function(x) x@result[,c("ONTOLOGY","NES","pvalue","p.adjust","log10Psign")] )
+    
+    #save to list
+    res_enrich[[bulkname]] <- bulk_GSEA
+    res_enrich[[scname]] <- res1_cut
+    res_enrich[[paste0("result",y)]] <- res_all
+}
+
+saveRDS(res_enrich,"results/SC_Bulk_DE_GSEAenrichment/GSEAenrich_Angelidis2019_pneumo_scRST_signlog10P.rds")
+```
+
+### sc MAST
+```{r}
+DE_res <- readRDS("results/SC_Bulk_DEresults/Bulk_SC_SpearCor_DEresults_MAST_Angelidis2019_pneumo.rds")
+Compare_names <- unique(sapply(names(DE_res),function(x) strsplit(x,"bulk|sc")[[1]][2] ))
+```
+
+#### sign -log10P
+```{r message=FALSE}
+res_enrich <- list()
+organism <- "org.Mm.eg.db"
+
+for(y in Compare_names){
+    bulkname <- paste0("bulk",y)
+    scname <- paste0("sc",y)
+    bulkres <- DE_res[[bulkname]]
+    scres <- DE_res[[scname]]
+    bulk_GSEA <- bulkres$signlogP
+    names(bulk_GSEA) <- rownames(bulkres)
+    bulk_GSEA <- sort(bulk_GSEA,decreasing=TRUE)
+    bulk_GSEA <- gseGO(geneList=bulk_GSEA,ont="ALL",OrgDb=organism,keyType="SYMBOL",pvalueCutoff=1)
+    bulk_GSEA@result$log10Psign <- ifelse(bulk_GSEA@result$NES>0,-log10(bulk_GSEA@result$pvalue),log10(bulk_GSEA@result$pvalue))
+    
+    #SC
+    tmp <- scres[,grep("signlogP",colnames(scres))]
+    res1 <- apply(tmp,2,getGSEA,rownames(scres),"ALL",organism,bulk_GSEA)
+    
+    #results
+    res1_1 <- as.data.frame(lapply(res1,function(x) cor.test(x@result$log10Psign,bulk_GSEA@result$log10Psign,method="spearman")$estimate ) )
+    res1_2 <- as.data.frame(lapply(res1,function(x) cor.test(x@result[bulk_GSEA@result$pvalue<=0.05,]$log10Psign,bulk_GSEA@result[bulk_GSEA@result$pvalue<=0.05,]$log10Psign,method="spearman")$estimate ) )
+    res1_3 <- as.data.frame(lapply(res1,function(x) cor.test(x@result[bulk_GSEA@result$pvalue<=0.005,]$log10Psign,bulk_GSEA@result[bulk_GSEA@result$pvalue<=0.005,]$log10Psign,method="spearman")$estimate ) )
+    res_all <- rbind(res1_1,res1_2,res1_3)
+    res_all <- as.data.frame(t(res_all))
+    
+    res1_cut <- lapply(res1,function(x) x@result[,c("ONTOLOGY","NES","pvalue","p.adjust","log10Psign")] )
+    
+    #save to list
+    res_enrich[[bulkname]] <- bulk_GSEA
+    res_enrich[[scname]] <- res1_cut
+    res_enrich[[paste0("result",y)]] <- res_all
+}
+
+saveRDS(res_enrich,"results/SC_Bulk_DE_GSEAenrichment/GSEAenrich_Angelidis2019_pneumo_MAST_signlog10P.rds")
+```
+
+#### logFC
+```{r}
+res_enrich <- list()
+organism <- "org.Mm.eg.db"
+
+for(y in Compare_names){
+    bulkname <- paste0("bulk",y)
+    scname <- paste0("sc",y)
+    bulkres <- DE_res[[bulkname]]
+    scres <- DE_res[[scname]]
+    bulk_GSEA <- bulkres$logFC
+    names(bulk_GSEA) <- rownames(bulkres)
+    bulk_GSEA <- sort(bulk_GSEA,decreasing=TRUE)
+    bulk_GSEA <- gseGO(geneList=bulk_GSEA,ont="ALL",OrgDb=organism,keyType="SYMBOL",pvalueCutoff=1)
+    bulk_GSEA@result$log10Psign <- ifelse(bulk_GSEA@result$NES>0,-log10(bulk_GSEA@result$pvalue),log10(bulk_GSEA@result$pvalue))
+    
+    #SC
+    tmp <- scres[,grep("logFC",colnames(scres))]
+    res1 <- apply(tmp,2,getGSEA,rownames(scres),"ALL",organism,bulk_GSEA)
+    
+    #results
+    res1_1 <- as.data.frame(lapply(res1,function(x) cor.test(x@result$log10Psign,bulk_GSEA@result$log10Psign,method="spearman")$estimate ) )
+    res1_2 <- as.data.frame(lapply(res1,function(x) cor.test(x@result[bulk_GSEA@result$pvalue<=0.05,]$log10Psign,bulk_GSEA@result[bulk_GSEA@result$pvalue<=0.05,]$log10Psign,method="spearman")$estimate ) )
+    res1_3 <- as.data.frame(lapply(res1,function(x) cor.test(x@result[bulk_GSEA@result$pvalue<=0.005,]$log10Psign,bulk_GSEA@result[bulk_GSEA@result$pvalue<=0.005,]$log10Psign,method="spearman")$estimate ) )
+    res_all <- rbind(res1_1,res1_2,res1_3)
+    res_all <- as.data.frame(t(res_all))
+    
+    #save to list
+    res_enrich[[bulkname]] <- bulk_GSEA
+    res_enrich[[scname]] <- res1
+    res_enrich[[paste0("result",y)]] <- res_all
+}
+
+saveRDS(res_enrich,"results/SC_Bulk_DE_GSEAenrichment/GSEAenrich_Angelidis2019_pneumo_MAST_logFC.rds")
+```
+
+
+### PBlimma
+```{r}
+DE_res <- readRDS("results/SC_Bulk_DEresults/Bulk_SC_SpearCor_DEresults_PBlimma_Angelidis2019_pneumo.rds")
+Compare_names <- unique(sapply(names(DE_res),function(x) strsplit(x,"bulk|sc")[[1]][2] ))
+```
+
+#### sign -log10P
+```{r message=FALSE}
+res_enrich <- list()
+organism <- "org.Mm.eg.db"
+
+for(y in Compare_names){
+    bulkname <- paste0("bulk",y)
+    scname <- paste0("sc",y)
+    bulkres <- DE_res[[bulkname]]
+    scres <- DE_res[[scname]]
+    bulk_GSEA <- bulkres$signlogP
+    names(bulk_GSEA) <- rownames(bulkres)
+    bulk_GSEA <- sort(bulk_GSEA,decreasing=TRUE)
+    bulk_GSEA <- gseGO(geneList=bulk_GSEA,ont="ALL",OrgDb=organism,keyType="SYMBOL",pvalueCutoff=1)
+    bulk_GSEA@result$log10Psign <- ifelse(bulk_GSEA@result$NES>0,-log10(bulk_GSEA@result$pvalue),log10(bulk_GSEA@result$pvalue))
+    
+    #SC
+    tmp <- scres[,grep("signlogP",colnames(scres))]
+    res1 <- apply(tmp,2,getGSEA,rownames(scres),"ALL",organism,bulk_GSEA)
+    
+    #results
+    res1_1 <- as.data.frame(lapply(res1,function(x) cor.test(x@result$log10Psign,bulk_GSEA@result$log10Psign,method="spearman")$estimate ) )
+    res1_2 <- as.data.frame(lapply(res1,function(x) cor.test(x@result[bulk_GSEA@result$pvalue<=0.05,]$log10Psign,bulk_GSEA@result[bulk_GSEA@result$pvalue<=0.05,]$log10Psign,method="spearman")$estimate ) )
+    res1_3 <- as.data.frame(lapply(res1,function(x) cor.test(x@result[bulk_GSEA@result$pvalue<=0.005,]$log10Psign,bulk_GSEA@result[bulk_GSEA@result$pvalue<=0.005,]$log10Psign,method="spearman")$estimate ) )
+    res_all <- rbind(res1_1,res1_2,res1_3)
+    res_all <- as.data.frame(t(res_all))
+    
+    res1_cut <- lapply(res1,function(x) x@result[,c("ONTOLOGY","NES","pvalue","p.adjust","log10Psign")] )
+    
+    #save to list
+    res_enrich[[bulkname]] <- bulk_GSEA
+    res_enrich[[scname]] <- res1_cut
+    res_enrich[[paste0("result",y)]] <- res_all
+}
+
+saveRDS(res_enrich,"results/SC_Bulk_DE_GSEAenrichment/GSEAenrich_Angelidis2019_pneumo_PBlimma_signlog10P.rds")
+```
+
+#### logFC
+```{r}
+res_enrich <- list()
+organism <- "org.Mm.eg.db"
+
+for(y in Compare_names){
+    bulkname <- paste0("bulk",y)
+    scname <- paste0("sc",y)
+    bulkres <- DE_res[[bulkname]]
+    scres <- DE_res[[scname]]
+    bulk_GSEA <- bulkres$logFC
+    names(bulk_GSEA) <- rownames(bulkres)
+    bulk_GSEA <- sort(bulk_GSEA,decreasing=TRUE)
+    bulk_GSEA <- gseGO(geneList=bulk_GSEA,ont="ALL",OrgDb=organism,keyType="SYMBOL",pvalueCutoff=1)
+    bulk_GSEA@result$log10Psign <- ifelse(bulk_GSEA@result$NES>0,-log10(bulk_GSEA@result$pvalue),log10(bulk_GSEA@result$pvalue))
+    
+    #SC
+    tmp <- scres[,grep("logFC",colnames(scres))]
+    res1 <- apply(tmp,2,getGSEA,rownames(scres),"ALL",organism,bulk_GSEA)
+    
+    #results
+    res1_1 <- as.data.frame(lapply(res1,function(x) cor.test(x@result$log10Psign,bulk_GSEA@result$log10Psign,method="spearman")$estimate ) )
+    res1_2 <- as.data.frame(lapply(res1,function(x) cor.test(x@result[bulk_GSEA@result$pvalue<=0.05,]$log10Psign,bulk_GSEA@result[bulk_GSEA@result$pvalue<=0.05,]$log10Psign,method="spearman")$estimate ) )
+    res1_3 <- as.data.frame(lapply(res1,function(x) cor.test(x@result[bulk_GSEA@result$pvalue<=0.005,]$log10Psign,bulk_GSEA@result[bulk_GSEA@result$pvalue<=0.005,]$log10Psign,method="spearman")$estimate ) )
+    res_all <- rbind(res1_1,res1_2,res1_3)
+    res_all <- as.data.frame(t(res_all))
+    
+    res1_cut <- lapply(res1,function(x) x@result[,c("ONTOLOGY","NES","pvalue","p.adjust","log10Psign")] )
+    
+    #save to list
+    res_enrich[[bulkname]] <- bulk_GSEA
+    res_enrich[[scname]] <- res1_cut
+    res_enrich[[paste0("result",y)]] <- res_all
+}
+
+saveRDS(res_enrich,"results/SC_Bulk_DE_GSEAenrichment/GSEAenrich_Angelidis2019_pneumo_PBlimma_logFC.rds")
+```
+
+## CanoGamez2020_memory_iTreg
+### sc RST
+```{r}
+DE_res <- readRDS("results/SC_Bulk_DEresults/Bulk_SC_SpearCor_DEresults_RST_CanoGamez2020_memory_iTreg.rds")
+Compare_names <- unique(sapply(names(DE_res),function(x) strsplit(x,"bulk|sc")[[1]][2] ))
+```
+
+#### sign -log10P
+```{r message=FALSE, warning=FALSE}
+res_enrich <- list()
+organism <- "org.Hs.eg.db"
+
+for(y in Compare_names){
+    bulkname <- paste0("bulk",y)
+    scname <- paste0("sc",y)
+    bulkres <- DE_res[[bulkname]]
+    scres <- DE_res[[scname]]
+    bulk_GSEA <- bulkres$signlogP
+    names(bulk_GSEA) <- rownames(bulkres)
+    
+    bulk_GSEA <- sort(bulk_GSEA,decreasing=TRUE)
+    bulk_GSEA <- gseGO(geneList=bulk_GSEA,ont="ALL",OrgDb=organism,keyType="SYMBOL",pvalueCutoff=1)
+    bulk_GSEA@result$log10Psign <- ifelse(bulk_GSEA@result$NES>0,-log10(bulk_GSEA@result$pvalue),log10(bulk_GSEA@result$pvalue))
+    
+    #SC
+    tmp <- scres[,grep("signlogP",colnames(scres))]
+    #tmp <- tmp[GeneSymbol$SYMBOL,]
+    #rownames(tmp) <- GeneSymbol$ENSEMBL
+    res1 <- apply(tmp,2,getGSEA,rownames(tmp),"ALL",organism,bulk_GSEA)
+    
+    #results
+    res1_1 <- as.data.frame(lapply(res1,function(x) cor.test(x@result$log10Psign,bulk_GSEA@result$log10Psign,method="spearman")$estimate ) )
+    res1_2 <- as.data.frame(lapply(res1,function(x) cor.test(x@result[bulk_GSEA@result$pvalue<=0.05,]$log10Psign,bulk_GSEA@result[bulk_GSEA@result$pvalue<=0.05,]$log10Psign,method="spearman")$estimate ) )
+    res1_3 <- as.data.frame(lapply(res1,function(x) cor.test(x@result[bulk_GSEA@result$pvalue<=0.005,]$log10Psign,bulk_GSEA@result[bulk_GSEA@result$pvalue<=0.005,]$log10Psign,method="spearman")$estimate ) )
+    res_all <- rbind(res1_1,res1_2,res1_3)
+    res_all <- as.data.frame(t(res_all))
+    
+    res1_cut <- lapply(res1,function(x) x@result[,c("ONTOLOGY","NES","pvalue","p.adjust","log10Psign")] )
+    
+    #save to list
+    res_enrich[[bulkname]] <- bulk_GSEA
+    res_enrich[[scname]] <- res1_cut
+    res_enrich[[paste0("result",y)]] <- res_all
+}
+
+saveRDS(res_enrich,"results/SC_Bulk_DE_GSEAenrichment/GSEAenrich_CanoGamez2020_memory_iTreg_scRST_signlog10P.rds")
+```
+
+### sc MAST
+```{r}
+DE_res <- readRDS("results/SC_Bulk_DEresults/Bulk_SC_SpearCor_DEresults_MAST_CanoGamez2020_memory_iTreg.rds")
+Compare_names <- unique(sapply(names(DE_res),function(x) strsplit(x,"bulk|sc")[[1]][2] ))
+```
+
+#### sign -log10P
+```{r message=FALSE}
+res_enrich <- list()
+organism <- "org.Hs.eg.db"
+
+for(y in Compare_names){
+    bulkname <- paste0("bulk",y)
+    scname <- paste0("sc",y)
+    bulkres <- DE_res[[bulkname]]
+    scres <- DE_res[[scname]]
+    bulk_GSEA <- bulkres$signlogP
+    names(bulk_GSEA) <- rownames(bulkres)
+    bulk_GSEA <- sort(bulk_GSEA,decreasing=TRUE)
+    bulk_GSEA <- gseGO(geneList=bulk_GSEA,ont="ALL",OrgDb=organism,keyType="SYMBOL",pvalueCutoff=1)
+    bulk_GSEA@result$log10Psign <- ifelse(bulk_GSEA@result$NES>0,-log10(bulk_GSEA@result$pvalue),log10(bulk_GSEA@result$pvalue))
+    
+    #SC
+    tmp <- scres[,grep("signlogP",colnames(scres))]
+    res1 <- apply(tmp,2,getGSEA,rownames(scres),"ALL",organism,bulk_GSEA)
+    
+    #results
+    res1_1 <- as.data.frame(lapply(res1,function(x) cor.test(x@result$log10Psign,bulk_GSEA@result$log10Psign,method="spearman")$estimate ) )
+    res1_2 <- as.data.frame(lapply(res1,function(x) cor.test(x@result[bulk_GSEA@result$pvalue<=0.05,]$log10Psign,bulk_GSEA@result[bulk_GSEA@result$pvalue<=0.05,]$log10Psign,method="spearman")$estimate ) )
+    res1_3 <- as.data.frame(lapply(res1,function(x) cor.test(x@result[bulk_GSEA@result$pvalue<=0.005,]$log10Psign,bulk_GSEA@result[bulk_GSEA@result$pvalue<=0.005,]$log10Psign,method="spearman")$estimate ) )
+    res_all <- rbind(res1_1,res1_2,res1_3)
+    res_all <- as.data.frame(t(res_all))
+    
+    res1_cut <- lapply(res1,function(x) x@result[,c("ONTOLOGY","NES","pvalue","p.adjust","log10Psign")] )
+    
+    #save to list
+    res_enrich[[bulkname]] <- bulk_GSEA
+    res_enrich[[scname]] <- res1_cut
+    res_enrich[[paste0("result",y)]] <- res_all
+}
+
+saveRDS(res_enrich,"results/SC_Bulk_DE_GSEAenrichment/GSEAenrich_CanoGamez2020_memory_iTreg_MAST_signlog10P.rds")
+```
+
+#### logFC
+```{r}
+res_enrich <- list()
+organism <- "org.Hs.eg.db"
+
+for(y in Compare_names){
+    bulkname <- paste0("bulk",y)
+    scname <- paste0("sc",y)
+    bulkres <- DE_res[[bulkname]]
+    scres <- DE_res[[scname]]
+    bulk_GSEA <- bulkres$logFC
+    names(bulk_GSEA) <- rownames(bulkres)
+    bulk_GSEA <- sort(bulk_GSEA,decreasing=TRUE)
+    bulk_GSEA <- gseGO(geneList=bulk_GSEA,ont="ALL",OrgDb=organism,keyType="SYMBOL",pvalueCutoff=1)
+    bulk_GSEA@result$log10Psign <- ifelse(bulk_GSEA@result$NES>0,-log10(bulk_GSEA@result$pvalue),log10(bulk_GSEA@result$pvalue))
+    
+    #SC
+    tmp <- scres[,grep("logFC",colnames(scres))]
+    res1 <- apply(tmp,2,getGSEA,rownames(scres),"ALL",organism,bulk_GSEA)
+    
+    #results
+    res1_1 <- as.data.frame(lapply(res1,function(x) cor.test(x@result$log10Psign,bulk_GSEA@result$log10Psign,method="spearman")$estimate ) )
+    res1_2 <- as.data.frame(lapply(res1,function(x) cor.test(x@result[bulk_GSEA@result$pvalue<=0.05,]$log10Psign,bulk_GSEA@result[bulk_GSEA@result$pvalue<=0.05,]$log10Psign,method="spearman")$estimate ) )
+    res1_3 <- as.data.frame(lapply(res1,function(x) cor.test(x@result[bulk_GSEA@result$pvalue<=0.005,]$log10Psign,bulk_GSEA@result[bulk_GSEA@result$pvalue<=0.005,]$log10Psign,method="spearman")$estimate ) )
+    res_all <- rbind(res1_1,res1_2,res1_3)
+    res_all <- as.data.frame(t(res_all))
+    
+    res1_cut <- lapply(res1,function(x) x@result[,c("ONTOLOGY","NES","pvalue","p.adjust","log10Psign")] )
+    
+    #save to list
+    res_enrich[[bulkname]] <- bulk_GSEA
+    res_enrich[[scname]] <- res1_cut
+    res_enrich[[paste0("result",y)]] <- res_all
+}
+
+saveRDS(res_enrich,"results/SC_Bulk_DE_GSEAenrichment/GSEAenrich_CanoGamez2020_memory_iTreg_MAST_logFC.rds")
+```
+
+
+
+### PBlimma
+```{r}
+DE_res <- readRDS("results/SC_Bulk_DEresults/Bulk_SC_SpearCor_DEresults_PBlimma_CanoGamez2020_memory_iTreg.rds")
+Compare_names <- unique(sapply(names(DE_res),function(x) strsplit(x,"bulk|sc")[[1]][2] ))
+```
+
+#### sign -log10P
+```{r message=FALSE}
+res_enrich <- list()
+organism <- "org.Hs.eg.db"
+
+for(y in Compare_names){
+    bulkname <- paste0("bulk",y)
+    scname <- paste0("sc",y)
+    bulkres <- DE_res[[bulkname]]
+    scres <- DE_res[[scname]]
+    bulk_GSEA <- bulkres$signlogP
+    names(bulk_GSEA) <- rownames(bulkres)
+    bulk_GSEA <- sort(bulk_GSEA,decreasing=TRUE)
+    bulk_GSEA <- gseGO(geneList=bulk_GSEA,ont="ALL",OrgDb=organism,keyType="SYMBOL",pvalueCutoff=1)
+    bulk_GSEA@result$log10Psign <- ifelse(bulk_GSEA@result$NES>0,-log10(bulk_GSEA@result$pvalue),log10(bulk_GSEA@result$pvalue))
+    
+    #SC
+    tmp <- scres[,grep("signlogP",colnames(scres))]
+    res1 <- apply(tmp,2,getGSEA,rownames(scres),"ALL",organism,bulk_GSEA)
+    
+    #results
+    res1_1 <- as.data.frame(lapply(res1,function(x) cor.test(x@result$log10Psign,bulk_GSEA@result$log10Psign,method="spearman")$estimate ) )
+    res1_2 <- as.data.frame(lapply(res1,function(x) cor.test(x@result[bulk_GSEA@result$pvalue<=0.05,]$log10Psign,bulk_GSEA@result[bulk_GSEA@result$pvalue<=0.05,]$log10Psign,method="spearman")$estimate ) )
+    res1_3 <- as.data.frame(lapply(res1,function(x) cor.test(x@result[bulk_GSEA@result$pvalue<=0.005,]$log10Psign,bulk_GSEA@result[bulk_GSEA@result$pvalue<=0.005,]$log10Psign,method="spearman")$estimate ) )
+    res_all <- rbind(res1_1,res1_2,res1_3)
+    res_all <- as.data.frame(t(res_all))
+    
+    res1_cut <- lapply(res1,function(x) x@result[,c("ONTOLOGY","NES","pvalue","p.adjust","log10Psign")] )
+    
+    #save to list
+    res_enrich[[bulkname]] <- bulk_GSEA
+    res_enrich[[scname]] <- res1_cut
+    res_enrich[[paste0("result",y)]] <- res_all
+}
+
+saveRDS(res_enrich,"results/SC_Bulk_DE_GSEAenrichment/GSEAenrich_CanoGamez2020_memory_iTreg_PBlimma_signlog10P.rds")
+```
+
+#### logFC
+```{r}
+res_enrich <- list()
+organism <- "org.Hs.eg.db"
+
+for(y in Compare_names){
+    bulkname <- paste0("bulk",y)
+    scname <- paste0("sc",y)
+    bulkres <- DE_res[[bulkname]]
+    scres <- DE_res[[scname]]
+    bulk_GSEA <- bulkres$logFC
+    names(bulk_GSEA) <- rownames(bulkres)
+    bulk_GSEA <- sort(bulk_GSEA,decreasing=TRUE)
+    bulk_GSEA <- gseGO(geneList=bulk_GSEA,ont="ALL",OrgDb=organism,keyType="SYMBOL",pvalueCutoff=1)
+    bulk_GSEA@result$log10Psign <- ifelse(bulk_GSEA@result$NES>0,-log10(bulk_GSEA@result$pvalue),log10(bulk_GSEA@result$pvalue))
+    
+    #SC
+    tmp <- scres[,grep("logFC",colnames(scres))]
+    res1 <- apply(tmp,2,getGSEA,rownames(scres),"ALL",organism,bulk_GSEA)
+    
+    #results
+    res1_1 <- as.data.frame(lapply(res1,function(x) cor.test(x@result$log10Psign,bulk_GSEA@result$log10Psign,method="spearman")$estimate ) )
+    res1_2 <- as.data.frame(lapply(res1,function(x) cor.test(x@result[bulk_GSEA@result$pvalue<=0.05,]$log10Psign,bulk_GSEA@result[bulk_GSEA@result$pvalue<=0.05,]$log10Psign,method="spearman")$estimate ) )
+    res1_3 <- as.data.frame(lapply(res1,function(x) cor.test(x@result[bulk_GSEA@result$pvalue<=0.005,]$log10Psign,bulk_GSEA@result[bulk_GSEA@result$pvalue<=0.005,]$log10Psign,method="spearman")$estimate ) )
+    res_all <- rbind(res1_1,res1_2,res1_3)
+    res_all <- as.data.frame(t(res_all))
+    
+    res1_cut <- lapply(res1,function(x) x@result[,c("ONTOLOGY","NES","pvalue","p.adjust","log10Psign")] )
+    
+    #save to list
+    res_enrich[[bulkname]] <- bulk_GSEA
+    res_enrich[[scname]] <- res1_cut
+    res_enrich[[paste0("result",y)]] <- res_all
+}
+
+saveRDS(res_enrich,"results/SC_Bulk_DE_GSEAenrichment/GSEAenrich_CanoGamez2020_memory_iTreg_PBlimma_logFC.rds")
+```
+
+
+
+## CanoGamez2020_memory_Th0
+### sc RST
+```{r}
+DE_res <- readRDS("results/SC_Bulk_DEresults/Bulk_SC_SpearCor_DEresults_RST_CanoGamez2020_memory_Th0.rds")
+Compare_names <- unique(sapply(names(DE_res),function(x) strsplit(x,"bulk|sc")[[1]][2] ))
+```
+
+#### sign -log10P
+```{r message=FALSE, warning=FALSE}
+res_enrich <- list()
+organism <- "org.Hs.eg.db"
+
+for(y in Compare_names){
+    bulkname <- paste0("bulk",y)
+    scname <- paste0("sc",y)
+    bulkres <- DE_res[[bulkname]]
+    scres <- DE_res[[scname]]
+    bulk_GSEA <- bulkres$signlogP
+    names(bulk_GSEA) <- rownames(bulkres)
+    
+    bulk_GSEA <- sort(bulk_GSEA,decreasing=TRUE)
+    bulk_GSEA <- gseGO(geneList=bulk_GSEA,ont="ALL",OrgDb=organism,keyType="SYMBOL",pvalueCutoff=1)
+    bulk_GSEA@result$log10Psign <- ifelse(bulk_GSEA@result$NES>0,-log10(bulk_GSEA@result$pvalue),log10(bulk_GSEA@result$pvalue))
+    
+    #SC
+    tmp <- scres[,grep("signlogP",colnames(scres))]
+    #tmp <- tmp[GeneSymbol$SYMBOL,]
+    #rownames(tmp) <- GeneSymbol$ENSEMBL
+    res1 <- apply(tmp,2,getGSEA,rownames(tmp),"ALL",organism,bulk_GSEA)
+    
+    #results
+    res1_1 <- as.data.frame(lapply(res1,function(x) cor.test(x@result$log10Psign,bulk_GSEA@result$log10Psign,method="spearman")$estimate ) )
+    res1_2 <- as.data.frame(lapply(res1,function(x) cor.test(x@result[bulk_GSEA@result$pvalue<=0.05,]$log10Psign,bulk_GSEA@result[bulk_GSEA@result$pvalue<=0.05,]$log10Psign,method="spearman")$estimate ) )
+    res1_3 <- as.data.frame(lapply(res1,function(x) cor.test(x@result[bulk_GSEA@result$pvalue<=0.005,]$log10Psign,bulk_GSEA@result[bulk_GSEA@result$pvalue<=0.005,]$log10Psign,method="spearman")$estimate ) )
+    res_all <- rbind(res1_1,res1_2,res1_3)
+    res_all <- as.data.frame(t(res_all))
+    
+    res1_cut <- lapply(res1,function(x) x@result[,c("ONTOLOGY","NES","pvalue","p.adjust","log10Psign")] )
+    
+    #save to list
+    res_enrich[[bulkname]] <- bulk_GSEA
+    res_enrich[[scname]] <- res1_cut
+    res_enrich[[paste0("result",y)]] <- res_all
+}
+
+saveRDS(res_enrich,"results/SC_Bulk_DE_GSEAenrichment/GSEAenrich_CanoGamez2020_memory_Th0_scRST_signlog10P.rds")
+```
+
+### sc MAST
+```{r}
+DE_res <- readRDS("results/SC_Bulk_DEresults/Bulk_SC_SpearCor_DEresults_MAST_CanoGamez2020_memory_Th0.rds")
+Compare_names <- unique(sapply(names(DE_res),function(x) strsplit(x,"bulk|sc")[[1]][2] ))
+```
+
+#### sign -log10P
+```{r message=FALSE}
+res_enrich <- list()
+organism <- "org.Hs.eg.db"
+
+for(y in Compare_names){
+    bulkname <- paste0("bulk",y)
+    scname <- paste0("sc",y)
+    bulkres <- DE_res[[bulkname]]
+    scres <- DE_res[[scname]]
+    bulk_GSEA <- bulkres$signlogP
+    names(bulk_GSEA) <- rownames(bulkres)
+    bulk_GSEA <- sort(bulk_GSEA,decreasing=TRUE)
+    bulk_GSEA <- gseGO(geneList=bulk_GSEA,ont="ALL",OrgDb=organism,keyType="SYMBOL",pvalueCutoff=1)
+    bulk_GSEA@result$log10Psign <- ifelse(bulk_GSEA@result$NES>0,-log10(bulk_GSEA@result$pvalue),log10(bulk_GSEA@result$pvalue))
+    
+    #SC
+    tmp <- scres[,grep("signlogP",colnames(scres))]
+    res1 <- apply(tmp,2,getGSEA,rownames(scres),"ALL",organism,bulk_GSEA)
+    
+    #results
+    res1_1 <- as.data.frame(lapply(res1,function(x) cor.test(x@result$log10Psign,bulk_GSEA@result$log10Psign,method="spearman")$estimate ) )
+    res1_2 <- as.data.frame(lapply(res1,function(x) cor.test(x@result[bulk_GSEA@result$pvalue<=0.05,]$log10Psign,bulk_GSEA@result[bulk_GSEA@result$pvalue<=0.05,]$log10Psign,method="spearman")$estimate ) )
+    res1_3 <- as.data.frame(lapply(res1,function(x) cor.test(x@result[bulk_GSEA@result$pvalue<=0.005,]$log10Psign,bulk_GSEA@result[bulk_GSEA@result$pvalue<=0.005,]$log10Psign,method="spearman")$estimate ) )
+    res_all <- rbind(res1_1,res1_2,res1_3)
+    res_all <- as.data.frame(t(res_all))
+    
+    res1_cut <- lapply(res1,function(x) x@result[,c("ONTOLOGY","NES","pvalue","p.adjust","log10Psign")] )
+    
+    #save to list
+    res_enrich[[bulkname]] <- bulk_GSEA
+    res_enrich[[scname]] <- res1_cut
+    res_enrich[[paste0("result",y)]] <- res_all
+}
+
+saveRDS(res_enrich,"results/SC_Bulk_DE_GSEAenrichment/GSEAenrich_CanoGamez2020_memory_Th0_MAST_signlog10P.rds")
+```
+
+#### logFC
+```{r}
+res_enrich <- list()
+organism <- "org.Hs.eg.db"
+
+for(y in Compare_names){
+    bulkname <- paste0("bulk",y)
+    scname <- paste0("sc",y)
+    bulkres <- DE_res[[bulkname]]
+    scres <- DE_res[[scname]]
+    bulk_GSEA <- bulkres$logFC
+    names(bulk_GSEA) <- rownames(bulkres)
+    bulk_GSEA <- sort(bulk_GSEA,decreasing=TRUE)
+    bulk_GSEA <- gseGO(geneList=bulk_GSEA,ont="ALL",OrgDb=organism,keyType="SYMBOL",pvalueCutoff=1)
+    bulk_GSEA@result$log10Psign <- ifelse(bulk_GSEA@result$NES>0,-log10(bulk_GSEA@result$pvalue),log10(bulk_GSEA@result$pvalue))
+    
+    #SC
+    tmp <- scres[,grep("logFC",colnames(scres))]
+    res1 <- apply(tmp,2,getGSEA,rownames(scres),"ALL",organism,bulk_GSEA)
+    
+    #results
+    res1_1 <- as.data.frame(lapply(res1,function(x) cor.test(x@result$log10Psign,bulk_GSEA@result$log10Psign,method="spearman")$estimate ) )
+    res1_2 <- as.data.frame(lapply(res1,function(x) cor.test(x@result[bulk_GSEA@result$pvalue<=0.05,]$log10Psign,bulk_GSEA@result[bulk_GSEA@result$pvalue<=0.05,]$log10Psign,method="spearman")$estimate ) )
+    res1_3 <- as.data.frame(lapply(res1,function(x) cor.test(x@result[bulk_GSEA@result$pvalue<=0.005,]$log10Psign,bulk_GSEA@result[bulk_GSEA@result$pvalue<=0.005,]$log10Psign,method="spearman")$estimate ) )
+    res_all <- rbind(res1_1,res1_2,res1_3)
+    res_all <- as.data.frame(t(res_all))
+    
+    res1_cut <- lapply(res1,function(x) x@result[,c("ONTOLOGY","NES","pvalue","p.adjust","log10Psign")] )
+    
+    #save to list
+    res_enrich[[bulkname]] <- bulk_GSEA
+    res_enrich[[scname]] <- res1_cut
+    res_enrich[[paste0("result",y)]] <- res_all
+}
+
+saveRDS(res_enrich,"results/SC_Bulk_DE_GSEAenrichment/GSEAenrich_CanoGamez2020_memory_Th0_MAST_logFC.rds")
+```
+
+### PBlimma
+```{r}
+DE_res <- readRDS("results/SC_Bulk_DEresults/Bulk_SC_SpearCor_DEresults_PBlimma_CanoGamez2020_memory_Th0.rds")
+Compare_names <- unique(sapply(names(DE_res),function(x) strsplit(x,"bulk|sc")[[1]][2] ))
+```
+
+#### sign -log10P
+```{r message=FALSE}
+res_enrich <- list()
+organism <- "org.Hs.eg.db"
+
+for(y in Compare_names){
+    bulkname <- paste0("bulk",y)
+    scname <- paste0("sc",y)
+    bulkres <- DE_res[[bulkname]]
+    scres <- DE_res[[scname]]
+    bulk_GSEA <- bulkres$signlogP
+    names(bulk_GSEA) <- rownames(bulkres)
+    bulk_GSEA <- sort(bulk_GSEA,decreasing=TRUE)
+    bulk_GSEA <- gseGO(geneList=bulk_GSEA,ont="ALL",OrgDb=organism,keyType="SYMBOL",pvalueCutoff=1)
+    bulk_GSEA@result$log10Psign <- ifelse(bulk_GSEA@result$NES>0,-log10(bulk_GSEA@result$pvalue),log10(bulk_GSEA@result$pvalue))
+    
+    #SC
+    tmp <- scres[,grep("signlogP",colnames(scres))]
+    res1 <- apply(tmp,2,getGSEA,rownames(scres),"ALL",organism,bulk_GSEA)
+    
+    #results
+    res1_1 <- as.data.frame(lapply(res1,function(x) cor.test(x@result$log10Psign,bulk_GSEA@result$log10Psign,method="spearman")$estimate ) )
+    res1_2 <- as.data.frame(lapply(res1,function(x) cor.test(x@result[bulk_GSEA@result$pvalue<=0.05,]$log10Psign,bulk_GSEA@result[bulk_GSEA@result$pvalue<=0.05,]$log10Psign,method="spearman")$estimate ) )
+    res1_3 <- as.data.frame(lapply(res1,function(x) cor.test(x@result[bulk_GSEA@result$pvalue<=0.005,]$log10Psign,bulk_GSEA@result[bulk_GSEA@result$pvalue<=0.005,]$log10Psign,method="spearman")$estimate ) )
+    res_all <- rbind(res1_1,res1_2,res1_3)
+    res_all <- as.data.frame(t(res_all))
+    
+    res1_cut <- lapply(res1,function(x) x@result[,c("ONTOLOGY","NES","pvalue","p.adjust","log10Psign")] )
+    
+    #save to list
+    res_enrich[[bulkname]] <- bulk_GSEA
+    res_enrich[[scname]] <- res1_cut
+    res_enrich[[paste0("result",y)]] <- res_all
+}
+
+saveRDS(res_enrich,"results/SC_Bulk_DE_GSEAenrichment/GSEAenrich_CanoGamez2020_memory_Th0_PBlimma_signlog10P.rds")
+```
+
+#### logFC
+```{r}
+res_enrich <- list()
+organism <- "org.Hs.eg.db"
+
+for(y in Compare_names){
+    bulkname <- paste0("bulk",y)
+    scname <- paste0("sc",y)
+    bulkres <- DE_res[[bulkname]]
+    scres <- DE_res[[scname]]
+    bulk_GSEA <- bulkres$logFC
+    names(bulk_GSEA) <- rownames(bulkres)
+    bulk_GSEA <- sort(bulk_GSEA,decreasing=TRUE)
+    bulk_GSEA <- gseGO(geneList=bulk_GSEA,ont="ALL",OrgDb=organism,keyType="SYMBOL",pvalueCutoff=1)
+    bulk_GSEA@result$log10Psign <- ifelse(bulk_GSEA@result$NES>0,-log10(bulk_GSEA@result$pvalue),log10(bulk_GSEA@result$pvalue))
+    
+    #SC
+    tmp <- scres[,grep("logFC",colnames(scres))]
+    res1 <- apply(tmp,2,getGSEA,rownames(scres),"ALL",organism,bulk_GSEA)
+    
+    #results
+    res1_1 <- as.data.frame(lapply(res1,function(x) cor.test(x@result$log10Psign,bulk_GSEA@result$log10Psign,method="spearman")$estimate ) )
+    res1_2 <- as.data.frame(lapply(res1,function(x) cor.test(x@result[bulk_GSEA@result$pvalue<=0.05,]$log10Psign,bulk_GSEA@result[bulk_GSEA@result$pvalue<=0.05,]$log10Psign,method="spearman")$estimate ) )
+    res1_3 <- as.data.frame(lapply(res1,function(x) cor.test(x@result[bulk_GSEA@result$pvalue<=0.005,]$log10Psign,bulk_GSEA@result[bulk_GSEA@result$pvalue<=0.005,]$log10Psign,method="spearman")$estimate ) )
+    res_all <- rbind(res1_1,res1_2,res1_3)
+    res_all <- as.data.frame(t(res_all))
+    
+    res1_cut <- lapply(res1,function(x) x@result[,c("ONTOLOGY","NES","pvalue","p.adjust","log10Psign")] )
+    
+    #save to list
+    res_enrich[[bulkname]] <- bulk_GSEA
+    res_enrich[[scname]] <- res1_cut
+    res_enrich[[paste0("result",y)]] <- res_all
+}
+
+saveRDS(res_enrich,"results/SC_Bulk_DE_GSEAenrichment/GSEAenrich_CanoGamez2020_memory_Th0_PBlimma_logFC.rds")
+```
+
+## CanoGamez2020_memory_Th2
+### sc RST
+```{r}
+DE_res <- readRDS("results/SC_Bulk_DEresults/Bulk_SC_SpearCor_DEresults_RST_CanoGamez2020_memory_Th2.rds")
+Compare_names <- unique(sapply(names(DE_res),function(x) strsplit(x,"bulk|sc")[[1]][2] ))
+```
+
+#### sign -log10P
+```{r message=FALSE, warning=FALSE}
+res_enrich <- list()
+organism <- "org.Hs.eg.db"
+
+for(y in Compare_names){
+    bulkname <- paste0("bulk",y)
+    scname <- paste0("sc",y)
+    bulkres <- DE_res[[bulkname]]
+    scres <- DE_res[[scname]]
+    bulk_GSEA <- bulkres$signlogP
+    names(bulk_GSEA) <- rownames(bulkres)
+    
+    bulk_GSEA <- sort(bulk_GSEA,decreasing=TRUE)
+    bulk_GSEA <- gseGO(geneList=bulk_GSEA,ont="ALL",OrgDb=organism,keyType="SYMBOL",pvalueCutoff=1)
+    bulk_GSEA@result$log10Psign <- ifelse(bulk_GSEA@result$NES>0,-log10(bulk_GSEA@result$pvalue),log10(bulk_GSEA@result$pvalue))
+    
+    #SC
+    tmp <- scres[,grep("signlogP",colnames(scres))]
+    #tmp <- tmp[GeneSymbol$SYMBOL,]
+    #rownames(tmp) <- GeneSymbol$ENSEMBL
+    res1 <- apply(tmp,2,getGSEA,rownames(tmp),"ALL",organism,bulk_GSEA)
+    
+    #results
+    res1_1 <- as.data.frame(lapply(res1,function(x) cor.test(x@result$log10Psign,bulk_GSEA@result$log10Psign,method="spearman")$estimate ) )
+    res1_2 <- as.data.frame(lapply(res1,function(x) cor.test(x@result[bulk_GSEA@result$pvalue<=0.05,]$log10Psign,bulk_GSEA@result[bulk_GSEA@result$pvalue<=0.05,]$log10Psign,method="spearman")$estimate ) )
+    res1_3 <- as.data.frame(lapply(res1,function(x) cor.test(x@result[bulk_GSEA@result$pvalue<=0.005,]$log10Psign,bulk_GSEA@result[bulk_GSEA@result$pvalue<=0.005,]$log10Psign,method="spearman")$estimate ) )
+    res_all <- rbind(res1_1,res1_2,res1_3)
+    res_all <- as.data.frame(t(res_all))
+    
+    res1_cut <- lapply(res1,function(x) x@result[,c("ONTOLOGY","NES","pvalue","p.adjust","log10Psign")] )
+    
+    #save to list
+    res_enrich[[bulkname]] <- bulk_GSEA
+    res_enrich[[scname]] <- res1_cut
+    res_enrich[[paste0("result",y)]] <- res_all
+}
+
+saveRDS(res_enrich,"results/SC_Bulk_DE_GSEAenrichment/GSEAenrich_CanoGamez2020_memory_Th2_scRST_signlog10P.rds")
+```
+
+### sc MAST
+```{r}
+DE_res <- readRDS("results/SC_Bulk_DEresults/Bulk_SC_SpearCor_DEresults_MAST_CanoGamez2020_memory_Th2.rds")
+Compare_names <- unique(sapply(names(DE_res),function(x) strsplit(x,"bulk|sc")[[1]][2] ))
+```
+
+#### sign -log10P
+```{r message=FALSE}
+res_enrich <- list()
+organism <- "org.Hs.eg.db"
+
+for(y in Compare_names){
+    bulkname <- paste0("bulk",y)
+    scname <- paste0("sc",y)
+    bulkres <- DE_res[[bulkname]]
+    scres <- DE_res[[scname]]
+    bulk_GSEA <- bulkres$signlogP
+    names(bulk_GSEA) <- rownames(bulkres)
+    bulk_GSEA <- sort(bulk_GSEA,decreasing=TRUE)
+    bulk_GSEA <- gseGO(geneList=bulk_GSEA,ont="ALL",OrgDb=organism,keyType="SYMBOL",pvalueCutoff=1)
+    bulk_GSEA@result$log10Psign <- ifelse(bulk_GSEA@result$NES>0,-log10(bulk_GSEA@result$pvalue),log10(bulk_GSEA@result$pvalue))
+    
+    #SC
+    tmp <- scres[,grep("signlogP",colnames(scres))]
+    res1 <- apply(tmp,2,getGSEA,rownames(scres),"ALL",organism,bulk_GSEA)
+    
+    #results
+    res1_1 <- as.data.frame(lapply(res1,function(x) cor.test(x@result$log10Psign,bulk_GSEA@result$log10Psign,method="spearman")$estimate ) )
+    res1_2 <- as.data.frame(lapply(res1,function(x) cor.test(x@result[bulk_GSEA@result$pvalue<=0.05,]$log10Psign,bulk_GSEA@result[bulk_GSEA@result$pvalue<=0.05,]$log10Psign,method="spearman")$estimate ) )
+    res1_3 <- as.data.frame(lapply(res1,function(x) cor.test(x@result[bulk_GSEA@result$pvalue<=0.005,]$log10Psign,bulk_GSEA@result[bulk_GSEA@result$pvalue<=0.005,]$log10Psign,method="spearman")$estimate ) )
+    res_all <- rbind(res1_1,res1_2,res1_3)
+    res_all <- as.data.frame(t(res_all))
+    
+    res1_cut <- lapply(res1,function(x) x@result[,c("ONTOLOGY","NES","pvalue","p.adjust","log10Psign")] )
+    
+    #save to list
+    res_enrich[[bulkname]] <- bulk_GSEA
+    res_enrich[[scname]] <- res1_cut
+    res_enrich[[paste0("result",y)]] <- res_all
+}
+
+saveRDS(res_enrich,"results/SC_Bulk_DE_GSEAenrichment/GSEAenrich_CanoGamez2020_memory_Th2_MAST_signlog10P.rds")
+```
+
+#### logFC
+```{r}
+res_enrich <- list()
+organism <- "org.Hs.eg.db"
+
+for(y in Compare_names){
+    bulkname <- paste0("bulk",y)
+    scname <- paste0("sc",y)
+    bulkres <- DE_res[[bulkname]]
+    scres <- DE_res[[scname]]
+    bulk_GSEA <- bulkres$logFC
+    names(bulk_GSEA) <- rownames(bulkres)
+    bulk_GSEA <- sort(bulk_GSEA,decreasing=TRUE)
+    bulk_GSEA <- gseGO(geneList=bulk_GSEA,ont="ALL",OrgDb=organism,keyType="SYMBOL",pvalueCutoff=1)
+    bulk_GSEA@result$log10Psign <- ifelse(bulk_GSEA@result$NES>0,-log10(bulk_GSEA@result$pvalue),log10(bulk_GSEA@result$pvalue))
+    
+    #SC
+    tmp <- scres[,grep("logFC",colnames(scres))]
+    res1 <- apply(tmp,2,getGSEA,rownames(scres),"ALL",organism,bulk_GSEA)
+    
+    #results
+    res1_1 <- as.data.frame(lapply(res1,function(x) cor.test(x@result$log10Psign,bulk_GSEA@result$log10Psign,method="spearman")$estimate ) )
+    res1_2 <- as.data.frame(lapply(res1,function(x) cor.test(x@result[bulk_GSEA@result$pvalue<=0.05,]$log10Psign,bulk_GSEA@result[bulk_GSEA@result$pvalue<=0.05,]$log10Psign,method="spearman")$estimate ) )
+    res1_3 <- as.data.frame(lapply(res1,function(x) cor.test(x@result[bulk_GSEA@result$pvalue<=0.005,]$log10Psign,bulk_GSEA@result[bulk_GSEA@result$pvalue<=0.005,]$log10Psign,method="spearman")$estimate ) )
+    res_all <- rbind(res1_1,res1_2,res1_3)
+    res_all <- as.data.frame(t(res_all))
+    
+    res1_cut <- lapply(res1,function(x) x@result[,c("ONTOLOGY","NES","pvalue","p.adjust","log10Psign")] )
+    
+    #save to list
+    res_enrich[[bulkname]] <- bulk_GSEA
+    res_enrich[[scname]] <- res1_cut
+    res_enrich[[paste0("result",y)]] <- res_all
+}
+
+saveRDS(res_enrich,"results/SC_Bulk_DE_GSEAenrichment/GSEAenrich_CanoGamez2020_memory_Th2_MAST_logFC.rds")
+```
+
+
+
+### PBlimma
+```{r}
+DE_res <- readRDS("results/SC_Bulk_DEresults/Bulk_SC_SpearCor_DEresults_PBlimma_CanoGamez2020_memory_Th2.rds")
+Compare_names <- unique(sapply(names(DE_res),function(x) strsplit(x,"bulk|sc")[[1]][2] ))
+```
+
+#### sign -log10P
+```{r message=FALSE}
+res_enrich <- list()
+organism <- "org.Hs.eg.db"
+
+for(y in Compare_names){
+    bulkname <- paste0("bulk",y)
+    scname <- paste0("sc",y)
+    bulkres <- DE_res[[bulkname]]
+    scres <- DE_res[[scname]]
+    bulk_GSEA <- bulkres$signlogP
+    names(bulk_GSEA) <- rownames(bulkres)
+    bulk_GSEA <- sort(bulk_GSEA,decreasing=TRUE)
+    bulk_GSEA <- gseGO(geneList=bulk_GSEA,ont="ALL",OrgDb=organism,keyType="SYMBOL",pvalueCutoff=1)
+    bulk_GSEA@result$log10Psign <- ifelse(bulk_GSEA@result$NES>0,-log10(bulk_GSEA@result$pvalue),log10(bulk_GSEA@result$pvalue))
+    
+    #SC
+    tmp <- scres[,grep("signlogP",colnames(scres))]
+    res1 <- apply(tmp,2,getGSEA,rownames(scres),"ALL",organism,bulk_GSEA)
+    
+    #results
+    res1_1 <- as.data.frame(lapply(res1,function(x) cor.test(x@result$log10Psign,bulk_GSEA@result$log10Psign,method="spearman")$estimate ) )
+    res1_2 <- as.data.frame(lapply(res1,function(x) cor.test(x@result[bulk_GSEA@result$pvalue<=0.05,]$log10Psign,bulk_GSEA@result[bulk_GSEA@result$pvalue<=0.05,]$log10Psign,method="spearman")$estimate ) )
+    res1_3 <- as.data.frame(lapply(res1,function(x) cor.test(x@result[bulk_GSEA@result$pvalue<=0.005,]$log10Psign,bulk_GSEA@result[bulk_GSEA@result$pvalue<=0.005,]$log10Psign,method="spearman")$estimate ) )
+    res_all <- rbind(res1_1,res1_2,res1_3)
+    res_all <- as.data.frame(t(res_all))
+    
+    res1_cut <- lapply(res1,function(x) x@result[,c("ONTOLOGY","NES","pvalue","p.adjust","log10Psign")] )
+    
+    #save to list
+    res_enrich[[bulkname]] <- bulk_GSEA
+    res_enrich[[scname]] <- res1_cut
+    res_enrich[[paste0("result",y)]] <- res_all
+}
+
+saveRDS(res_enrich,"results/SC_Bulk_DE_GSEAenrichment/GSEAenrich_CanoGamez2020_memory_Th2_PBlimma_signlog10P.rds")
+```
+
+#### logFC
+```{r}
+res_enrich <- list()
+organism <- "org.Hs.eg.db"
+
+for(y in Compare_names){
+    bulkname <- paste0("bulk",y)
+    scname <- paste0("sc",y)
+    bulkres <- DE_res[[bulkname]]
+    scres <- DE_res[[scname]]
+    bulk_GSEA <- bulkres$logFC
+    names(bulk_GSEA) <- rownames(bulkres)
+    bulk_GSEA <- sort(bulk_GSEA,decreasing=TRUE)
+    bulk_GSEA <- gseGO(geneList=bulk_GSEA,ont="ALL",OrgDb=organism,keyType="SYMBOL",pvalueCutoff=1)
+    bulk_GSEA@result$log10Psign <- ifelse(bulk_GSEA@result$NES>0,-log10(bulk_GSEA@result$pvalue),log10(bulk_GSEA@result$pvalue))
+    
+    #SC
+    tmp <- scres[,grep("logFC",colnames(scres))]
+    res1 <- apply(tmp,2,getGSEA,rownames(scres),"ALL",organism,bulk_GSEA)
+    
+    #results
+    res1_1 <- as.data.frame(lapply(res1,function(x) cor.test(x@result$log10Psign,bulk_GSEA@result$log10Psign,method="spearman")$estimate ) )
+    res1_2 <- as.data.frame(lapply(res1,function(x) cor.test(x@result[bulk_GSEA@result$pvalue<=0.05,]$log10Psign,bulk_GSEA@result[bulk_GSEA@result$pvalue<=0.05,]$log10Psign,method="spearman")$estimate ) )
+    res1_3 <- as.data.frame(lapply(res1,function(x) cor.test(x@result[bulk_GSEA@result$pvalue<=0.005,]$log10Psign,bulk_GSEA@result[bulk_GSEA@result$pvalue<=0.005,]$log10Psign,method="spearman")$estimate ) )
+    res_all <- rbind(res1_1,res1_2,res1_3)
+    res_all <- as.data.frame(t(res_all))
+    
+    res1_cut <- lapply(res1,function(x) x@result[,c("ONTOLOGY","NES","pvalue","p.adjust","log10Psign")] )
+    
+    #save to list
+    res_enrich[[bulkname]] <- bulk_GSEA
+    res_enrich[[scname]] <- res1_cut
+    res_enrich[[paste0("result",y)]] <- res_all
+}
+
+saveRDS(res_enrich,"results/SC_Bulk_DE_GSEAenrichment/GSEAenrich_CanoGamez2020_memory_Th2_PBlimma_logFC.rds")
+```
+
+
+## CanoGamez2020_naive_iTreg
+### sc RST
+```{r}
+DE_res <- readRDS("results/SC_Bulk_DEresults/Bulk_SC_SpearCor_DEresults_RST_CanoGamez2020_naive_iTreg.rds")
+Compare_names <- unique(sapply(names(DE_res),function(x) strsplit(x,"bulk|sc")[[1]][2] ))
+```
+
+#### sign -log10P
+```{r message=FALSE, warning=FALSE}
+res_enrich <- list()
+organism <- "org.Hs.eg.db"
+
+for(y in Compare_names){
+    bulkname <- paste0("bulk",y)
+    scname <- paste0("sc",y)
+    bulkres <- DE_res[[bulkname]]
+    scres <- DE_res[[scname]]
+    bulk_GSEA <- bulkres$signlogP
+    names(bulk_GSEA) <- rownames(bulkres)
+    
+    bulk_GSEA <- sort(bulk_GSEA,decreasing=TRUE)
+    bulk_GSEA <- gseGO(geneList=bulk_GSEA,ont="ALL",OrgDb=organism,keyType="SYMBOL",pvalueCutoff=1)
+    bulk_GSEA@result$log10Psign <- ifelse(bulk_GSEA@result$NES>0,-log10(bulk_GSEA@result$pvalue),log10(bulk_GSEA@result$pvalue))
+    
+    #SC
+    tmp <- scres[,grep("signlogP",colnames(scres))]
+    #tmp <- tmp[GeneSymbol$SYMBOL,]
+    #rownames(tmp) <- GeneSymbol$ENSEMBL
+    res1 <- apply(tmp,2,getGSEA,rownames(tmp),"ALL",organism,bulk_GSEA)
+    
+    #results
+    res1_1 <- as.data.frame(lapply(res1,function(x) cor.test(x@result$log10Psign,bulk_GSEA@result$log10Psign,method="spearman")$estimate ) )
+    res1_2 <- as.data.frame(lapply(res1,function(x) cor.test(x@result[bulk_GSEA@result$pvalue<=0.05,]$log10Psign,bulk_GSEA@result[bulk_GSEA@result$pvalue<=0.05,]$log10Psign,method="spearman")$estimate ) )
+    res1_3 <- as.data.frame(lapply(res1,function(x) cor.test(x@result[bulk_GSEA@result$pvalue<=0.005,]$log10Psign,bulk_GSEA@result[bulk_GSEA@result$pvalue<=0.005,]$log10Psign,method="spearman")$estimate ) )
+    res_all <- rbind(res1_1,res1_2,res1_3)
+    res_all <- as.data.frame(t(res_all))
+    
+    res1_cut <- lapply(res1,function(x) x@result[,c("ONTOLOGY","NES","pvalue","p.adjust","log10Psign")] )
+    
+    #save to list
+    res_enrich[[bulkname]] <- bulk_GSEA
+    res_enrich[[scname]] <- res1_cut
+    res_enrich[[paste0("result",y)]] <- res_all
+}
+
+saveRDS(res_enrich,"results/SC_Bulk_DE_GSEAenrichment/GSEAenrich_CanoGamez2020_naive_iTreg_scRST_signlog10P.rds")
+```
+
+### sc MAST
+```{r}
+DE_res <- readRDS("results/SC_Bulk_DEresults/Bulk_SC_SpearCor_DEresults_MAST_CanoGamez2020_naive_iTreg.rds")
+Compare_names <- unique(sapply(names(DE_res),function(x) strsplit(x,"bulk|sc")[[1]][2] ))
+```
+
+#### sign -log10P
+```{r message=FALSE}
+res_enrich <- list()
+organism <- "org.Hs.eg.db"
+
+for(y in Compare_names){
+    bulkname <- paste0("bulk",y)
+    scname <- paste0("sc",y)
+    bulkres <- DE_res[[bulkname]]
+    scres <- DE_res[[scname]]
+    bulk_GSEA <- bulkres$signlogP
+    names(bulk_GSEA) <- rownames(bulkres)
+    bulk_GSEA <- sort(bulk_GSEA,decreasing=TRUE)
+    bulk_GSEA <- gseGO(geneList=bulk_GSEA,ont="ALL",OrgDb=organism,keyType="SYMBOL",pvalueCutoff=1)
+    bulk_GSEA@result$log10Psign <- ifelse(bulk_GSEA@result$NES>0,-log10(bulk_GSEA@result$pvalue),log10(bulk_GSEA@result$pvalue))
+    
+    #SC
+    tmp <- scres[,grep("signlogP",colnames(scres))]
+    res1 <- apply(tmp,2,getGSEA,rownames(scres),"ALL",organism,bulk_GSEA)
+    
+    #results
+    res1_1 <- as.data.frame(lapply(res1,function(x) cor.test(x@result$log10Psign,bulk_GSEA@result$log10Psign,method="spearman")$estimate ) )
+    res1_2 <- as.data.frame(lapply(res1,function(x) cor.test(x@result[bulk_GSEA@result$pvalue<=0.05,]$log10Psign,bulk_GSEA@result[bulk_GSEA@result$pvalue<=0.05,]$log10Psign,method="spearman")$estimate ) )
+    res1_3 <- as.data.frame(lapply(res1,function(x) cor.test(x@result[bulk_GSEA@result$pvalue<=0.005,]$log10Psign,bulk_GSEA@result[bulk_GSEA@result$pvalue<=0.005,]$log10Psign,method="spearman")$estimate ) )
+    res_all <- rbind(res1_1,res1_2,res1_3)
+    res_all <- as.data.frame(t(res_all))
+    
+    res1_cut <- lapply(res1,function(x) x@result[,c("ONTOLOGY","NES","pvalue","p.adjust","log10Psign")] )
+    
+    #save to list
+    res_enrich[[bulkname]] <- bulk_GSEA
+    res_enrich[[scname]] <- res1_cut
+    res_enrich[[paste0("result",y)]] <- res_all
+}
+
+saveRDS(res_enrich,"results/SC_Bulk_DE_GSEAenrichment/GSEAenrich_CanoGamez2020_naive_iTreg_MAST_signlog10P.rds")
+```
+
+#### logFC
+```{r}
+res_enrich <- list()
+organism <- "org.Hs.eg.db"
+
+for(y in Compare_names){
+    bulkname <- paste0("bulk",y)
+    scname <- paste0("sc",y)
+    bulkres <- DE_res[[bulkname]]
+    scres <- DE_res[[scname]]
+    bulk_GSEA <- bulkres$logFC
+    names(bulk_GSEA) <- rownames(bulkres)
+    bulk_GSEA <- sort(bulk_GSEA,decreasing=TRUE)
+    bulk_GSEA <- gseGO(geneList=bulk_GSEA,ont="ALL",OrgDb=organism,keyType="SYMBOL",pvalueCutoff=1)
+    bulk_GSEA@result$log10Psign <- ifelse(bulk_GSEA@result$NES>0,-log10(bulk_GSEA@result$pvalue),log10(bulk_GSEA@result$pvalue))
+    
+    #SC
+    tmp <- scres[,grep("logFC",colnames(scres))]
+    res1 <- apply(tmp,2,getGSEA,rownames(scres),"ALL",organism,bulk_GSEA)
+    
+    #results
+    res1_1 <- as.data.frame(lapply(res1,function(x) cor.test(x@result$log10Psign,bulk_GSEA@result$log10Psign,method="spearman")$estimate ) )
+    res1_2 <- as.data.frame(lapply(res1,function(x) cor.test(x@result[bulk_GSEA@result$pvalue<=0.05,]$log10Psign,bulk_GSEA@result[bulk_GSEA@result$pvalue<=0.05,]$log10Psign,method="spearman")$estimate ) )
+    res1_3 <- as.data.frame(lapply(res1,function(x) cor.test(x@result[bulk_GSEA@result$pvalue<=0.005,]$log10Psign,bulk_GSEA@result[bulk_GSEA@result$pvalue<=0.005,]$log10Psign,method="spearman")$estimate ) )
+    res_all <- rbind(res1_1,res1_2,res1_3)
+    res_all <- as.data.frame(t(res_all))
+    
+    res1_cut <- lapply(res1,function(x) x@result[,c("ONTOLOGY","NES","pvalue","p.adjust","log10Psign")] )
+    
+    #save to list
+    res_enrich[[bulkname]] <- bulk_GSEA
+    res_enrich[[scname]] <- res1_cut
+    res_enrich[[paste0("result",y)]] <- res_all
+}
+
+saveRDS(res_enrich,"results/SC_Bulk_DE_GSEAenrichment/GSEAenrich_CanoGamez2020_naive_iTreg_MAST_logFC.rds")
+```
+
+### PBlimma
+```{r}
+DE_res <- readRDS("results/SC_Bulk_DEresults/Bulk_SC_SpearCor_DEresults_PBlimma_CanoGamez2020_naive_iTreg.rds")
+Compare_names <- unique(sapply(names(DE_res),function(x) strsplit(x,"bulk|sc")[[1]][2] ))
+```
+
+#### sign -log10P
+```{r message=FALSE}
+res_enrich <- list()
+organism <- "org.Hs.eg.db"
+
+for(y in Compare_names){
+    bulkname <- paste0("bulk",y)
+    scname <- paste0("sc",y)
+    bulkres <- DE_res[[bulkname]]
+    scres <- DE_res[[scname]]
+    bulk_GSEA <- bulkres$signlogP
+    names(bulk_GSEA) <- rownames(bulkres)
+    bulk_GSEA <- sort(bulk_GSEA,decreasing=TRUE)
+    bulk_GSEA <- gseGO(geneList=bulk_GSEA,ont="ALL",OrgDb=organism,keyType="SYMBOL",pvalueCutoff=1)
+    bulk_GSEA@result$log10Psign <- ifelse(bulk_GSEA@result$NES>0,-log10(bulk_GSEA@result$pvalue),log10(bulk_GSEA@result$pvalue))
+    
+    #SC
+    tmp <- scres[,grep("signlogP",colnames(scres))]
+    res1 <- apply(tmp,2,getGSEA,rownames(scres),"ALL",organism,bulk_GSEA)
+    
+    #results
+    res1_1 <- as.data.frame(lapply(res1,function(x) cor.test(x@result$log10Psign,bulk_GSEA@result$log10Psign,method="spearman")$estimate ) )
+    res1_2 <- as.data.frame(lapply(res1,function(x) cor.test(x@result[bulk_GSEA@result$pvalue<=0.05,]$log10Psign,bulk_GSEA@result[bulk_GSEA@result$pvalue<=0.05,]$log10Psign,method="spearman")$estimate ) )
+    res1_3 <- as.data.frame(lapply(res1,function(x) cor.test(x@result[bulk_GSEA@result$pvalue<=0.005,]$log10Psign,bulk_GSEA@result[bulk_GSEA@result$pvalue<=0.005,]$log10Psign,method="spearman")$estimate ) )
+    res_all <- rbind(res1_1,res1_2,res1_3)
+    res_all <- as.data.frame(t(res_all))
+    
+    res1_cut <- lapply(res1,function(x) x@result[,c("ONTOLOGY","NES","pvalue","p.adjust","log10Psign")] )
+    
+    #save to list
+    res_enrich[[bulkname]] <- bulk_GSEA
+    res_enrich[[scname]] <- res1_cut
+    res_enrich[[paste0("result",y)]] <- res_all
+}
+
+saveRDS(res_enrich,"results/SC_Bulk_DE_GSEAenrichment/GSEAenrich_CanoGamez2020_naive_iTreg_PBlimma_signlog10P.rds")
+```
+
+#### logFC
+```{r}
+res_enrich <- list()
+organism <- "org.Hs.eg.db"
+
+for(y in Compare_names){
+    bulkname <- paste0("bulk",y)
+    scname <- paste0("sc",y)
+    bulkres <- DE_res[[bulkname]]
+    scres <- DE_res[[scname]]
+    bulk_GSEA <- bulkres$logFC
+    names(bulk_GSEA) <- rownames(bulkres)
+    bulk_GSEA <- sort(bulk_GSEA,decreasing=TRUE)
+    bulk_GSEA <- gseGO(geneList=bulk_GSEA,ont="ALL",OrgDb=organism,keyType="SYMBOL",pvalueCutoff=1)
+    bulk_GSEA@result$log10Psign <- ifelse(bulk_GSEA@result$NES>0,-log10(bulk_GSEA@result$pvalue),log10(bulk_GSEA@result$pvalue))
+    
+    #SC
+    tmp <- scres[,grep("logFC",colnames(scres))]
+    res1 <- apply(tmp,2,getGSEA,rownames(scres),"ALL",organism,bulk_GSEA)
+    
+    #results
+    res1_1 <- as.data.frame(lapply(res1,function(x) cor.test(x@result$log10Psign,bulk_GSEA@result$log10Psign,method="spearman")$estimate ) )
+    res1_2 <- as.data.frame(lapply(res1,function(x) cor.test(x@result[bulk_GSEA@result$pvalue<=0.05,]$log10Psign,bulk_GSEA@result[bulk_GSEA@result$pvalue<=0.05,]$log10Psign,method="spearman")$estimate ) )
+    res1_3 <- as.data.frame(lapply(res1,function(x) cor.test(x@result[bulk_GSEA@result$pvalue<=0.005,]$log10Psign,bulk_GSEA@result[bulk_GSEA@result$pvalue<=0.005,]$log10Psign,method="spearman")$estimate ) )
+    res_all <- rbind(res1_1,res1_2,res1_3)
+    res_all <- as.data.frame(t(res_all))
+    
+    res1_cut <- lapply(res1,function(x) x@result[,c("ONTOLOGY","NES","pvalue","p.adjust","log10Psign")] )
+    
+    #save to list
+    res_enrich[[bulkname]] <- bulk_GSEA
+    res_enrich[[scname]] <- res1_cut
+    res_enrich[[paste0("result",y)]] <- res_all
+}
+
+saveRDS(res_enrich,"results/SC_Bulk_DE_GSEAenrichment/GSEAenrich_CanoGamez2020_naive_iTreg_PBlimma_logFC.rds")
+```
+
+## CanoGamez2020_naive_Th0
+### sc RST
+```{r}
+DE_res <- readRDS("results/SC_Bulk_DEresults/Bulk_SC_SpearCor_DEresults_RST_CanoGamez2020_naive_Th0.rds")
+Compare_names <- unique(sapply(names(DE_res),function(x) strsplit(x,"bulk|sc")[[1]][2] ))
+```
+
+#### sign -log10P
+```{r message=FALSE, warning=FALSE}
+res_enrich <- list()
+organism <- "org.Hs.eg.db"
+
+for(y in Compare_names){
+    bulkname <- paste0("bulk",y)
+    scname <- paste0("sc",y)
+    bulkres <- DE_res[[bulkname]]
+    scres <- DE_res[[scname]]
+    bulk_GSEA <- bulkres$signlogP
+    names(bulk_GSEA) <- rownames(bulkres)
+    
+    bulk_GSEA <- sort(bulk_GSEA,decreasing=TRUE)
+    bulk_GSEA <- gseGO(geneList=bulk_GSEA,ont="ALL",OrgDb=organism,keyType="SYMBOL",pvalueCutoff=1)
+    bulk_GSEA@result$log10Psign <- ifelse(bulk_GSEA@result$NES>0,-log10(bulk_GSEA@result$pvalue),log10(bulk_GSEA@result$pvalue))
+    
+    #SC
+    tmp <- scres[,grep("signlogP",colnames(scres))]
+    #tmp <- tmp[GeneSymbol$SYMBOL,]
+    #rownames(tmp) <- GeneSymbol$ENSEMBL
+    res1 <- apply(tmp,2,getGSEA,rownames(tmp),"ALL",organism,bulk_GSEA)
+    
+    #results
+    res1_1 <- as.data.frame(lapply(res1,function(x) cor.test(x@result$log10Psign,bulk_GSEA@result$log10Psign,method="spearman")$estimate ) )
+    res1_2 <- as.data.frame(lapply(res1,function(x) cor.test(x@result[bulk_GSEA@result$pvalue<=0.05,]$log10Psign,bulk_GSEA@result[bulk_GSEA@result$pvalue<=0.05,]$log10Psign,method="spearman")$estimate ) )
+    res1_3 <- as.data.frame(lapply(res1,function(x) cor.test(x@result[bulk_GSEA@result$pvalue<=0.005,]$log10Psign,bulk_GSEA@result[bulk_GSEA@result$pvalue<=0.005,]$log10Psign,method="spearman")$estimate ) )
+    res_all <- rbind(res1_1,res1_2,res1_3)
+    res_all <- as.data.frame(t(res_all))
+    
+    res1_cut <- lapply(res1,function(x) x@result[,c("ONTOLOGY","NES","pvalue","p.adjust","log10Psign")] )
+    
+    #save to list
+    res_enrich[[bulkname]] <- bulk_GSEA
+    res_enrich[[scname]] <- res1_cut
+    res_enrich[[paste0("result",y)]] <- res_all
+}
+
+saveRDS(res_enrich,"results/SC_Bulk_DE_GSEAenrichment/GSEAenrich_CanoGamez2020_naive_Th0_scRST_signlog10P.rds")
+```
+
+### sc MAST
+```{r}
+DE_res <- readRDS("results/SC_Bulk_DEresults/Bulk_SC_SpearCor_DEresults_MAST_CanoGamez2020_naive_Th0.rds")
+Compare_names <- unique(sapply(names(DE_res),function(x) strsplit(x,"bulk|sc")[[1]][2] ))
+```
+
+#### sign -log10P
+```{r message=FALSE}
+res_enrich <- list()
+organism <- "org.Hs.eg.db"
+
+for(y in Compare_names){
+    bulkname <- paste0("bulk",y)
+    scname <- paste0("sc",y)
+    bulkres <- DE_res[[bulkname]]
+    scres <- DE_res[[scname]]
+    bulk_GSEA <- bulkres$signlogP
+    names(bulk_GSEA) <- rownames(bulkres)
+    bulk_GSEA <- sort(bulk_GSEA,decreasing=TRUE)
+    bulk_GSEA <- gseGO(geneList=bulk_GSEA,ont="ALL",OrgDb=organism,keyType="SYMBOL",pvalueCutoff=1)
+    bulk_GSEA@result$log10Psign <- ifelse(bulk_GSEA@result$NES>0,-log10(bulk_GSEA@result$pvalue),log10(bulk_GSEA@result$pvalue))
+    
+    #SC
+    tmp <- scres[,grep("signlogP",colnames(scres))]
+    res1 <- apply(tmp,2,getGSEA,rownames(scres),"ALL",organism,bulk_GSEA)
+    
+    #results
+    res1_1 <- as.data.frame(lapply(res1,function(x) cor.test(x@result$log10Psign,bulk_GSEA@result$log10Psign,method="spearman")$estimate ) )
+    res1_2 <- as.data.frame(lapply(res1,function(x) cor.test(x@result[bulk_GSEA@result$pvalue<=0.05,]$log10Psign,bulk_GSEA@result[bulk_GSEA@result$pvalue<=0.05,]$log10Psign,method="spearman")$estimate ) )
+    res1_3 <- as.data.frame(lapply(res1,function(x) cor.test(x@result[bulk_GSEA@result$pvalue<=0.005,]$log10Psign,bulk_GSEA@result[bulk_GSEA@result$pvalue<=0.005,]$log10Psign,method="spearman")$estimate ) )
+    res_all <- rbind(res1_1,res1_2,res1_3)
+    res_all <- as.data.frame(t(res_all))
+    
+    res1_cut <- lapply(res1,function(x) x@result[,c("ONTOLOGY","NES","pvalue","p.adjust","log10Psign")] )
+    
+    #save to list
+    res_enrich[[bulkname]] <- bulk_GSEA
+    res_enrich[[scname]] <- res1_cut
+    res_enrich[[paste0("result",y)]] <- res_all
+}
+
+saveRDS(res_enrich,"results/SC_Bulk_DE_GSEAenrichment/GSEAenrich_CanoGamez2020_naive_Th0_MAST_signlog10P.rds")
+```
+
+#### logFC
+```{r}
+res_enrich <- list()
+organism <- "org.Hs.eg.db"
+
+for(y in Compare_names){
+    bulkname <- paste0("bulk",y)
+    scname <- paste0("sc",y)
+    bulkres <- DE_res[[bulkname]]
+    scres <- DE_res[[scname]]
+    bulk_GSEA <- bulkres$logFC
+    names(bulk_GSEA) <- rownames(bulkres)
+    bulk_GSEA <- sort(bulk_GSEA,decreasing=TRUE)
+    bulk_GSEA <- gseGO(geneList=bulk_GSEA,ont="ALL",OrgDb=organism,keyType="SYMBOL",pvalueCutoff=1)
+    bulk_GSEA@result$log10Psign <- ifelse(bulk_GSEA@result$NES>0,-log10(bulk_GSEA@result$pvalue),log10(bulk_GSEA@result$pvalue))
+    
+    #SC
+    tmp <- scres[,grep("logFC",colnames(scres))]
+    res1 <- apply(tmp,2,getGSEA,rownames(scres),"ALL",organism,bulk_GSEA)
+    
+    #results
+    res1_1 <- as.data.frame(lapply(res1,function(x) cor.test(x@result$log10Psign,bulk_GSEA@result$log10Psign,method="spearman")$estimate ) )
+    res1_2 <- as.data.frame(lapply(res1,function(x) cor.test(x@result[bulk_GSEA@result$pvalue<=0.05,]$log10Psign,bulk_GSEA@result[bulk_GSEA@result$pvalue<=0.05,]$log10Psign,method="spearman")$estimate ) )
+    res1_3 <- as.data.frame(lapply(res1,function(x) cor.test(x@result[bulk_GSEA@result$pvalue<=0.005,]$log10Psign,bulk_GSEA@result[bulk_GSEA@result$pvalue<=0.005,]$log10Psign,method="spearman")$estimate ) )
+    res_all <- rbind(res1_1,res1_2,res1_3)
+    res_all <- as.data.frame(t(res_all))
+    
+    res1_cut <- lapply(res1,function(x) x@result[,c("ONTOLOGY","NES","pvalue","p.adjust","log10Psign")] )
+    
+    #save to list
+    res_enrich[[bulkname]] <- bulk_GSEA
+    res_enrich[[scname]] <- res1_cut
+    res_enrich[[paste0("result",y)]] <- res_all
+}
+
+saveRDS(res_enrich,"results/SC_Bulk_DE_GSEAenrichment/GSEAenrich_CanoGamez2020_naive_Th0_MAST_logFC.rds")
+```
+
+### PBlimma
+```{r}
+DE_res <- readRDS("results/SC_Bulk_DEresults/Bulk_SC_SpearCor_DEresults_PBlimma_CanoGamez2020_naive_Th0.rds")
+Compare_names <- unique(sapply(names(DE_res),function(x) strsplit(x,"bulk|sc")[[1]][2] ))
+```
+
+#### sign -log10P
+```{r message=FALSE}
+res_enrich <- list()
+organism <- "org.Hs.eg.db"
+
+for(y in Compare_names){
+    bulkname <- paste0("bulk",y)
+    scname <- paste0("sc",y)
+    bulkres <- DE_res[[bulkname]]
+    scres <- DE_res[[scname]]
+    bulk_GSEA <- bulkres$signlogP
+    names(bulk_GSEA) <- rownames(bulkres)
+    bulk_GSEA <- sort(bulk_GSEA,decreasing=TRUE)
+    bulk_GSEA <- gseGO(geneList=bulk_GSEA,ont="ALL",OrgDb=organism,keyType="SYMBOL",pvalueCutoff=1)
+    bulk_GSEA@result$log10Psign <- ifelse(bulk_GSEA@result$NES>0,-log10(bulk_GSEA@result$pvalue),log10(bulk_GSEA@result$pvalue))
+    
+    #SC
+    tmp <- scres[,grep("signlogP",colnames(scres))]
+    res1 <- apply(tmp,2,getGSEA,rownames(scres),"ALL",organism,bulk_GSEA)
+    
+    #results
+    res1_1 <- as.data.frame(lapply(res1,function(x) cor.test(x@result$log10Psign,bulk_GSEA@result$log10Psign,method="spearman")$estimate ) )
+    res1_2 <- as.data.frame(lapply(res1,function(x) cor.test(x@result[bulk_GSEA@result$pvalue<=0.05,]$log10Psign,bulk_GSEA@result[bulk_GSEA@result$pvalue<=0.05,]$log10Psign,method="spearman")$estimate ) )
+    res1_3 <- as.data.frame(lapply(res1,function(x) cor.test(x@result[bulk_GSEA@result$pvalue<=0.005,]$log10Psign,bulk_GSEA@result[bulk_GSEA@result$pvalue<=0.005,]$log10Psign,method="spearman")$estimate ) )
+    res_all <- rbind(res1_1,res1_2,res1_3)
+    res_all <- as.data.frame(t(res_all))
+    
+    res1_cut <- lapply(res1,function(x) x@result[,c("ONTOLOGY","NES","pvalue","p.adjust","log10Psign")] )
+    
+    #save to list
+    res_enrich[[bulkname]] <- bulk_GSEA
+    res_enrich[[scname]] <- res1_cut
+    res_enrich[[paste0("result",y)]] <- res_all
+}
+
+saveRDS(res_enrich,"results/SC_Bulk_DE_GSEAenrichment/GSEAenrich_CanoGamez2020_naive_Th0_PBlimma_signlog10P.rds")
+```
+
+#### logFC
+```{r}
+res_enrich <- list()
+organism <- "org.Hs.eg.db"
+
+for(y in Compare_names){
+    bulkname <- paste0("bulk",y)
+    scname <- paste0("sc",y)
+    bulkres <- DE_res[[bulkname]]
+    scres <- DE_res[[scname]]
+    bulk_GSEA <- bulkres$logFC
+    names(bulk_GSEA) <- rownames(bulkres)
+    bulk_GSEA <- sort(bulk_GSEA,decreasing=TRUE)
+    bulk_GSEA <- gseGO(geneList=bulk_GSEA,ont="ALL",OrgDb=organism,keyType="SYMBOL",pvalueCutoff=1)
+    bulk_GSEA@result$log10Psign <- ifelse(bulk_GSEA@result$NES>0,-log10(bulk_GSEA@result$pvalue),log10(bulk_GSEA@result$pvalue))
+    
+    #SC
+    tmp <- scres[,grep("logFC",colnames(scres))]
+    res1 <- apply(tmp,2,getGSEA,rownames(scres),"ALL",organism,bulk_GSEA)
+    
+    #results
+    res1_1 <- as.data.frame(lapply(res1,function(x) cor.test(x@result$log10Psign,bulk_GSEA@result$log10Psign,method="spearman")$estimate ) )
+    res1_2 <- as.data.frame(lapply(res1,function(x) cor.test(x@result[bulk_GSEA@result$pvalue<=0.05,]$log10Psign,bulk_GSEA@result[bulk_GSEA@result$pvalue<=0.05,]$log10Psign,method="spearman")$estimate ) )
+    res1_3 <- as.data.frame(lapply(res1,function(x) cor.test(x@result[bulk_GSEA@result$pvalue<=0.005,]$log10Psign,bulk_GSEA@result[bulk_GSEA@result$pvalue<=0.005,]$log10Psign,method="spearman")$estimate ) )
+    res_all <- rbind(res1_1,res1_2,res1_3)
+    res_all <- as.data.frame(t(res_all))
+    
+    res1_cut <- lapply(res1,function(x) x@result[,c("ONTOLOGY","NES","pvalue","p.adjust","log10Psign")] )
+    
+    #save to list
+    res_enrich[[bulkname]] <- bulk_GSEA
+    res_enrich[[scname]] <- res1_cut
+    res_enrich[[paste0("result",y)]] <- res_all
+}
+
+saveRDS(res_enrich,"results/SC_Bulk_DE_GSEAenrichment/GSEAenrich_CanoGamez2020_naive_Th0_PBlimma_logFC.rds")
+```
+
+
+
+# time course sample(with R 4.2.1)
+## GSE75748timecourse
+### Trend RST
+```{r}
+DE_res <- readRDS("results/SC_Bulk_DEresults/Bulk_SC_SpearCor_DEresults_TrendRST_GSE75748timecourse.rds")
+Compare_names <- unique(sapply(names(DE_res),function(x) strsplit(x,"bulk|sc")[[1]][2] ))
+```
+
+#### sign -log10P
+```{r message=FALSE, warning=FALSE}
+res_enrich <- list()
+organism <- "org.Hs.eg.db"
+
+for(y in Compare_names){
+    bulkname <- paste0("bulk",y)
+    scname <- paste0("sc",y)
+    bulkres <- DE_res[[bulkname]]
+    scres <- DE_res[[scname]]
+    bulk_GSEA <- bulkres$signlogP
+    names(bulk_GSEA) <- rownames(bulkres)
+    
+    bulk_GSEA <- sort(bulk_GSEA,decreasing=TRUE)
+    bulk_GSEA <- gseGO(geneList=bulk_GSEA,ont="ALL",OrgDb=organism,keyType="SYMBOL",pvalueCutoff=1)
+    bulk_GSEA@result$log10Psign <- ifelse(bulk_GSEA@result$NES>0,-log10(bulk_GSEA@result$pvalue),log10(bulk_GSEA@result$pvalue))
+    
+    #SC
+    tmp <- scres[,grep("signlogP",colnames(scres))]
+    #tmp <- tmp[GeneSymbol$SYMBOL,]
+    #rownames(tmp) <- GeneSymbol$ENSEMBL
+    res1 <- apply(tmp,2,getGSEA,rownames(tmp),"ALL",organism,bulk_GSEA)
+    
+    #results
+    res1_1 <- as.data.frame(lapply(res1,function(x) cor.test(x@result$log10Psign,bulk_GSEA@result$log10Psign,method="spearman")$estimate ) )
+    res1_2 <- as.data.frame(lapply(res1,function(x) cor.test(x@result[bulk_GSEA@result$pvalue<=0.05,]$log10Psign,bulk_GSEA@result[bulk_GSEA@result$pvalue<=0.05,]$log10Psign,method="spearman")$estimate ) )
+    res1_3 <- as.data.frame(lapply(res1,function(x) cor.test(x@result[bulk_GSEA@result$pvalue<=0.005,]$log10Psign,bulk_GSEA@result[bulk_GSEA@result$pvalue<=0.005,]$log10Psign,method="spearman")$estimate ) )
+    res_all <- rbind(res1_1,res1_2,res1_3)
+    res_all <- as.data.frame(t(res_all))
+    
+    res1_cut <- lapply(res1,function(x) x@result[,c("ONTOLOGY","NES","pvalue","p.adjust","log10Psign")] )
+    
+    #save to list
+    res_enrich[[bulkname]] <- bulk_GSEA
+    res_enrich[[scname]] <- res1_cut
+    res_enrich[[paste0("result",y)]] <- res_all
+}
+
+saveRDS(res_enrich,"results/SC_Bulk_DE_GSEAenrichment/GSEAenrich_GSE75748timecourse_TrendRST_signlog10P.rds")
+```
+
+### sc MAST
+```{r}
+DE_res <- readRDS("results/SC_Bulk_DEresults/Bulk_SC_SpearCor_DEresults_MAST_GSE75748timecourse.rds")
+Compare_names <- unique(sapply(names(DE_res),function(x) strsplit(x,"bulk|sc")[[1]][2] ))
+```
+
+#### sign -log10P
+```{r message=FALSE}
+res_enrich <- list()
+organism <- "org.Hs.eg.db"
+
+for(y in Compare_names){
+    bulkname <- paste0("bulk",y)
+    scname <- paste0("sc",y)
+    bulkres <- DE_res[[bulkname]]
+    scres <- DE_res[[scname]]
+    bulk_GSEA <- bulkres$signlogP
+    names(bulk_GSEA) <- rownames(bulkres)
+    bulk_GSEA <- sort(bulk_GSEA,decreasing=TRUE)
+    bulk_GSEA <- gseGO(geneList=bulk_GSEA,ont="ALL",OrgDb=organism,keyType="SYMBOL",pvalueCutoff=1)
+    bulk_GSEA@result$log10Psign <- ifelse(bulk_GSEA@result$NES>0,-log10(bulk_GSEA@result$pvalue),log10(bulk_GSEA@result$pvalue))
+    
+    #SC
+    tmp <- scres[,grep("signlogP",colnames(scres))]
+    res1 <- apply(tmp,2,getGSEA,rownames(scres),"ALL",organism,bulk_GSEA)
+    
+    #results
+    res1_1 <- as.data.frame(lapply(res1,function(x) cor.test(x@result$log10Psign,bulk_GSEA@result$log10Psign,method="spearman")$estimate ) )
+    res1_2 <- as.data.frame(lapply(res1,function(x) cor.test(x@result[bulk_GSEA@result$pvalue<=0.05,]$log10Psign,bulk_GSEA@result[bulk_GSEA@result$pvalue<=0.05,]$log10Psign,method="spearman")$estimate ) )
+    res1_3 <- as.data.frame(lapply(res1,function(x) cor.test(x@result[bulk_GSEA@result$pvalue<=0.005,]$log10Psign,bulk_GSEA@result[bulk_GSEA@result$pvalue<=0.005,]$log10Psign,method="spearman")$estimate ) )
+    res_all <- rbind(res1_1,res1_2,res1_3)
+    res_all <- as.data.frame(t(res_all))
+    
+    res1_cut <- lapply(res1,function(x) x@result[,c("ONTOLOGY","NES","pvalue","p.adjust","log10Psign")] )
+    
+    #save to list
+    res_enrich[[bulkname]] <- bulk_GSEA
+    res_enrich[[scname]] <- res1_cut
+    res_enrich[[paste0("result",y)]] <- res_all
+}
+
+saveRDS(res_enrich,"results/SC_Bulk_DE_GSEAenrichment/GSEAenrich_GSE75748timecourse_MAST_signlog10P.rds")
+```
+
+#### logFC
+```{r}
+res_enrich <- list()
+organism <- "org.Hs.eg.db"
+
+for(y in Compare_names){
+    bulkname <- paste0("bulk",y)
+    scname <- paste0("sc",y)
+    bulkres <- DE_res[[bulkname]]
+    scres <- DE_res[[scname]]
+    bulk_GSEA <- bulkres$logFC
+    names(bulk_GSEA) <- rownames(bulkres)
+    bulk_GSEA <- sort(bulk_GSEA,decreasing=TRUE)
+    bulk_GSEA <- gseGO(geneList=bulk_GSEA,ont="ALL",OrgDb=organism,keyType="SYMBOL",pvalueCutoff=1)
+    bulk_GSEA@result$log10Psign <- ifelse(bulk_GSEA@result$NES>0,-log10(bulk_GSEA@result$pvalue),log10(bulk_GSEA@result$pvalue))
+    
+    #SC
+    tmp <- scres[,grep("logFC",colnames(scres))]
+    res1 <- apply(tmp,2,getGSEA,rownames(scres),"ALL",organism,bulk_GSEA)
+    
+    #results
+    res1_1 <- as.data.frame(lapply(res1,function(x) cor.test(x@result$log10Psign,bulk_GSEA@result$log10Psign,method="spearman")$estimate ) )
+    res1_2 <- as.data.frame(lapply(res1,function(x) cor.test(x@result[bulk_GSEA@result$pvalue<=0.05,]$log10Psign,bulk_GSEA@result[bulk_GSEA@result$pvalue<=0.05,]$log10Psign,method="spearman")$estimate ) )
+    res1_3 <- as.data.frame(lapply(res1,function(x) cor.test(x@result[bulk_GSEA@result$pvalue<=0.005,]$log10Psign,bulk_GSEA@result[bulk_GSEA@result$pvalue<=0.005,]$log10Psign,method="spearman")$estimate ) )
+    res_all <- rbind(res1_1,res1_2,res1_3)
+    res_all <- as.data.frame(t(res_all))
+    
+    res1_cut <- lapply(res1,function(x) x@result[,c("ONTOLOGY","NES","pvalue","p.adjust","log10Psign")] )
+    
+    #save to list
+    res_enrich[[bulkname]] <- bulk_GSEA
+    res_enrich[[scname]] <- res1_cut
+    res_enrich[[paste0("result",y)]] <- res_all
+}
+
+saveRDS(res_enrich,"results/SC_Bulk_DE_GSEAenrichment/GSEAenrich_GSE75748timecourse_MAST_logFC.rds")
+```
+
+## GSE79578
+### Trend RST
+```{r}
+DE_res <- readRDS("results/SC_Bulk_DEresults/Bulk_SC_SpearCor_DEresults_TrendRST_GSE79578.rds")
+Compare_names <- unique(sapply(names(DE_res),function(x) strsplit(x,"bulk|sc")[[1]][2] ))
+```
+
+#### sign -log10P
+```{r message=FALSE, warning=FALSE}
+res_enrich <- list()
+organism <- "org.Mm.eg.db"
+
+for(y in Compare_names){
+    bulkname <- paste0("bulk",y)
+    scname <- paste0("sc",y)
+    bulkres <- DE_res[[bulkname]]
+    scres <- DE_res[[scname]]
+    bulk_GSEA <- bulkres$signlogP
+    names(bulk_GSEA) <- rownames(bulkres)
+    
+    bulk_GSEA <- sort(bulk_GSEA,decreasing=TRUE)
+    bulk_GSEA <- gseGO(geneList=bulk_GSEA,ont="ALL",OrgDb=organism,keyType="SYMBOL",pvalueCutoff=1)
+    bulk_GSEA@result$log10Psign <- ifelse(bulk_GSEA@result$NES>0,-log10(bulk_GSEA@result$pvalue),log10(bulk_GSEA@result$pvalue))
+    
+    #SC
+    tmp <- scres[,grep("signlogP",colnames(scres))]
+    #tmp <- tmp[GeneSymbol$SYMBOL,]
+    #rownames(tmp) <- GeneSymbol$ENSEMBL
+    res1 <- apply(tmp,2,getGSEA,rownames(tmp),"ALL",organism,bulk_GSEA)
+    
+    #results
+    res1_1 <- as.data.frame(lapply(res1,function(x) cor.test(x@result$log10Psign,bulk_GSEA@result$log10Psign,method="spearman")$estimate ) )
+    res1_2 <- as.data.frame(lapply(res1,function(x) cor.test(x@result[bulk_GSEA@result$pvalue<=0.05,]$log10Psign,bulk_GSEA@result[bulk_GSEA@result$pvalue<=0.05,]$log10Psign,method="spearman")$estimate ) )
+    res1_3 <- as.data.frame(lapply(res1,function(x) cor.test(x@result[bulk_GSEA@result$pvalue<=0.005,]$log10Psign,bulk_GSEA@result[bulk_GSEA@result$pvalue<=0.005,]$log10Psign,method="spearman")$estimate ) )
+    res_all <- rbind(res1_1,res1_2,res1_3)
+    res_all <- as.data.frame(t(res_all))
+    
+    res1_cut <- lapply(res1,function(x) x@result[,c("ONTOLOGY","NES","pvalue","p.adjust","log10Psign")] )
+    
+    #save to list
+    res_enrich[[bulkname]] <- bulk_GSEA
+    res_enrich[[scname]] <- res1_cut
+    res_enrich[[paste0("result",y)]] <- res_all
+}
+
+saveRDS(res_enrich,"results/SC_Bulk_DE_GSEAenrichment/GSEAenrich_GSE79578_TrendRST_signlog10P.rds")
+```
+
+### sc MAST
+```{r}
+DE_res <- readRDS("results/SC_Bulk_DEresults/Bulk_SC_SpearCor_DEresults_MAST_GSE79578timecourse.rds")
+Compare_names <- unique(sapply(names(DE_res),function(x) strsplit(x,"bulk|sc")[[1]][2] ))
+```
+
+#### sign -log10P
+```{r message=FALSE}
+res_enrich <- list()
+organism <- "org.Mm.eg.db"
+
+for(y in Compare_names){
+    bulkname <- paste0("bulk",y)
+    scname <- paste0("sc",y)
+    bulkres <- DE_res[[bulkname]]
+    scres <- DE_res[[scname]]
+    bulk_GSEA <- bulkres$signlogP
+    names(bulk_GSEA) <- rownames(bulkres)
+    bulk_GSEA <- sort(bulk_GSEA,decreasing=TRUE)
+    bulk_GSEA <- gseGO(geneList=bulk_GSEA,ont="ALL",OrgDb=organism,keyType="SYMBOL",pvalueCutoff=1)
+    bulk_GSEA@result$log10Psign <- ifelse(bulk_GSEA@result$NES>0,-log10(bulk_GSEA@result$pvalue),log10(bulk_GSEA@result$pvalue))
+    
+    #SC
+    tmp <- scres[,grep("signlogP",colnames(scres))]
+    res1 <- apply(tmp,2,getGSEA,rownames(scres),"ALL",organism,bulk_GSEA)
+    
+    #results
+    res1_1 <- as.data.frame(lapply(res1,function(x) cor.test(x@result$log10Psign,bulk_GSEA@result$log10Psign,method="spearman")$estimate ) )
+    res1_2 <- as.data.frame(lapply(res1,function(x) cor.test(x@result[bulk_GSEA@result$pvalue<=0.05,]$log10Psign,bulk_GSEA@result[bulk_GSEA@result$pvalue<=0.05,]$log10Psign,method="spearman")$estimate ) )
+    res1_3 <- as.data.frame(lapply(res1,function(x) cor.test(x@result[bulk_GSEA@result$pvalue<=0.005,]$log10Psign,bulk_GSEA@result[bulk_GSEA@result$pvalue<=0.005,]$log10Psign,method="spearman")$estimate ) )
+    res_all <- rbind(res1_1,res1_2,res1_3)
+    res_all <- as.data.frame(t(res_all))
+    
+    res1_cut <- lapply(res1,function(x) x@result[,c("ONTOLOGY","NES","pvalue","p.adjust","log10Psign")] )
+    
+    #save to list
+    res_enrich[[bulkname]] <- bulk_GSEA
+    res_enrich[[scname]] <- res1_cut
+    res_enrich[[paste0("result",y)]] <- res_all
+}
+
+saveRDS(res_enrich,"results/SC_Bulk_DE_GSEAenrichment/GSEAenrich_GSE79578_MAST_signlog10P.rds")
+```
+
+#### logFC
+```{r}
+res_enrich <- list()
+organism <- "org.Mm.eg.db"
+
+for(y in Compare_names){
+    bulkname <- paste0("bulk",y)
+    scname <- paste0("sc",y)
+    bulkres <- DE_res[[bulkname]]
+    scres <- DE_res[[scname]]
+    bulk_GSEA <- bulkres$logFC
+    names(bulk_GSEA) <- rownames(bulkres)
+    bulk_GSEA <- sort(bulk_GSEA,decreasing=TRUE)
+    bulk_GSEA <- gseGO(geneList=bulk_GSEA,ont="ALL",OrgDb=organism,keyType="SYMBOL",pvalueCutoff=1)
+    bulk_GSEA@result$log10Psign <- ifelse(bulk_GSEA@result$NES>0,-log10(bulk_GSEA@result$pvalue),log10(bulk_GSEA@result$pvalue))
+    
+    #SC
+    tmp <- scres[,grep("logFC",colnames(scres))]
+    res1 <- apply(tmp,2,getGSEA,rownames(scres),"ALL",organism,bulk_GSEA)
+    
+    #results
+    res1_1 <- as.data.frame(lapply(res1,function(x) cor.test(x@result$log10Psign,bulk_GSEA@result$log10Psign,method="spearman")$estimate ) )
+    res1_2 <- as.data.frame(lapply(res1,function(x) cor.test(x@result[bulk_GSEA@result$pvalue<=0.05,]$log10Psign,bulk_GSEA@result[bulk_GSEA@result$pvalue<=0.05,]$log10Psign,method="spearman")$estimate ) )
+    res1_3 <- as.data.frame(lapply(res1,function(x) cor.test(x@result[bulk_GSEA@result$pvalue<=0.005,]$log10Psign,bulk_GSEA@result[bulk_GSEA@result$pvalue<=0.005,]$log10Psign,method="spearman")$estimate ) )
+    res_all <- rbind(res1_1,res1_2,res1_3)
+    res_all <- as.data.frame(t(res_all))
+    
+    res1_cut <- lapply(res1,function(x) x@result[,c("ONTOLOGY","NES","pvalue","p.adjust","log10Psign")] )
+    
+    #save to list
+    res_enrich[[bulkname]] <- bulk_GSEA
+    res_enrich[[scname]] <- res1_cut
+    res_enrich[[paste0("result",y)]] <- res_all
+}
+
+saveRDS(res_enrich,"results/SC_Bulk_DE_GSEAenrichment/GSEAenrich_GSE79578_MAST_logFC.rds")
+```
+
+## GSE90047
+### Trend RST
+```{r}
+DE_res <- readRDS("results/SC_Bulk_DEresults/Bulk_SC_SpearCor_DEresults_TrendRST_GSE90047.rds")
+Compare_names <- unique(sapply(names(DE_res),function(x) strsplit(x,"bulk|sc")[[1]][2] ))
+```
+
+#### sign -log10P
+```{r message=FALSE, warning=FALSE}
+res_enrich <- list()
+organism <- "org.Mm.eg.db"
+
+for(y in Compare_names){
+    bulkname <- paste0("bulk",y)
+    scname <- paste0("sc",y)
+    bulkres <- DE_res[[bulkname]]
+    scres <- DE_res[[scname]]
+    bulk_GSEA <- bulkres$signlogP
+    names(bulk_GSEA) <- rownames(bulkres)
+    
+    bulk_GSEA <- sort(bulk_GSEA,decreasing=TRUE)
+    bulk_GSEA <- gseGO(geneList=bulk_GSEA,ont="ALL",OrgDb=organism,keyType="ENSEMBL",pvalueCutoff=1)
+    bulk_GSEA@result$log10Psign <- ifelse(bulk_GSEA@result$NES>0,-log10(bulk_GSEA@result$pvalue),log10(bulk_GSEA@result$pvalue))
+    
+    #SC
+    tmp <- scres[,grep("signlogP",colnames(scres))]
+    #tmp <- tmp[GeneSymbol$SYMBOL,]
+    #rownames(tmp) <- GeneSymbol$ENSEMBL
+    res1 <- apply(tmp,2,getGSEA,rownames(tmp),"ALL",organism,bulk_GSEA,keytype="ENSEMBL")
+    
+    #results
+    res1_1 <- as.data.frame(lapply(res1,function(x) cor.test(x@result$log10Psign,bulk_GSEA@result$log10Psign,method="spearman")$estimate ) )
+    res1_2 <- as.data.frame(lapply(res1,function(x) cor.test(x@result[bulk_GSEA@result$pvalue<=0.05,]$log10Psign,bulk_GSEA@result[bulk_GSEA@result$pvalue<=0.05,]$log10Psign,method="spearman")$estimate ) )
+    res1_3 <- as.data.frame(lapply(res1,function(x) cor.test(x@result[bulk_GSEA@result$pvalue<=0.005,]$log10Psign,bulk_GSEA@result[bulk_GSEA@result$pvalue<=0.005,]$log10Psign,method="spearman")$estimate ) )
+    res_all <- rbind(res1_1,res1_2,res1_3)
+    res_all <- as.data.frame(t(res_all))
+    
+    res1_cut <- lapply(res1,function(x) x@result[,c("ONTOLOGY","NES","pvalue","p.adjust","log10Psign")] )
+    
+    #save to list
+    res_enrich[[bulkname]] <- bulk_GSEA
+    res_enrich[[scname]] <- res1_cut
+    res_enrich[[paste0("result",y)]] <- res_all
+}
+
+saveRDS(res_enrich,"results/SC_Bulk_DE_GSEAenrichment/GSEAenrich_GSE90047_TrendRST_signlog10P.rds")
+```
+
+### sc MAST
+```{r}
+DE_res <- readRDS("results/SC_Bulk_DEresults/Bulk_SC_SpearCor_DEresults_MAST_GSE90047timecourse.rds")
+Compare_names <- unique(sapply(names(DE_res),function(x) strsplit(x,"bulk|sc")[[1]][2] ))
+```
+
+#### sign -log10P
+```{r message=FALSE}
+res_enrich <- list()
+organism <- "org.Mm.eg.db"
+
+for(y in Compare_names){
+    bulkname <- paste0("bulk",y)
+    scname <- paste0("sc",y)
+    bulkres <- DE_res[[bulkname]]
+    scres <- DE_res[[scname]]
+    bulk_GSEA <- bulkres$signlogP
+    names(bulk_GSEA) <- rownames(bulkres)
+    bulk_GSEA <- sort(bulk_GSEA,decreasing=TRUE)
+    bulk_GSEA <- gseGO(geneList=bulk_GSEA,ont="ALL",OrgDb=organism,keyType="ENSEMBL",pvalueCutoff=1)
+    bulk_GSEA@result$log10Psign <- ifelse(bulk_GSEA@result$NES>0,-log10(bulk_GSEA@result$pvalue),log10(bulk_GSEA@result$pvalue))
+    
+    #SC
+    tmp <- scres[,grep("signlogP",colnames(scres))]
+    res1 <- apply(tmp,2,getGSEA,rownames(scres),"ALL",organism,bulk_GSEA,keytype="ENSEMBL")
+    
+    #results
+    res1_1 <- as.data.frame(lapply(res1,function(x) cor.test(x@result$log10Psign,bulk_GSEA@result$log10Psign,method="spearman")$estimate ) )
+    res1_2 <- as.data.frame(lapply(res1,function(x) cor.test(x@result[bulk_GSEA@result$pvalue<=0.05,]$log10Psign,bulk_GSEA@result[bulk_GSEA@result$pvalue<=0.05,]$log10Psign,method="spearman")$estimate ) )
+    res1_3 <- as.data.frame(lapply(res1,function(x) cor.test(x@result[bulk_GSEA@result$pvalue<=0.005,]$log10Psign,bulk_GSEA@result[bulk_GSEA@result$pvalue<=0.005,]$log10Psign,method="spearman")$estimate ) )
+    res_all <- rbind(res1_1,res1_2,res1_3)
+    res_all <- as.data.frame(t(res_all))
+    
+    res1_cut <- lapply(res1,function(x) x@result[,c("ONTOLOGY","NES","pvalue","p.adjust","log10Psign")] )
+    
+    #save to list
+    res_enrich[[bulkname]] <- bulk_GSEA
+    res_enrich[[scname]] <- res1_cut
+    res_enrich[[paste0("result",y)]] <- res_all
+}
+
+saveRDS(res_enrich,"results/SC_Bulk_DE_GSEAenrichment/GSEAenrich_GSE90047_MAST_signlog10P.rds")
+```
+
+#### logFC
+```{r}
+res_enrich <- list()
+organism <- "org.Mm.eg.db"
+
+for(y in Compare_names){
+    bulkname <- paste0("bulk",y)
+    scname <- paste0("sc",y)
+    bulkres <- DE_res[[bulkname]]
+    scres <- DE_res[[scname]]
+    bulk_GSEA <- bulkres$logFC
+    names(bulk_GSEA) <- rownames(bulkres)
+    bulk_GSEA <- sort(bulk_GSEA,decreasing=TRUE)
+    bulk_GSEA <- gseGO(geneList=bulk_GSEA,ont="ALL",OrgDb=organism,keyType="ENSEMBL",pvalueCutoff=1)
+    bulk_GSEA@result$log10Psign <- ifelse(bulk_GSEA@result$NES>0,-log10(bulk_GSEA@result$pvalue),log10(bulk_GSEA@result$pvalue))
+    
+    #SC
+    tmp <- scres[,grep("logFC",colnames(scres))]
+    res1 <- apply(tmp,2,getGSEA,rownames(scres),"ALL",organism,bulk_GSEA,keytype="ENSEMBL")
+    
+    #results
+    res1_1 <- as.data.frame(lapply(res1,function(x) cor.test(x@result$log10Psign,bulk_GSEA@result$log10Psign,method="spearman")$estimate ) )
+    res1_2 <- as.data.frame(lapply(res1,function(x) cor.test(x@result[bulk_GSEA@result$pvalue<=0.05,]$log10Psign,bulk_GSEA@result[bulk_GSEA@result$pvalue<=0.05,]$log10Psign,method="spearman")$estimate ) )
+    res1_3 <- as.data.frame(lapply(res1,function(x) cor.test(x@result[bulk_GSEA@result$pvalue<=0.005,]$log10Psign,bulk_GSEA@result[bulk_GSEA@result$pvalue<=0.005,]$log10Psign,method="spearman")$estimate ) )
+    res_all <- rbind(res1_1,res1_2,res1_3)
+    res_all <- as.data.frame(t(res_all))
+    
+    res1_cut <- lapply(res1,function(x) x@result[,c("ONTOLOGY","NES","pvalue","p.adjust","log10Psign")] )
+    
+    #save to list
+    res_enrich[[bulkname]] <- bulk_GSEA
+    res_enrich[[scname]] <- res1_cut
+    res_enrich[[paste0("result",y)]] <- res_all
+}
+
+saveRDS(res_enrich,"results/SC_Bulk_DE_GSEAenrichment/GSEAenrich_GSE90047_MAST_logFC.rds")
+```
+
+# evaluation
+## mixture sample
+### sc level RST
+#### sign log10P based
+```{r message=FALSE, warning=FALSE}
+#rank sum test
+Enrich_res_p <- list.files("results/SC_Bulk_DE_GSEAenrichment/")
+Enrich_res_p <- Enrich_res_p[grep("scRST_signlog10P",Enrich_res_p)]
+Enrich_res_p <- Enrich_res_p[!grepl("timecourse",Enrich_res_p)]
+
+datasets <- c("GSE75748","GSE81861","cellbench")
+p_all <- data.frame()
+p_005 <- data.frame()
+
+for(x in datasets){
+    tmp <- Enrich_res_p[grep(x,Enrich_res_p)]
+    tmppath <- paste0("results/SC_Bulk_DE_GSEAenrichment/",tmp)
+    tmp <- readRDS(tmppath)
+    tmp_name <- grep("result",names(tmp))
+    for(i in tmp_name){
+        Compare_names <- strsplit(names(tmp)[i],"result")[[1]][2]
+        p_all <- rbind(p_all,tmp[[i]][,1])
+        p_005 <- rbind(p_005,tmp[[i]][,2])
+        rownames(p_all)[nrow(p_all)] <- paste0("all",Compare_names,"_",x)
+        rownames(p_005)[nrow(p_005)] <- paste0("p0.05",Compare_names,"_",x) 
+    }
+}
+colnames(p_all) <- sapply(rownames(tmp[[tmp_name[1]]]),function(x) strsplit(x,"\\.")[[1]][1])
+colnames(p_005) <- sapply(rownames(tmp[[tmp_name[1]]]),function(x) strsplit(x,"\\.")[[1]][1])
+
+```
+
+process data
+```{r}
+md_raw_p_all <- median(p_all$raw)
+p_all_res <- as.data.frame(apply(p_all[,-1],2,function(x) x-p_all[,1] ))
+p_all_res$group <- rownames(p_all_res)
+md_raw_p_005 <- median(p_005$raw)
+p_005_res <- as.data.frame(apply(p_005[,-1],2,function(x) x-p_005[,1] ))
+p_005_res$group <- rownames(p_005_res)
+
+p_all_res_melt <- data.table::melt(p_all_res,id.vars=c("group"))
+
+p_all_res_melt$Type <- "Deep learning based"
+p_all_res_melt[p_all_res_melt$variable%in%c("ccImpute","I_Impute","kNN_smoothing","MAGIC","MAGIC_log"),]$Type <- "Model or smoothing based"
+p_all_res_melt[p_all_res_melt$variable%in%c("ALRA","Bfimpute","afMF","scRMD"),]$Type <- "Matrix based"
+p_all_res_melt$Type <- factor(p_all_res_melt$Type,levels=c("Matrix based","Model or smoothing based","Deep learning based"))
+
+head(p_all_res_melt)
+p_005_res_melt <- data.table::melt(p_005_res,id.vars=c("group"))
+p_005_res_melt$Type <- "Deep learning based"
+p_005_res_melt[p_005_res_melt$variable%in%c("ccImpute","I_Impute","kNN_smoothing","MAGIC","MAGIC_log"),]$Type <- "Model or smoothing based"
+p_005_res_melt[p_005_res_melt$variable%in%c("ALRA","Bfimpute","afMF","scRMD"),]$Type <- "Matrix based"
+p_005_res_melt$Type <- factor(p_005_res_melt$Type,levels=c("Matrix based","Model or smoothing based","Deep learning based"))
+```
+
+box plot
+p_all_res
+```{r}
+mdv <- p_all_res_melt %>% dplyr::group_by(variable) %>% dplyr::summarise(md=median(value,na.rm=TRUE))
+rank1 <- mdv[order(mdv$md),]$variable
+p_all_res_melt$Method <- as.character(p_all_res_melt$variable)
+p_all_res_melt$variable <- factor(p_all_res_melt$variable,levels=rank1)
+neg_md <- sum(mdv$md<=0)
+
+#performed tests
+pv <- apply(p_all[,-1],2,function(x) wilcox.test(p_all[,1],x,alternative="less",paired=TRUE)$p.value )
+pv_sig <- sapply(pv,getPsig)
+pv_sig <- pv_sig[as.character(rank1)]
+
+tmp_bp <- p_all_res_melt[,]
+tmp_bp[tmp_bp$value<(-0.25),]$value <- -0.25
+
+mix_p_all_scc_bp_rst <- ggboxplot(tmp_bp,x="variable",y="value",fill="Type")+geom_hline(yintercept=0,linetype="dashed")+geom_vline(xintercept=neg_md+0.5,linetype="dashed")+xlab("Method")+ylab("SCC Difference")+ggtitle("Bulk-SC GSEA Sign(P) SCC Difference(All Terms)(Mixture)(Rank Sum Sign(P) Based)")+annotate(geom="text",x=c(1:length(pv_sig)),y=0.25,label=pv_sig,size=7)+annotate(geom="text",x=length(pv_sig)+2.3,y=0.03,label=paste0("Raw(Median=",round(md_raw_p_all,2),")"),size=4.5)+coord_cartesian(xlim=c(1,length(pv_sig)+3.5))+theme(plot.title=element_text(size=16),legend.title=element_text(size=15),legend.text=element_text(size=14),axis.title=element_text(size=18),axis.text.x=element_text(angle=90,size=15),axis.text.y=element_text(size=15))+scale_fill_brewer(palette="Set2")
+mix_p_all_scc_bp_rst
+```
+
+heatmap
+```{r fig.height=3}
+tmp_hm <- p_all_res_melt[,]
+tmp_hm[tmp_hm$value<(-0.25),]$value <- -0.25
+colnames(tmp_hm)[3] <- "SCC_Difference"
+mix_p_all_scc_hm_rst <- ggplot(tmp_hm,aes(variable,group,fill=SCC_Difference))+geom_tile()+scale_fill_gradient2(low="blue",mid="white",high="red",midpoint=0)+geom_vline(xintercept=neg_md+0.5,linetype="dashed")+xlab("Method")+ggtitle("Bulk-SC GSEA Sign(P) SCC Difference(All Terms)(Mixture)(Rank Sum Sign(P) Based)")+theme(plot.title=element_text(size=16),legend.title=element_text(size=15),legend.text=element_text(size=14),axis.title=element_text(size=18),axis.text.x=element_text(angle=90,size=15),axis.text.y=element_text(size=8))
+mix_p_all_scc_hm_rst
+```
+
+box plot
+p_005_res
+```{r}
+mdv <- p_005_res_melt %>% dplyr::group_by(variable) %>% dplyr::summarise(md=median(value,na.rm=TRUE))
+rank1 <- mdv[order(mdv$md),]$variable
+p_005_res_melt$Method <- as.character(p_005_res_melt$variable)
+p_005_res_melt$variable <- factor(p_005_res_melt$variable,levels=rank1)
+neg_md <- sum(mdv$md<=0)
+
+#performed tests
+pv <- apply(p_005[,-1],2,function(x) wilcox.test(p_005[,1],x,alternative="less",paired=TRUE)$p.value )
+pv_sig <- sapply(pv,getPsig)
+pv_sig <- pv_sig[as.character(rank1)]
+
+tmp_bp <- p_005_res_melt[,]
+tmp_bp[tmp_bp$value<(-0.2),]$value <- -0.2
+
+mix_p_005_scc_bp_rst <- ggboxplot(tmp_bp,x="variable",y="value",fill="Type")+geom_hline(yintercept=0,linetype="dashed")+geom_vline(xintercept=neg_md+0.5,linetype="dashed")+xlab("Method")+ylab("SCC Difference")+ggtitle("Bulk-SC GSEA Sign(P) SCC Difference(P<0.05 Terms)(Mixture)(Rank Sum Sign(P) Based)")+annotate(geom="text",x=c(1:length(pv_sig)),y=0.32,label=pv_sig,size=7)+annotate(geom="text",x=length(pv_sig)+2.3,y=0.03,label=paste0("Raw(Median=",round(md_raw_p_005,2),")"),size=4.5)+coord_cartesian(xlim=c(1,length(pv_sig)+3.5))+theme(plot.title=element_text(size=16),legend.title=element_text(size=15),legend.text=element_text(size=14),axis.title=element_text(size=18),axis.text.x=element_text(angle=90,size=15),axis.text.y=element_text(size=15))+scale_fill_brewer(palette="Set2")
+mix_p_005_scc_bp_rst
+```
+
+heatmap
+```{r fig.height=3}
+tmp_hm <- p_005_res_melt[,]
+tmp_hm[tmp_hm$value<(-0.2),]$value <- -0.2
+colnames(tmp_hm)[3] <- "SCC_Difference"
+mix_p_005_scc_hm_rst <- ggplot(tmp_hm,aes(variable,group,fill=SCC_Difference))+geom_tile()+scale_fill_gradient2(low="blue",mid="white",high="red",midpoint=0)+geom_vline(xintercept=neg_md+0.5,linetype="dashed")+xlab("Method")+ggtitle("Bulk-SC GSEA Sign(P) SCC Difference(P<0.05 Terms)(Mixture)(Rank Sum Sign(P) Based)")+theme(plot.title=element_text(size=16),legend.title=element_text(size=15),legend.text=element_text(size=14),axis.title=element_text(size=18),axis.text.x=element_text(angle=90,size=15),axis.text.y=element_text(size=8))
+mix_p_005_scc_hm_rst
+```
+
+### sc level MAST
+#### sign log10P based
+```{r message=FALSE, warning=FALSE}
+#rank sum test
+Enrich_res_p <- list.files("results/SC_Bulk_DE_GSEAenrichment/")
+Enrich_res_p <- Enrich_res_p[grep("MAST_signlog10P",Enrich_res_p)]
+Enrich_res_p <- Enrich_res_p[!grepl("timecourse",Enrich_res_p)]
+
+datasets <- c("GSE75748","GSE81861","cellbench")
+p_all <- data.frame()
+p_005 <- data.frame()
+
+for(x in datasets){
+    tmp <- Enrich_res_p[grep(x,Enrich_res_p)]
+    tmppath <- paste0("results/SC_Bulk_DE_GSEAenrichment/",tmp)
+    tmp <- readRDS(tmppath)
+    tmp_name <- grep("result",names(tmp))
+    for(i in tmp_name){
+        Compare_names <- strsplit(names(tmp)[i],"result")[[1]][2]
+        p_all <- rbind(p_all,tmp[[i]][,1])
+        p_005 <- rbind(p_005,tmp[[i]][,2])
+        rownames(p_all)[nrow(p_all)] <- paste0("all",Compare_names,"_",x)
+        rownames(p_005)[nrow(p_005)] <- paste0("p0.05",Compare_names,"_",x) 
+    }
+}
+colnames(p_all) <- sapply(rownames(tmp[[tmp_name[1]]]),function(x) strsplit(x,"\\.")[[1]][1])
+colnames(p_005) <- sapply(rownames(tmp[[tmp_name[1]]]),function(x) strsplit(x,"\\.")[[1]][1])
+
+```
+
+process data
+```{r}
+md_raw_p_all <- median(p_all$raw)
+p_all_res <- as.data.frame(apply(p_all[,-1],2,function(x) x-p_all[,1] ))
+p_all_res$group <- rownames(p_all_res)
+md_raw_p_005 <- median(p_005$raw)
+p_005_res <- as.data.frame(apply(p_005[,-1],2,function(x) x-p_005[,1] ))
+p_005_res$group <- rownames(p_005_res)
+
+p_all_res_melt <- data.table::melt(p_all_res,id.vars=c("group"))
+
+p_all_res_melt$Type <- "Deep learning based"
+p_all_res_melt[p_all_res_melt$variable%in%c("ccImpute","I_Impute","kNN_smoothing","MAGIC","MAGIC_log"),]$Type <- "Model or smoothing based"
+p_all_res_melt[p_all_res_melt$variable%in%c("ALRA","Bfimpute","afMF","scRMD"),]$Type <- "Matrix based"
+p_all_res_melt$Type <- factor(p_all_res_melt$Type,levels=c("Matrix based","Model or smoothing based","Deep learning based"))
+
+head(p_all_res_melt)
+p_005_res_melt <- data.table::melt(p_005_res,id.vars=c("group"))
+
+p_005_res_melt$Type <- "Deep learning based"
+p_005_res_melt[p_005_res_melt$variable%in%c("ccImpute","I_Impute","kNN_smoothing","MAGIC","MAGIC_log"),]$Type <- "Model or smoothing based"
+p_005_res_melt[p_005_res_melt$variable%in%c("ALRA","Bfimpute","afMF","scRMD"),]$Type <- "Matrix based"
+p_005_res_melt$Type <- factor(p_005_res_melt$Type,levels=c("Matrix based","Model or smoothing based","Deep learning based"))
+```
+
+box plot
+p_all_res
+```{r}
+mdv <- p_all_res_melt %>% dplyr::group_by(variable) %>% dplyr::summarise(md=median(value,na.rm=TRUE))
+rank1 <- mdv[order(mdv$md),]$variable
+p_all_res_melt$Method <- as.character(p_all_res_melt$variable)
+p_all_res_melt$variable <- factor(p_all_res_melt$variable,levels=rank1)
+neg_md <- sum(mdv$md<=0)
+
+#performed tests
+pv <- apply(p_all[,-1],2,function(x) wilcox.test(p_all[,1],x,alternative="less",paired=TRUE)$p.value )
+pv_sig <- sapply(pv,getPsig)
+pv_sig <- pv_sig[as.character(rank1)]
+
+tmp_bp <- p_all_res_melt[,]
+tmp_bp[tmp_bp$value<(-0.25),]$value <- -0.25
+
+mix_p_all_scc_bp_mast <- ggboxplot(tmp_bp,x="variable",y="value",fill="Type")+geom_hline(yintercept=0,linetype="dashed")+geom_vline(xintercept=neg_md+0.5,linetype="dashed")+xlab("Method")+ylab("SCC Difference")+ggtitle("Bulk-SC GSEA Sign(P) SCC Difference(All Terms)(Mixture)(MAST Sign(P) Based)")+annotate(geom="text",x=c(1:length(pv_sig)),y=0.37,label=pv_sig,size=7)+annotate(geom="text",x=length(pv_sig)+2.3,y=0.03,label=paste0("Raw(Median=",round(md_raw_p_all,2),")"),size=4.5)+coord_cartesian(xlim=c(1,length(pv_sig)+3.5))+theme(plot.title=element_text(size=16),legend.title=element_text(size=15),legend.text=element_text(size=14),axis.title=element_text(size=18),axis.text.x=element_text(angle=90,size=15),axis.text.y=element_text(size=15))+scale_fill_brewer(palette="Set2")
+mix_p_all_scc_bp_mast
+```
+
+heatmap
+```{r fig.height=3}
+tmp_hm <- p_all_res_melt[,]
+tmp_hm[tmp_hm$value<(-0.25),]$value <- -0.25
+colnames(tmp_hm)[3] <- "SCC_Difference"
+mix_p_all_scc_hm_mast <- ggplot(tmp_hm,aes(variable,group,fill=SCC_Difference))+geom_tile()+scale_fill_gradient2(low="blue",mid="white",high="red",midpoint=0)+geom_vline(xintercept=neg_md+0.5,linetype="dashed")+xlab("Method")+ggtitle("Bulk-SC GSEA Sign(P) SCC Difference(All Terms)(Mixture)(MAST Sign(P) Based)")+theme(plot.title=element_text(size=16),legend.title=element_text(size=15),legend.text=element_text(size=14),axis.title=element_text(size=18),axis.text.x=element_text(angle=90,size=15),axis.text.y=element_text(size=8))
+mix_p_all_scc_hm_mast
+```
+
+box plot
+```{r}
+mdv <- p_005_res_melt %>% dplyr::group_by(variable) %>% dplyr::summarise(md=median(value,na.rm=TRUE))
+rank1 <- mdv[order(mdv$md),]$variable
+p_005_res_melt$Method <- as.character(p_005_res_melt$variable)
+p_005_res_melt$variable <- factor(p_005_res_melt$variable,levels=rank1)
+neg_md <- sum(mdv$md<=0)
+
+#performed tests
+pv <- apply(p_005[,-1],2,function(x) wilcox.test(p_005[,1],x,alternative="less",paired=TRUE)$p.value )
+pv_sig <- sapply(pv,getPsig)
+pv_sig <- pv_sig[as.character(rank1)]
+
+tmp_bp <- p_005_res_melt[,]
+tmp_bp[tmp_bp$value<(-0.25),]$value <- -0.25
+tmp_bp[tmp_bp$value>(0.3),]$value <- 0.3
+
+mix_p_005_scc_bp_mast <- ggboxplot(tmp_bp,x="variable",y="value",fill="Type")+geom_hline(yintercept=0,linetype="dashed")+geom_vline(xintercept=neg_md+0.5,linetype="dashed")+xlab("Method")+ylab("SCC Difference")+ggtitle("Bulk-SC GSEA Sign(P) SCC Difference(P<0.05 Terms)(Mixture)(MAST Sign(P) Based)")+annotate(geom="text",x=c(1:length(pv_sig)),y=0.33,label=pv_sig,size=7)+annotate(geom="text",x=length(pv_sig)+2.3,y=0.03,label=paste0("Raw(Median=",round(md_raw_p_005,2),")"),size=4.5)+coord_cartesian(xlim=c(1,length(pv_sig)+3.5))+theme(plot.title=element_text(size=16),legend.title=element_text(size=15),legend.text=element_text(size=14),axis.title=element_text(size=18),axis.text.x=element_text(angle=90,size=15),axis.text.y=element_text(size=15))+scale_fill_brewer(palette="Set2")
+mix_p_005_scc_bp_mast
+```
+
+heatmap
+```{r fig.height=3}
+tmp_hm <- p_005_res_melt[,]
+tmp_hm[tmp_hm$value<(-0.25),]$value <- -0.25
+tmp_hm[tmp_hm$value>(0.3),]$value <- 0.3
+colnames(tmp_hm)[3] <- "SCC_Difference"
+mix_p_005_scc_hm_mast <- ggplot(tmp_hm,aes(variable,group,fill=SCC_Difference))+geom_tile()+scale_fill_gradient2(low="blue",mid="white",high="red",midpoint=0)+geom_vline(xintercept=neg_md+0.5,linetype="dashed")+xlab("Method")+ggtitle("Bulk-SC GSEA Sign(P) SCC Difference(P<0.05 Terms)(Mixture)(MAST Sign(P) Based)")+theme(plot.title=element_text(size=16),legend.title=element_text(size=15),legend.text=element_text(size=14),axis.title=element_text(size=18),axis.text.x=element_text(angle=90,size=15),axis.text.y=element_text(size=8))
+mix_p_005_scc_hm_mast
+```
+
+
+#### logFC based
+```{r message=FALSE, warning=FALSE}
+Enrich_res_fc <- list.files("results/SC_Bulk_DE_GSEAenrichment/")
+Enrich_res_fc <- Enrich_res_fc[grep("MAST_logFC",Enrich_res_fc)]
+Enrich_res_fc <- Enrich_res_fc[!grepl("timecourse",Enrich_res_fc)]
+
+datasets <- c("GSE75748","GSE81861","cellbench")
+p_all <- data.frame()
+p_005 <- data.frame()
+
+for(x in datasets){
+    tmp <- Enrich_res_fc[grep(x,Enrich_res_fc)]
+    tmppath <- paste0("results/SC_Bulk_DE_GSEAenrichment/",tmp)
+    tmp <- readRDS(tmppath)
+    tmp_name <- grep("result",names(tmp))
+    for(i in tmp_name){
+        Compare_names <- strsplit(names(tmp)[i],"result")[[1]][2]
+        p_all <- rbind(p_all,tmp[[i]][,1])
+        p_005 <- rbind(p_005,tmp[[i]][,2])
+        rownames(p_all)[nrow(p_all)] <- paste0("all",Compare_names,"_",x)
+        rownames(p_005)[nrow(p_005)] <- paste0("p0.05",Compare_names,"_",x) 
+    }
+}
+colnames(p_all) <- sapply(rownames(tmp[[tmp_name[1]]]),function(x) strsplit(x,"\\.")[[1]][1])
+colnames(p_005) <- sapply(rownames(tmp[[tmp_name[1]]]),function(x) strsplit(x,"\\.")[[1]][1])
+
+```
+
+process data
+```{r}
+md_raw_p_all <- median(p_all$raw)
+p_all_res <- as.data.frame(apply(p_all[,-1],2,function(x) x-p_all[,1] ))
+p_all_res$group <- rownames(p_all_res)
+md_raw_p_005 <- median(p_005$raw)
+p_005_res <- as.data.frame(apply(p_005[,-1],2,function(x) x-p_005[,1] ))
+p_005_res$group <- rownames(p_005_res)
+
+p_all_res_melt <- data.table::melt(p_all_res,id.vars=c("group"))
+p_all_res_melt$Type <- "Deep learning based"
+p_all_res_melt[p_all_res_melt$variable%in%c("ccImpute","I_Impute","kNN_smoothing","MAGIC","MAGIC_log"),]$Type <- "Model or smoothing based"
+p_all_res_melt[p_all_res_melt$variable%in%c("ALRA","Bfimpute","afMF","scRMD"),]$Type <- "Matrix based"
+p_all_res_melt$Type <- factor(p_all_res_melt$Type,levels=c("Matrix based","Model or smoothing based","Deep learning based"))
+
+head(p_all_res_melt)
+p_005_res_melt <- data.table::melt(p_005_res,id.vars=c("group"))
+p_005_res_melt$Type <- "Deep learning based"
+p_005_res_melt[p_005_res_melt$variable%in%c("ccImpute","I_Impute","kNN_smoothing","MAGIC","MAGIC_log"),]$Type <- "Model or smoothing based"
+p_005_res_melt[p_005_res_melt$variable%in%c("ALRA","Bfimpute","afMF","scRMD"),]$Type <- "Matrix based"
+p_005_res_melt$Type <- factor(p_005_res_melt$Type,levels=c("Matrix based","Model or smoothing based","Deep learning based"))
+```
+
+box plot
+fc_all_res
+```{r}
+mdv <- p_all_res_melt %>% dplyr::group_by(variable) %>% dplyr::summarise(md=median(value,na.rm=TRUE))
+rank1 <- mdv[order(mdv$md),]$variable
+p_all_res_melt$Method <- as.character(p_all_res_melt$variable)
+p_all_res_melt$variable <- factor(p_all_res_melt$variable,levels=rank1)
+neg_md <- sum(mdv$md<=0)
+
+#performed tests
+pv <- apply(p_all[,-1],2,function(x) wilcox.test(p_all[,1],x,alternative="less",paired=TRUE)$p.value )
+pv_sig <- sapply(pv,getPsig)
+pv_sig <- pv_sig[as.character(rank1)]
+
+tmp_bp <- p_all_res_melt[,]
+tmp_bp[tmp_bp$value<(-0.25),]$value <- -0.25
+
+mix_fc_all_scc_bp_mast <- ggboxplot(tmp_bp,x="variable",y="value",fill="Type")+geom_hline(yintercept=0,linetype="dashed")+geom_vline(xintercept=neg_md+0.5,linetype="dashed")+xlab("Method")+ylab("SCC Difference")+ggtitle("Bulk-SC GSEA Sign(P) SCC Difference(All Terms)(Mixture)(MAST logFC Based)")+annotate(geom="text",x=c(1:length(pv_sig)),y=0.35,label=pv_sig,size=7)+annotate(geom="text",x=length(pv_sig)+2.3,y=0.03,label=paste0("Raw(Median=",round(md_raw_p_all,2),")"),size=4.5)+coord_cartesian(xlim=c(1,length(pv_sig)+3.5))+theme(plot.title=element_text(size=16),legend.title=element_text(size=15),legend.text=element_text(size=14),axis.title=element_text(size=18),axis.text.x=element_text(angle=90,size=15),axis.text.y=element_text(size=15))+scale_fill_brewer(palette="Set2")
+mix_fc_all_scc_bp_mast
+```
+
+heatmap
+```{r fig.height=3}
+tmp_hm <- p_all_res_melt[,]
+tmp_hm[tmp_hm$value<(-0.25),]$value <- -0.25
+colnames(tmp_hm)[3] <- "SCC_Difference"
+mix_fc_all_scc_hm_mast <- ggplot(tmp_hm,aes(variable,group,fill=SCC_Difference))+geom_tile()+scale_fill_gradient2(low="blue",mid="white",high="red",midpoint=0)+geom_vline(xintercept=neg_md+0.5,linetype="dashed")+xlab("Method")+ggtitle("Bulk-SC GSEA Sign(P) SCC Difference(All Terms)(Mixture)(MAST logFC Based)")+theme(plot.title=element_text(size=16),legend.title=element_text(size=15),legend.text=element_text(size=14),axis.title=element_text(size=18),axis.text.x=element_text(angle=90,size=15),axis.text.y=element_text(size=8))
+mix_fc_all_scc_hm_mast
+```
+
+box plot
+fc_005_res
+```{r}
+mdv <- p_005_res_melt %>% dplyr::group_by(variable) %>% dplyr::summarise(md=median(value,na.rm=TRUE))
+rank1 <- mdv[order(mdv$md),]$variable
+p_005_res_melt$Method <- as.character(p_005_res_melt$variable)
+p_005_res_melt$variable <- factor(p_005_res_melt$variable,levels=rank1)
+neg_md <- sum(mdv$md<=0)
+
+#performed tests
+pv <- apply(p_005[,-1],2,function(x) wilcox.test(p_005[,1],x,alternative="less",paired=TRUE)$p.value )
+pv_sig <- sapply(pv,getPsig)
+pv_sig <- pv_sig[as.character(rank1)]
+
+tmp_bp <- p_005_res_melt[,]
+tmp_bp[tmp_bp$value<(-0.25),]$value <- -0.25
+
+mix_fc_005_scc_bp_mast <- ggboxplot(tmp_bp,x="variable",y="value",fill="Type")+geom_hline(yintercept=0,linetype="dashed")+geom_vline(xintercept=neg_md+0.5,linetype="dashed")+xlab("Method")+ylab("SCC Difference")+ggtitle("Bulk-SC GSEA Sign(P) SCC Difference(P<0.05 Terms)(Mixture)(MAST logFC Based)")+annotate(geom="text",x=c(1:length(pv_sig)),y=0.35,label=pv_sig,size=7)+annotate(geom="text",x=length(pv_sig)+2.3,y=0.03,label=paste0("Raw(Median=",round(md_raw_p_005,2),")"),size=4.5)+coord_cartesian(xlim=c(1,length(pv_sig)+3.5))+theme(plot.title=element_text(size=16),legend.title=element_text(size=15),legend.text=element_text(size=14),axis.title=element_text(size=18),axis.text.x=element_text(angle=90,size=15),axis.text.y=element_text(size=15))+scale_fill_brewer(palette="Set2")
+mix_fc_005_scc_bp_mast
+```
+
+heatmap
+```{r fig.height=3}
+tmp_hm <- p_005_res_melt[,]
+tmp_hm[tmp_hm$value<(-0.25),]$value <- -0.25
+colnames(tmp_hm)[3] <- "SCC_Difference"
+mix_fc_005_scc_hm_mast <- ggplot(tmp_hm,aes(variable,group,fill=SCC_Difference))+geom_tile()+scale_fill_gradient2(low="blue",mid="white",high="red",midpoint=0)+geom_vline(xintercept=neg_md+0.5,linetype="dashed")+xlab("Method")+ggtitle("Bulk-SC GSEA Sign(P) SCC Difference(P<0.05 Terms)(Mixture)(MAST logFC Based)")+theme(plot.title=element_text(size=16),legend.title=element_text(size=15),legend.text=element_text(size=14),axis.title=element_text(size=18),axis.text.x=element_text(angle=90,size=15),axis.text.y=element_text(size=8))
+mix_fc_005_scc_hm_mast
+```
+
+
+## purified sample
+### sc level RST
+#### sign log10P based
+```{r message=FALSE, warning=FALSE}
+#rank sum test
+Enrich_res_p <- list.files("results/SC_Bulk_DE_GSEAenrichment/")
+Enrich_res_p <- Enrich_res_p[grep("scRST_signlog10P",Enrich_res_p)]
+Enrich_res_p <- Enrich_res_p[!grepl("timecourse",Enrich_res_p)]
+
+datasets <- c("Angelidis2019_alvmac","Angelidis2019_pneumo","CanoGamez2020_memory_iTreg","CanoGamez2020_memory_Th0","CanoGamez2020_memory_Th2","CanoGamez2020_naive_iTreg","CanoGamez2020_naive_Th0")
+p_all <- data.frame()
+p_005 <- data.frame()
+
+for(x in datasets){
+    tmp <- Enrich_res_p[grep(x,Enrich_res_p)]
+    tmppath <- paste0("results/SC_Bulk_DE_GSEAenrichment/",tmp)
+    tmp <- readRDS(tmppath)
+    tmp_name <- grep("result",names(tmp))
+    for(i in tmp_name){
+        Compare_names <- strsplit(names(tmp)[i],"result")[[1]][2]
+        p_all <- rbind(p_all,tmp[[i]][,1])
+        p_005 <- rbind(p_005,tmp[[i]][,2])
+        rownames(p_all)[nrow(p_all)] <- paste0("all",Compare_names,"_",x)
+        rownames(p_005)[nrow(p_005)] <- paste0("p0.05",Compare_names,"_",x) 
+    }
+}
+colnames(p_all) <- sapply(rownames(tmp[[tmp_name[1]]]),function(x) strsplit(x,"\\.")[[1]][1])
+colnames(p_005) <- sapply(rownames(tmp[[tmp_name[1]]]),function(x) strsplit(x,"\\.")[[1]][1])
+
+```
+
+process data
+```{r}
+md_raw_p_all <- median(p_all$raw)
+p_all_res <- as.data.frame(apply(p_all[,-1],2,function(x) x-p_all[,1] ))
+p_all_res$group <- rownames(p_all_res)
+md_raw_p_005 <- median(p_005$raw)
+p_005_res <- as.data.frame(apply(p_005[,-1],2,function(x) x-p_005[,1] ))
+p_005_res$group <- rownames(p_005_res)
+
+p_all_res_melt <- data.table::melt(p_all_res,id.vars=c("group"))
+p_all_res_melt$Type <- "Deep learning based"
+p_all_res_melt[p_all_res_melt$variable%in%c("ccImpute","I_Impute","kNN_smoothing","MAGIC","MAGIC_log"),]$Type <- "Model or smoothing based"
+p_all_res_melt[p_all_res_melt$variable%in%c("ALRA","Bfimpute","afMF","scRMD"),]$Type <- "Matrix based"
+p_all_res_melt$Type <- factor(p_all_res_melt$Type,levels=c("Matrix based","Model or smoothing based","Deep learning based"))
+
+head(p_all_res_melt)
+p_005_res_melt <- data.table::melt(p_005_res,id.vars=c("group"))
+p_005_res_melt$Type <- "Deep learning based"
+p_005_res_melt[p_005_res_melt$variable%in%c("ccImpute","I_Impute","kNN_smoothing","MAGIC","MAGIC_log"),]$Type <- "Model or smoothing based"
+p_005_res_melt[p_005_res_melt$variable%in%c("ALRA","Bfimpute","afMF","scRMD"),]$Type <- "Matrix based"
+p_005_res_melt$Type <- factor(p_005_res_melt$Type,levels=c("Matrix based","Model or smoothing based","Deep learning based"))
+```
+
+box plot
+p_all_res
+```{r}
+mdv <- p_all_res_melt %>% dplyr::group_by(variable) %>% dplyr::summarise(md=median(value,na.rm=TRUE))
+rank1 <- mdv[order(mdv$md),]$variable
+p_all_res_melt$Method <- as.character(p_all_res_melt$variable)
+p_all_res_melt$variable <- factor(p_all_res_melt$variable,levels=rank1)
+neg_md <- sum(mdv$md<=0)
+
+#performed tests
+pv <- apply(p_all[,-1],2,function(x) wilcox.test(p_all[,1],x,alternative="less",paired=TRUE)$p.value )
+pv_sig <- sapply(pv,getPsig)
+pv_sig <- pv_sig[as.character(rank1)]
+
+tmp_bp <- p_all_res_melt[,]
+
+pur_p_all_scc_bp_rst <- ggboxplot(tmp_bp,x="variable",y="value",fill="Type")+geom_hline(yintercept=0,linetype="dashed")+geom_vline(xintercept=neg_md+0.5,linetype="dashed")+xlab("Method")+ylab("SCC Difference")+ggtitle("Bulk-SC GSEA Sign(P) SCC Difference(All Terms)(Purified)(Rank Sum Sign(P) Based)")+annotate(geom="text",x=c(1:length(pv_sig)),y=0.37,label=pv_sig,size=7)+annotate(geom="text",x=length(pv_sig)+2.3,y=0.02,label=paste0("Raw(Median=",round(md_raw_p_all,2),")"),size=4.5)+coord_cartesian(xlim=c(1,length(pv_sig)+3.5))+theme(plot.title=element_text(size=16),legend.title=element_text(size=15),legend.text=element_text(size=14),axis.title=element_text(size=18),axis.text.x=element_text(angle=90,size=15),axis.text.y=element_text(size=15))+scale_fill_brewer(palette="Set2")
+pur_p_all_scc_bp_rst
+```
+
+heatmap
+```{r}
+tmp_hm <- p_all_res_melt[,]
+#tmp_hm[tmp_hm$value<(-0.25),]$value <- -0.25
+colnames(tmp_hm)[3] <- "SCC_Difference"
+pur_p_all_scc_hm_rst <- ggplot(tmp_hm,aes(variable,group,fill=SCC_Difference))+geom_tile()+scale_fill_gradient2(low="blue",mid="white",high="red",midpoint=0)+geom_vline(xintercept=neg_md+0.5,linetype="dashed")+xlab("Method")+ggtitle("Bulk-SC GSEA Sign(P) SCC Difference(All Terms)(Purified)(Rank Sum Sign(P) Based)")+theme(plot.title=element_text(size=16),legend.title=element_text(size=15),legend.text=element_text(size=14),axis.title=element_text(size=18),axis.text.x=element_text(angle=90,size=15),axis.text.y=element_text(size=8))
+pur_p_all_scc_hm_rst
+```
+
+box plot
+```{r}
+mdv <- p_005_res_melt %>% dplyr::group_by(variable) %>% dplyr::summarise(md=median(value,na.rm=TRUE))
+rank1 <- mdv[order(mdv$md),]$variable
+p_005_res_melt$Method <- as.character(p_005_res_melt$variable)
+p_005_res_melt$variable <- factor(p_005_res_melt$variable,levels=rank1)
+neg_md <- sum(mdv$md<=0)
+
+#performed tests
+pv <- apply(p_005[,-1],2,function(x) wilcox.test(p_005[,1],x,alternative="less",paired=TRUE)$p.value )
+pv_sig <- sapply(pv,getPsig)
+pv_sig <- pv_sig[as.character(rank1)]
+
+tmp_bp <- p_005_res_melt[,]
+
+pur_p_005_scc_bp_rst <- ggboxplot(tmp_bp,x="variable",y="value",fill="Type")+geom_hline(yintercept=0,linetype="dashed")+geom_vline(xintercept=neg_md+0.5,linetype="dashed")+xlab("Method")+ylab("SCC Difference")+ggtitle("Bulk-SC GSEA Sign(P) SCC Difference(P<0.05 Terms)(Purified)(Rank Sum Sign(P) Based)")+annotate(geom="text",x=c(1:length(pv_sig)),y=0.3,label=pv_sig,size=7)+annotate(geom="text",x=length(pv_sig)+2.3,y=0.03,label=paste0("Raw(Median=",round(md_raw_p_005,2),")"),size=4.5)+coord_cartesian(xlim=c(1,length(pv_sig)+3.5))+theme(plot.title=element_text(size=16),legend.title=element_text(size=15),legend.text=element_text(size=14),axis.title=element_text(size=18),axis.text.x=element_text(angle=90,size=15),axis.text.y=element_text(size=15))+scale_fill_brewer(palette="Set2")
+pur_p_005_scc_bp_rst
+```
+
+heatmap
+```{r}
+tmp_hm <- p_005_res_melt[,]
+#tmp_hm[tmp_hm$value<(-0.2),]$value <- -0.2
+colnames(tmp_hm)[3] <- "SCC_Difference"
+pur_p_005_scc_hm_rst <- ggplot(tmp_hm,aes(variable,group,fill=SCC_Difference))+geom_tile()+scale_fill_gradient2(low="blue",mid="white",high="red",midpoint=0)+geom_vline(xintercept=neg_md+0.5,linetype="dashed")+xlab("Method")+ggtitle("Bulk-SC GSEA Sign(P) SCC Difference(P<0.05 Terms)(Purified)(Rank Sum Sign(P) Based)")+theme(plot.title=element_text(size=16),legend.title=element_text(size=15),legend.text=element_text(size=14),axis.title=element_text(size=18),axis.text.x=element_text(angle=90,size=15),axis.text.y=element_text(size=8))
+pur_p_005_scc_hm_rst
+```
+
+### sc level MAST
+#### sign log10P based
+```{r message=FALSE, warning=FALSE}
+#rank sum test
+Enrich_res_p <- list.files("results/SC_Bulk_DE_GSEAenrichment/")
+Enrich_res_p <- Enrich_res_p[grep("MAST_signlog10P",Enrich_res_p)]
+Enrich_res_p <- Enrich_res_p[!grepl("timecourse",Enrich_res_p)]
+
+datasets <- c("Angelidis2019_alvmac","Angelidis2019_pneumo","CanoGamez2020_memory_iTreg","CanoGamez2020_memory_Th0","CanoGamez2020_memory_Th2","CanoGamez2020_naive_iTreg","CanoGamez2020_naive_Th0")
+p_all <- data.frame()
+p_005 <- data.frame()
+
+for(x in datasets){
+    tmp <- Enrich_res_p[grep(x,Enrich_res_p)]
+    tmppath <- paste0("results/SC_Bulk_DE_GSEAenrichment/",tmp)
+    tmp <- readRDS(tmppath)
+    tmp_name <- grep("result",names(tmp))
+    for(i in tmp_name){
+        Compare_names <- strsplit(names(tmp)[i],"result")[[1]][2]
+        p_all <- rbind(p_all,tmp[[i]][,1])
+        p_005 <- rbind(p_005,tmp[[i]][,2])
+        rownames(p_all)[nrow(p_all)] <- paste0("all",Compare_names,"_",x)
+        rownames(p_005)[nrow(p_005)] <- paste0("p0.05",Compare_names,"_",x) 
+    }
+}
+colnames(p_all) <- sapply(rownames(tmp[[tmp_name[1]]]),function(x) strsplit(x,"\\.")[[1]][1])
+colnames(p_005) <- sapply(rownames(tmp[[tmp_name[1]]]),function(x) strsplit(x,"\\.")[[1]][1])
+
+```
+
+process data
+```{r}
+md_raw_p_all <- median(p_all$raw)
+p_all_res <- as.data.frame(apply(p_all[,-1],2,function(x) x-p_all[,1] ))
+p_all_res$group <- rownames(p_all_res)
+md_raw_p_005 <- median(p_005$raw)
+p_005_res <- as.data.frame(apply(p_005[,-1],2,function(x) x-p_005[,1] ))
+p_005_res$group <- rownames(p_005_res)
+
+p_all_res_melt <- data.table::melt(p_all_res,id.vars=c("group"))
+p_all_res_melt$Type <- "Deep learning based"
+p_all_res_melt[p_all_res_melt$variable%in%c("ccImpute","I_Impute","kNN_smoothing","MAGIC","MAGIC_log"),]$Type <- "Model or smoothing based"
+p_all_res_melt[p_all_res_melt$variable%in%c("ALRA","Bfimpute","afMF","scRMD"),]$Type <- "Matrix based"
+p_all_res_melt$Type <- factor(p_all_res_melt$Type,levels=c("Matrix based","Model or smoothing based","Deep learning based"))
+head(p_all_res_melt)
+
+p_005_res_melt <- data.table::melt(p_005_res,id.vars=c("group"))
+p_005_res_melt$Type <- "Deep learning based"
+p_005_res_melt[p_005_res_melt$variable%in%c("ccImpute","I_Impute","kNN_smoothing","MAGIC","MAGIC_log"),]$Type <- "Model or smoothing based"
+p_005_res_melt[p_005_res_melt$variable%in%c("ALRA","Bfimpute","afMF","scRMD"),]$Type <- "Matrix based"
+p_005_res_melt$Type <- factor(p_005_res_melt$Type,levels=c("Matrix based","Model or smoothing based","Deep learning based"))
+```
+
+box plot
+p_all_res
+```{r}
+mdv <- p_all_res_melt %>% dplyr::group_by(variable) %>% dplyr::summarise(md=median(value,na.rm=TRUE))
+rank1 <- mdv[order(mdv$md),]$variable
+p_all_res_melt$Method <- as.character(p_all_res_melt$variable)
+p_all_res_melt$variable <- factor(p_all_res_melt$variable,levels=rank1)
+neg_md <- sum(mdv$md<=0)
+
+#performed tests
+pv <- apply(p_all[,-1],2,function(x) wilcox.test(p_all[,1],x,alternative="less",paired=TRUE)$p.value )
+pv_sig <- sapply(pv,getPsig)
+pv_sig <- pv_sig[as.character(rank1)]
+
+tmp_bp <- p_all_res_melt[,]
+
+pur_p_all_scc_bp_mast <- ggboxplot(tmp_bp,x="variable",y="value",fill="Type")+geom_hline(yintercept=0,linetype="dashed")+geom_vline(xintercept=neg_md+0.5,linetype="dashed")+xlab("Method")+ylab("SCC Difference")+ggtitle("Bulk-SC GSEA Sign(P) SCC Difference(All Terms)(Purified)(MAST Sign(P) Based)")+annotate(geom="text",x=c(1:length(pv_sig)),y=1.1,label=pv_sig,size=7)+annotate(geom="text",x=length(pv_sig)+2.3,y=0.06,label=paste0("Raw(Median=",round(md_raw_p_all,2),")"),size=4.5)+coord_cartesian(xlim=c(1,length(pv_sig)+3.5))+theme(plot.title=element_text(size=16),legend.title=element_text(size=15),legend.text=element_text(size=14),axis.title=element_text(size=18),axis.text.x=element_text(angle=90,size=15),axis.text.y=element_text(size=15))+scale_fill_brewer(palette="Set2")
+pur_p_all_scc_bp_mast
+```
+
+heatmap
+```{r}
+tmp_hm <- p_all_res_melt[,]
+#tmp_hm[tmp_hm$value<(-0.25),]$value <- -0.25
+colnames(tmp_hm)[3] <- "SCC_Difference"
+pur_p_all_scc_hm_mast <- ggplot(tmp_hm,aes(variable,group,fill=SCC_Difference))+geom_tile()+scale_fill_gradient2(low="blue",mid="white",high="red",midpoint=0)+geom_vline(xintercept=neg_md+0.5,linetype="dashed")+xlab("Method")+ggtitle("Bulk-SC GSEA Sign(P) SCC Difference(All Terms)(Purified)(MAST Sign(P) Based)")+theme(plot.title=element_text(size=16),legend.title=element_text(size=15),legend.text=element_text(size=14),axis.title=element_text(size=18),axis.text.x=element_text(angle=90,size=15),axis.text.y=element_text(size=8))
+pur_p_all_scc_hm_mast
+```
+
+box plot
+```{r}
+mdv <- p_005_res_melt %>% dplyr::group_by(variable) %>% dplyr::summarise(md=median(value,na.rm=TRUE))
+rank1 <- mdv[order(mdv$md),]$variable
+p_005_res_melt$Method <- as.character(p_005_res_melt$variable)
+p_005_res_melt$variable <- factor(p_005_res_melt$variable,levels=rank1)
+neg_md <- sum(mdv$md<=0)
+
+#performed tests
+pv <- apply(p_005[,-1],2,function(x) wilcox.test(p_005[,1],x,alternative="less",paired=TRUE)$p.value )
+pv_sig <- sapply(pv,getPsig)
+pv_sig <- pv_sig[as.character(rank1)]
+
+tmp_bp <- p_005_res_melt[,]
+
+pur_p_005_scc_bp_mast <- ggboxplot(tmp_bp,x="variable",y="value",fill="Type")+geom_hline(yintercept=0,linetype="dashed")+geom_vline(xintercept=neg_md+0.5,linetype="dashed")+xlab("Method")+ylab("SCC Difference")+ggtitle("Bulk-SC GSEA Sign(P) SCC Difference(P<0.05 Terms)(Purified)(MAST Sign(P) Based)")+annotate(geom="text",x=c(1:length(pv_sig)),y=1.2,label=pv_sig,size=7)+annotate(geom="text",x=length(pv_sig)+2.3,y=0.07,label=paste0("Raw(Median=",round(md_raw_p_005,2),")"),size=4.5)+coord_cartesian(xlim=c(1,length(pv_sig)+3.5))+theme(plot.title=element_text(size=16),legend.title=element_text(size=15),legend.text=element_text(size=14),axis.title=element_text(size=18),axis.text.x=element_text(angle=90,size=15),axis.text.y=element_text(size=15))+scale_fill_brewer(palette="Set2")
+pur_p_005_scc_bp_mast
+```
+
+heatmap
+```{r}
+tmp_hm <- p_005_res_melt[,]
+#tmp_hm[tmp_hm$value<(-0.25),]$value <- -0.25
+#tmp_hm[tmp_hm$value>(0.3),]$value <- 0.3
+colnames(tmp_hm)[3] <- "SCC_Difference"
+pur_p_005_scc_hm_mast <- ggplot(tmp_hm,aes(variable,group,fill=SCC_Difference))+geom_tile()+scale_fill_gradient2(low="blue",mid="white",high="red",midpoint=0)+geom_vline(xintercept=neg_md+0.5,linetype="dashed")+xlab("Method")+ggtitle("Bulk-SC GSEA Sign(P) SCC Difference(P<0.05 Terms)(Purified)(MAST Sign(P) Based)")+theme(plot.title=element_text(size=16),legend.title=element_text(size=15),legend.text=element_text(size=14),axis.title=element_text(size=18),axis.text.x=element_text(angle=90,size=15),axis.text.y=element_text(size=8))
+pur_p_005_scc_hm_mast
+```
+
+
+#### logFC based
+```{r message=FALSE, warning=FALSE}
+#rank sum test
+Enrich_res_fc <- list.files("results/SC_Bulk_DE_GSEAenrichment/")
+Enrich_res_fc <- Enrich_res_fc[grep("MAST_logFC",Enrich_res_fc)]
+Enrich_res_fc <- Enrich_res_fc[!grepl("timecourse",Enrich_res_fc)]
+
+datasets <- c("Angelidis2019_alvmac","Angelidis2019_pneumo","CanoGamez2020_memory_iTreg","CanoGamez2020_memory_Th0","CanoGamez2020_memory_Th2","CanoGamez2020_naive_iTreg","CanoGamez2020_naive_Th0")
+p_all <- data.frame()
+p_005 <- data.frame()
+
+for(x in datasets){
+    tmp <- Enrich_res_fc[grep(x,Enrich_res_fc)]
+    tmppath <- paste0("results/SC_Bulk_DE_GSEAenrichment/",tmp)
+    tmp <- readRDS(tmppath)
+    tmp_name <- grep("result",names(tmp))
+    for(i in tmp_name){
+        Compare_names <- strsplit(names(tmp)[i],"result")[[1]][2]
+        p_all <- rbind(p_all,tmp[[i]][,1])
+        p_005 <- rbind(p_005,tmp[[i]][,2])
+        rownames(p_all)[nrow(p_all)] <- paste0("all",Compare_names,"_",x)
+        rownames(p_005)[nrow(p_005)] <- paste0("p0.05",Compare_names,"_",x) 
+    }
+}
+colnames(p_all) <- sapply(rownames(tmp[[tmp_name[1]]]),function(x) strsplit(x,"\\.")[[1]][1])
+colnames(p_005) <- sapply(rownames(tmp[[tmp_name[1]]]),function(x) strsplit(x,"\\.")[[1]][1])
+
+```
+
+process data
+```{r}
+md_raw_p_all <- median(p_all$raw)
+p_all_res <- as.data.frame(apply(p_all[,-1],2,function(x) x-p_all[,1] ))
+p_all_res$group <- rownames(p_all_res)
+md_raw_p_005 <- median(p_005$raw)
+p_005_res <- as.data.frame(apply(p_005[,-1],2,function(x) x-p_005[,1] ))
+p_005_res$group <- rownames(p_005_res)
+
+p_all_res_melt <- data.table::melt(p_all_res,id.vars=c("group"))
+
+p_all_res_melt$Type <- "Deep learning based"
+p_all_res_melt[p_all_res_melt$variable%in%c("ccImpute","I_Impute","kNN_smoothing","MAGIC","MAGIC_log"),]$Type <- "Model or smoothing based"
+p_all_res_melt[p_all_res_melt$variable%in%c("ALRA","Bfimpute","afMF","scRMD"),]$Type <- "Matrix based"
+p_all_res_melt$Type <- factor(p_all_res_melt$Type,levels=c("Matrix based","Model or smoothing based","Deep learning based"))
+
+head(p_all_res_melt)
+
+p_005_res_melt <- data.table::melt(p_005_res,id.vars=c("group"))
+
+p_005_res_melt$Type <- "Deep learning based"
+p_005_res_melt[p_005_res_melt$variable%in%c("ccImpute","I_Impute","kNN_smoothing","MAGIC","MAGIC_log"),]$Type <- "Model or smoothing based"
+p_005_res_melt[p_005_res_melt$variable%in%c("ALRA","Bfimpute","afMF","scRMD"),]$Type <- "Matrix based"
+p_005_res_melt$Type <- factor(p_005_res_melt$Type,levels=c("Matrix based","Model or smoothing based","Deep learning based"))
+```
+
+box plot
+fc_all_res
+```{r}
+mdv <- p_all_res_melt %>% dplyr::group_by(variable) %>% dplyr::summarise(md=median(value,na.rm=TRUE))
+rank1 <- mdv[order(mdv$md),]$variable
+p_all_res_melt$Method <- as.character(p_all_res_melt$variable)
+p_all_res_melt$variable <- factor(p_all_res_melt$variable,levels=rank1)
+neg_md <- sum(mdv$md<=0)
+
+#performed tests
+pv <- apply(p_all[,-1],2,function(x) wilcox.test(p_all[,1],x,alternative="less",paired=TRUE)$p.value )
+pv_sig <- sapply(pv,getPsig)
+pv_sig <- pv_sig[as.character(rank1)]
+
+tmp_bp <- p_all_res_melt[,]
+
+pur_fc_all_scc_bp_mast <- ggboxplot(tmp_bp,x="variable",y="value",fill="Type")+geom_hline(yintercept=0,linetype="dashed")+geom_vline(xintercept=neg_md+0.5,linetype="dashed")+xlab("Method")+ylab("SCC Difference")+ggtitle("Bulk-SC GSEA Sign(P) SCC Difference(All Terms)(Purified)(MAST logFC Based)")+annotate(geom="text",x=c(1:length(pv_sig)),y=0.6,label=pv_sig,size=7)+annotate(geom="text",x=length(pv_sig)+2.3,y=0.04,label=paste0("Raw(Median=",round(md_raw_p_all,2),")"),size=4.5)+coord_cartesian(xlim=c(1,length(pv_sig)+3.5))+theme(plot.title=element_text(size=16),legend.title=element_text(size=15),legend.text=element_text(size=14),axis.title=element_text(size=18),axis.text.x=element_text(angle=90,size=15),axis.text.y=element_text(size=15))+scale_fill_brewer(palette="Set2")
+pur_fc_all_scc_bp_mast
+```
+
+heatmap
+```{r}
+tmp_hm <- p_all_res_melt[,]
+#tmp_hm[tmp_hm$value<(-0.25),]$value <- -0.25
+colnames(tmp_hm)[3] <- "SCC_Difference"
+pur_fc_all_scc_hm_mast <- ggplot(tmp_hm,aes(variable,group,fill=SCC_Difference))+geom_tile()+scale_fill_gradient2(low="blue",mid="white",high="red",midpoint=0)+geom_vline(xintercept=neg_md+0.5,linetype="dashed")+xlab("Method")+ggtitle("Bulk-SC GSEA Sign(P) SCC Difference(All Terms)(Purified)(MAST logFC Based)")+theme(plot.title=element_text(size=16),legend.title=element_text(size=15),legend.text=element_text(size=14),axis.title=element_text(size=18),axis.text.x=element_text(angle=90,size=15),axis.text.y=element_text(size=8))
+pur_fc_all_scc_hm_mast
+```
+
+box plot
+fc_005_res
+```{r}
+mdv <- p_005_res_melt %>% dplyr::group_by(variable) %>% dplyr::summarise(md=median(value,na.rm=TRUE))
+rank1 <- mdv[order(mdv$md),]$variable
+p_005_res_melt$Method <- as.character(p_005_res_melt$variable)
+p_005_res_melt$variable <- factor(p_005_res_melt$variable,levels=rank1)
+neg_md <- sum(mdv$md<=0)
+
+#performed tests
+pv <- apply(p_005[,-1],2,function(x) wilcox.test(p_005[,1],x,alternative="less",paired=TRUE)$p.value )
+pv_sig <- sapply(pv,getPsig)
+pv_sig <- pv_sig[as.character(rank1)]
+
+tmp_bp <- p_005_res_melt[,]
+
+pur_fc_005_scc_bp_mast <- ggboxplot(tmp_bp,x="variable",y="value",fill="Type")+geom_hline(yintercept=0,linetype="dashed")+geom_vline(xintercept=neg_md+0.5,linetype="dashed")+xlab("Method")+ylab("SCC Difference")+ggtitle("Bulk-SC GSEA Sign(P) SCC Difference(P<0.05 Terms)(Purified)(MAST logFC Based)")+annotate(geom="text",x=c(1:length(pv_sig)),y=0.75,label=pv_sig,size=7)+annotate(geom="text",x=length(pv_sig)+2.3,y=0.05,label=paste0("Raw(Median=",round(md_raw_p_005,2),")"),size=4.5)+coord_cartesian(xlim=c(1,length(pv_sig)+3.5))+theme(plot.title=element_text(size=16),legend.title=element_text(size=15),legend.text=element_text(size=14),axis.title=element_text(size=18),axis.text.x=element_text(angle=90,size=15),axis.text.y=element_text(size=15))+scale_fill_brewer(palette="Set2")
+pur_fc_005_scc_bp_mast
+```
+
+heatmap
+```{r}
+tmp_hm <- p_005_res_melt[,]
+#tmp_hm[tmp_hm$value<(-0.25),]$value <- -0.25
+colnames(tmp_hm)[3] <- "SCC_Difference"
+pur_fc_005_scc_hm_mast <- ggplot(tmp_hm,aes(variable,group,fill=SCC_Difference))+geom_tile()+scale_fill_gradient2(low="blue",mid="white",high="red",midpoint=0)+geom_vline(xintercept=neg_md+0.5,linetype="dashed")+xlab("Method")+ggtitle("Bulk-SC GSEA Sign(P) SCC Difference(P<0.05 Terms)(Purified)(MAST logFC Based)")+theme(plot.title=element_text(size=16),legend.title=element_text(size=15),legend.text=element_text(size=14),axis.title=element_text(size=18),axis.text.x=element_text(angle=90,size=15),axis.text.y=element_text(size=8))
+pur_fc_005_scc_hm_mast
+```
+
+
+### PBlimma
+#### sign log10P based
+```{r message=FALSE, warning=FALSE}
+#rank sum test
+Enrich_res_p <- list.files("results/SC_Bulk_DE_GSEAenrichment/")
+Enrich_res_p <- Enrich_res_p[grep("PBlimma_signlog10P",Enrich_res_p)]
+Enrich_res_p <- Enrich_res_p[!grepl("timecourse",Enrich_res_p)]
+
+datasets <- c("Angelidis2019_alvmac","Angelidis2019_pneumo","CanoGamez2020_memory_iTreg","CanoGamez2020_memory_Th0","CanoGamez2020_memory_Th2","CanoGamez2020_naive_iTreg","CanoGamez2020_naive_Th0")
+p_all <- data.frame()
+p_005 <- data.frame()
+
+for(x in datasets){
+    tmp <- Enrich_res_p[grep(x,Enrich_res_p)]
+    tmppath <- paste0("results/SC_Bulk_DE_GSEAenrichment/",tmp)
+    tmp <- readRDS(tmppath)
+    tmp_name <- grep("result",names(tmp))
+    for(i in tmp_name){
+        Compare_names <- strsplit(names(tmp)[i],"result")[[1]][2]
+        p_all <- rbind(p_all,tmp[[i]][,1])
+        p_005 <- rbind(p_005,tmp[[i]][,2])
+        rownames(p_all)[nrow(p_all)] <- paste0("all",Compare_names,"_",x)
+        rownames(p_005)[nrow(p_005)] <- paste0("p0.05",Compare_names,"_",x) 
+    }
+}
+colnames(p_all) <- sapply(rownames(tmp[[tmp_name[1]]]),function(x) strsplit(x,"\\.")[[1]][1])
+colnames(p_005) <- sapply(rownames(tmp[[tmp_name[1]]]),function(x) strsplit(x,"\\.")[[1]][1])
+
+```
+
+process data
+```{r}
+md_raw_p_all <- median(p_all$raw)
+p_all_res <- as.data.frame(apply(p_all[,-1],2,function(x) x-p_all[,1] ))
+p_all_res$group <- rownames(p_all_res)
+md_raw_p_005 <- median(p_005$raw)
+p_005_res <- as.data.frame(apply(p_005[,-1],2,function(x) x-p_005[,1] ))
+p_005_res$group <- rownames(p_005_res)
+
+p_all_res_melt <- data.table::melt(p_all_res,id.vars=c("group"))
+
+p_all_res_melt$Type <- "Deep learning based"
+p_all_res_melt[p_all_res_melt$variable%in%c("ccImpute","I_Impute","kNN_smoothing","MAGIC","MAGIC_log"),]$Type <- "Model or smoothing based"
+p_all_res_melt[p_all_res_melt$variable%in%c("ALRA","Bfimpute","afMF","scRMD"),]$Type <- "Matrix based"
+p_all_res_melt$Type <- factor(p_all_res_melt$Type,levels=c("Matrix based","Model or smoothing based","Deep learning based"))
+
+head(p_all_res_melt)
+p_005_res_melt <- data.table::melt(p_005_res,id.vars=c("group"))
+
+p_005_res_melt$Type <- "Deep learning based"
+p_005_res_melt[p_005_res_melt$variable%in%c("ccImpute","I_Impute","kNN_smoothing","MAGIC","MAGIC_log"),]$Type <- "Model or smoothing based"
+p_005_res_melt[p_005_res_melt$variable%in%c("ALRA","Bfimpute","afMF","scRMD"),]$Type <- "Matrix based"
+p_005_res_melt$Type <- factor(p_005_res_melt$Type,levels=c("Matrix based","Model or smoothing based","Deep learning based"))
+
+```
+
+box plot
+p_all_res
+```{r}
+mdv <- p_all_res_melt %>% dplyr::group_by(variable) %>% dplyr::summarise(md=median(value,na.rm=TRUE))
+rank1 <- mdv[order(mdv$md),]$variable
+p_all_res_melt$Method <- as.character(p_all_res_melt$variable)
+p_all_res_melt$variable <- factor(p_all_res_melt$variable,levels=rank1)
+neg_md <- sum(mdv$md<=0)
+
+#performed tests
+pv <- apply(p_all[,-1],2,function(x) wilcox.test(p_all[,1],x,alternative="less",paired=TRUE)$p.value )
+pv_sig <- sapply(pv,getPsig)
+pv_sig <- pv_sig[as.character(rank1)]
+
+tmp_bp <- p_all_res_melt[,]
+
+pur_p_all_scc_bp_limma <- ggboxplot(tmp_bp,x="variable",y="value",fill="Type")+geom_hline(yintercept=0,linetype="dashed")+geom_vline(xintercept=neg_md+0.5,linetype="dashed")+xlab("Method")+ylab("SCC Difference")+ggtitle("Bulk-SC GSEA Sign(P) SCC Difference(All Terms)(Purified)(PB-limma Sign(P) Based)")+annotate(geom="text",x=c(1:length(pv_sig)),y=0.1,label=pv_sig,size=7)+annotate(geom="text",x=length(pv_sig)+2.3,y=0.02,label=paste0("Raw(Median=",round(md_raw_p_all,2),")"),size=4.5)+coord_cartesian(xlim=c(1,length(pv_sig)+3.5))+theme(plot.title=element_text(size=16),legend.title=element_text(size=15),legend.text=element_text(size=14),axis.title=element_text(size=18),axis.text.x=element_text(angle=90,size=15),axis.text.y=element_text(size=15))+scale_fill_brewer(palette="Set2")
+pur_p_all_scc_bp_limma
+```
+
+heatmap
+```{r}
+tmp_hm <- p_all_res_melt[,]
+#tmp_hm[tmp_hm$value<(-0.25),]$value <- -0.25
+colnames(tmp_hm)[3] <- "SCC_Difference"
+pur_p_all_scc_hm_limma <- ggplot(tmp_hm,aes(variable,group,fill=SCC_Difference))+geom_tile()+scale_fill_gradient2(low="blue",mid="white",high="red",midpoint=0)+geom_vline(xintercept=neg_md+0.5,linetype="dashed")+xlab("Method")+ggtitle("Bulk-SC GSEA Sign(P) SCC Difference(All Terms)(Purified)(PB-limma Sign(P) Based)")+theme(plot.title=element_text(size=16),legend.title=element_text(size=15),legend.text=element_text(size=14),axis.title=element_text(size=18),axis.text.x=element_text(angle=90,size=15),axis.text.y=element_text(size=8))
+pur_p_all_scc_hm_limma
+```
+
+box plot
+```{r}
+mdv <- p_005_res_melt %>% dplyr::group_by(variable) %>% dplyr::summarise(md=median(value,na.rm=TRUE))
+rank1 <- mdv[order(mdv$md),]$variable
+p_005_res_melt$Method <- as.character(p_005_res_melt$variable)
+p_005_res_melt$variable <- factor(p_005_res_melt$variable,levels=rank1)
+neg_md <- sum(mdv$md<=0)
+
+#performed tests
+pv <- apply(p_005[,-1],2,function(x) wilcox.test(p_005[,1],x,alternative="less",paired=TRUE)$p.value )
+pv_sig <- sapply(pv,getPsig)
+pv_sig <- pv_sig[as.character(rank1)]
+
+tmp_bp <- p_005_res_melt[,]
+
+pur_p_005_scc_bp_limma <- ggboxplot(tmp_bp,x="variable",y="value",fill="Type")+geom_hline(yintercept=0,linetype="dashed")+geom_vline(xintercept=neg_md+0.5,linetype="dashed")+xlab("Method")+ylab("SCC Difference")+ggtitle("Bulk-SC GSEA Sign(P) SCC Difference(P<0.05 Terms)(Purified)(PB-limma Sign(P) Based)")+annotate(geom="text",x=c(1:length(pv_sig)),y=0.1,label=pv_sig,size=7)+annotate(geom="text",x=length(pv_sig)+2.3,y=0.03,label=paste0("Raw(Median=",round(md_raw_p_005,2),")"),size=4.5)+coord_cartesian(xlim=c(1,length(pv_sig)+3.5))+theme(plot.title=element_text(size=16),legend.title=element_text(size=15),legend.text=element_text(size=14),axis.title=element_text(size=18),axis.text.x=element_text(angle=90,size=15),axis.text.y=element_text(size=15))+scale_fill_brewer(palette="Set2")
+pur_p_005_scc_bp_limma
+```
+
+heatmap
+```{r}
+tmp_hm <- p_005_res_melt[,]
+#tmp_hm[tmp_hm$value<(-0.25),]$value <- -0.25
+#tmp_hm[tmp_hm$value>(0.3),]$value <- 0.3
+colnames(tmp_hm)[3] <- "SCC_Difference"
+pur_p_005_scc_hm_limma <- ggplot(tmp_hm,aes(variable,group,fill=SCC_Difference))+geom_tile()+scale_fill_gradient2(low="blue",mid="white",high="red",midpoint=0)+geom_vline(xintercept=neg_md+0.5,linetype="dashed")+xlab("Method")+ggtitle("Bulk-SC GSEA Sign(P) SCC Difference(P<0.05 Terms)(Purified)(PB-limma Sign(P) Based)")+theme(plot.title=element_text(size=16),legend.title=element_text(size=15),legend.text=element_text(size=14),axis.title=element_text(size=18),axis.text.x=element_text(angle=90,size=15),axis.text.y=element_text(size=8))
+pur_p_005_scc_hm_limma
+```
+
+
+#### logFC based
+```{r message=FALSE, warning=FALSE}
+#rank sum test
+Enrich_res_fc <- list.files("results/SC_Bulk_DE_GSEAenrichment/")
+Enrich_res_fc <- Enrich_res_fc[grep("PBlimma_logFC",Enrich_res_fc)]
+Enrich_res_fc <- Enrich_res_fc[!grepl("timecourse",Enrich_res_fc)]
+
+datasets <- c("Angelidis2019_alvmac","Angelidis2019_pneumo","CanoGamez2020_memory_iTreg","CanoGamez2020_memory_Th0","CanoGamez2020_memory_Th2","CanoGamez2020_naive_iTreg","CanoGamez2020_naive_Th0")
+p_all <- data.frame()
+p_005 <- data.frame()
+
+for(x in datasets){
+    tmp <- Enrich_res_fc[grep(x,Enrich_res_fc)]
+    tmppath <- paste0("results/SC_Bulk_DE_GSEAenrichment/",tmp)
+    tmp <- readRDS(tmppath)
+    tmp_name <- grep("result",names(tmp))
+    for(i in tmp_name){
+        Compare_names <- strsplit(names(tmp)[i],"result")[[1]][2]
+        p_all <- rbind(p_all,tmp[[i]][,1])
+        p_005 <- rbind(p_005,tmp[[i]][,2])
+        rownames(p_all)[nrow(p_all)] <- paste0("all",Compare_names,"_",x)
+        rownames(p_005)[nrow(p_005)] <- paste0("p0.05",Compare_names,"_",x) 
+    }
+}
+colnames(p_all) <- sapply(rownames(tmp[[tmp_name[1]]]),function(x) strsplit(x,"\\.")[[1]][1])
+colnames(p_005) <- sapply(rownames(tmp[[tmp_name[1]]]),function(x) strsplit(x,"\\.")[[1]][1])
+
+```
+
+process data
+```{r}
+md_raw_p_all <- median(p_all$raw)
+p_all_res <- as.data.frame(apply(p_all[,-1],2,function(x) x-p_all[,1] ))
+p_all_res$group <- rownames(p_all_res)
+md_raw_p_005 <- median(p_005$raw)
+p_005_res <- as.data.frame(apply(p_005[,-1],2,function(x) x-p_005[,1] ))
+p_005_res$group <- rownames(p_005_res)
+
+p_all_res_melt <- data.table::melt(p_all_res,id.vars=c("group"))
+
+p_all_res_melt$Type <- "Deep learning based"
+p_all_res_melt[p_all_res_melt$variable%in%c("ccImpute","I_Impute","kNN_smoothing","MAGIC","MAGIC_log"),]$Type <- "Model or smoothing based"
+p_all_res_melt[p_all_res_melt$variable%in%c("ALRA","Bfimpute","afMF","scRMD"),]$Type <- "Matrix based"
+p_all_res_melt$Type <- factor(p_all_res_melt$Type,levels=c("Matrix based","Model or smoothing based","Deep learning based"))
+
+head(p_all_res_melt)
+
+p_005_res_melt <- data.table::melt(p_005_res,id.vars=c("group"))
+p_005_res_melt$Type <- "Deep learning based"
+p_005_res_melt[p_005_res_melt$variable%in%c("ccImpute","I_Impute","kNN_smoothing","MAGIC","MAGIC_log"),]$Type <- "Model or smoothing based"
+p_005_res_melt[p_005_res_melt$variable%in%c("ALRA","Bfimpute","afMF","scRMD"),]$Type <- "Matrix based"
+p_005_res_melt$Type <- factor(p_005_res_melt$Type,levels=c("Matrix based","Model or smoothing based","Deep learning based"))
+```
+
+box plot
+fc_all_res
+```{r}
+mdv <- p_all_res_melt %>% dplyr::group_by(variable) %>% dplyr::summarise(md=median(value,na.rm=TRUE))
+rank1 <- mdv[order(mdv$md),]$variable
+p_all_res_melt$Method <- as.character(p_all_res_melt$variable)
+p_all_res_melt$variable <- factor(p_all_res_melt$variable,levels=rank1)
+neg_md <- sum(mdv$md<=0)
+
+#performed tests
+pv <- apply(p_all[,-1],2,function(x) wilcox.test(p_all[,1],x,alternative="less",paired=TRUE)$p.value )
+pv_sig <- sapply(pv,getPsig)
+pv_sig <- pv_sig[as.character(rank1)]
+
+tmp_bp <- p_all_res_melt[,]
+
+pur_fc_all_scc_bp_limma <- ggboxplot(tmp_bp,x="variable",y="value",fill="Type")+geom_hline(yintercept=0,linetype="dashed")+geom_vline(xintercept=neg_md+0.5,linetype="dashed")+xlab("Method")+ylab("SCC Difference")+ggtitle("Bulk-SC GSEA Sign(P) SCC Difference(All Terms)(Purified)(PB-limma logFC Based)")+annotate(geom="text",x=c(1:length(pv_sig)),y=0.25,label=pv_sig,size=7)+annotate(geom="text",x=length(pv_sig)+2.3,y=0.02,label=paste0("Raw(Median=",round(md_raw_p_all,2),")"),size=4.5)+coord_cartesian(xlim=c(1,length(pv_sig)+3.5))+theme(plot.title=element_text(size=16),legend.title=element_text(size=15),legend.text=element_text(size=14),axis.title=element_text(size=18),axis.text.x=element_text(angle=90,size=15),axis.text.y=element_text(size=15))+scale_fill_brewer(palette="Set2")
+pur_fc_all_scc_bp_limma
+```
+
+heatmap
+```{r}
+tmp_hm <- p_all_res_melt[,]
+#tmp_hm[tmp_hm$value<(-0.25),]$value <- -0.25
+colnames(tmp_hm)[3] <- "SCC_Difference"
+pur_fc_all_scc_hm_limma <- ggplot(tmp_hm,aes(variable,group,fill=SCC_Difference))+geom_tile()+scale_fill_gradient2(low="blue",mid="white",high="red",midpoint=0)+geom_vline(xintercept=neg_md+0.5,linetype="dashed")+xlab("Method")+ggtitle("Bulk-SC GSEA Sign(P) SCC Difference(All Terms)(Purified)(PB-limma logFC Based)")+theme(plot.title=element_text(size=16),legend.title=element_text(size=15),legend.text=element_text(size=14),axis.title=element_text(size=18),axis.text.x=element_text(angle=90,size=15),axis.text.y=element_text(size=8))
+pur_fc_all_scc_hm_limma
+```
+
+box plot
+fc005
+```{r}
+mdv <- p_005_res_melt %>% dplyr::group_by(variable) %>% dplyr::summarise(md=median(value,na.rm=TRUE))
+rank1 <- mdv[order(mdv$md),]$variable
+p_005_res_melt$Method <- as.character(p_005_res_melt$variable)
+p_005_res_melt$variable <- factor(p_005_res_melt$variable,levels=rank1)
+neg_md <- sum(mdv$md<=0)
+
+#performed tests
+pv <- apply(p_005[,-1],2,function(x) wilcox.test(p_005[,1],x,alternative="less",paired=TRUE)$p.value )
+pv_sig <- sapply(pv,getPsig)
+pv_sig <- pv_sig[as.character(rank1)]
+
+tmp_bp <- p_005_res_melt[,]
+
+pur_fc_005_scc_bp_limma <- ggboxplot(tmp_bp,x="variable",y="value",fill="Type")+geom_hline(yintercept=0,linetype="dashed")+geom_vline(xintercept=neg_md+0.5,linetype="dashed")+xlab("Method")+ylab("SCC Difference")+ggtitle("Bulk-SC GSEA Sign(P) SCC Difference(P<0.05 Terms)(Purified)(PB-limma logFC Based)")+annotate(geom="text",x=c(1:length(pv_sig)),y=0.25,label=pv_sig,size=7)+annotate(geom="text",x=length(pv_sig)+2.3,y=0.03,label=paste0("Raw(Median=",round(md_raw_p_005,2),")"),size=4.5)+coord_cartesian(xlim=c(1,length(pv_sig)+3.5))+theme(plot.title=element_text(size=16),legend.title=element_text(size=15),legend.text=element_text(size=14),axis.title=element_text(size=18),axis.text.x=element_text(angle=90,size=15),axis.text.y=element_text(size=15))+scale_fill_brewer(palette="Set2")
+pur_fc_005_scc_bp_limma
+```
+
+heatmap
+```{r}
+tmp_hm <- p_005_res_melt[,]
+#tmp_hm[tmp_hm$value<(-0.25),]$value <- -0.25
+colnames(tmp_hm)[3] <- "SCC_Difference"
+pur_fc_005_scc_hm_limma <- ggplot(tmp_hm,aes(variable,group,fill=SCC_Difference))+geom_tile()+scale_fill_gradient2(low="blue",mid="white",high="red",midpoint=0)+geom_vline(xintercept=neg_md+0.5,linetype="dashed")+xlab("Method")+ggtitle("Bulk-SC GSEA Sign(P) SCC Difference(P<0.05 Terms)(Purified)(PB-limma logFC Based)")+theme(plot.title=element_text(size=16),legend.title=element_text(size=15),legend.text=element_text(size=14),axis.title=element_text(size=18),axis.text.x=element_text(angle=90,size=15),axis.text.y=element_text(size=8))
+pur_fc_005_scc_hm_limma
+```
+
+
+## time-course sample
+### sc level RST
+#### sign log10P based
+```{r message=FALSE, warning=FALSE}
+#rank sum test
+Enrich_res_p <- list.files("results/SC_Bulk_DE_GSEAenrichment/")
+Enrich_res_p <- Enrich_res_p[grep("TrendRST_signlog10P",Enrich_res_p)]
+
+datasets <- c("GSE75748","GSE79578","GSE90047")
+p_all <- data.frame()
+p_005 <- data.frame()
+
+for(x in datasets){
+    tmp <- Enrich_res_p[grep(x,Enrich_res_p)]
+    tmppath <- paste0("results/SC_Bulk_DE_GSEAenrichment/",tmp)
+    tmp <- readRDS(tmppath)
+    tmp_name <- grep("result",names(tmp))
+    for(i in tmp_name){
+        Compare_names <- strsplit(names(tmp)[i],"result")[[1]][2]
+        p_all <- rbind(p_all,tmp[[i]][,1])
+        p_005 <- rbind(p_005,tmp[[i]][,2])
+        rownames(p_all)[nrow(p_all)] <- paste0("all",Compare_names,"_",x)
+        rownames(p_005)[nrow(p_005)] <- paste0("p0.05",Compare_names,"_",x) 
+    }
+}
+colnames(p_all) <- sapply(rownames(tmp[[tmp_name[1]]]),function(x) strsplit(x,"\\.")[[1]][1])
+colnames(p_005) <- sapply(rownames(tmp[[tmp_name[1]]]),function(x) strsplit(x,"\\.")[[1]][1])
+
+```
+
+process data
+```{r}
+md_raw_p_all <- median(p_all$raw)
+p_all_res <- as.data.frame(apply(p_all[,-1],2,function(x) x-p_all[,1] ))
+p_all_res$group <- rownames(p_all_res)
+md_raw_p_005 <- median(p_005$raw)
+p_005_res <- as.data.frame(apply(p_005[,-1],2,function(x) x-p_005[,1] ))
+p_005_res$group <- rownames(p_005_res)
+
+p_all_res_melt <- data.table::melt(p_all_res,id.vars=c("group"))
+head(p_all_res_melt)
+p_005_res_melt <- data.table::melt(p_005_res,id.vars=c("group"))
+```
+
+box plot
+p_all_res
+```{r}
+#rank
+mdv <- p_all_res_melt %>% dplyr::group_by(variable) %>% dplyr::summarise(md=median(value,na.rm=TRUE))
+rank1 <- mdv[order(mdv$md),]$variable
+p_all_res_melt$Method <- as.character(p_all_res_melt$variable)
+p_all_res_melt$variable <- factor(p_all_res_melt$variable,levels=rank1)
+neg_md <- sum(mdv$md<=0)
+
+p_all_res <- p_all_res[,-which(colnames(p_all_res)=="New")]
+tmp_bar <- apply(p_all_res[,-ncol(p_all_res)],2,median)
+tmp_bar <- data.frame(method=colnames(p_all_res)[-ncol(p_all_res)],scc_diff=tmp_bar)
+tmp_bar$Method <- factor(tmp_bar$method,levels=tmp_bar[order(tmp_bar$method),"method"])
+tmp_bar$method <- factor(tmp_bar$method,levels=rank1)
+
+tmp_bar$Type <- "Deep learning based"
+tmp_bar[tmp_bar$Method%in%c("ccImpute","I_Impute","kNN_smoothing","MAGIC","MAGIC_log"),]$Type <- "Model or smoothing based"
+tmp_bar[tmp_bar$Method%in%c("ALRA","Bfimpute","afMF","scRMD"),]$Type <- "Matrix based"
+tmp_bar$Type <- factor(tmp_bar$Type,levels=c("Matrix based","Model or smoothing based","Deep learning based"))
+
+tc_p_all_scc_bp_rst <- ggbarplot(tmp_bar,x="method",y="scc_diff",fill="Type")+geom_hline(yintercept=0,linetype="dashed")+geom_vline(xintercept=neg_md+0.5,linetype="dashed")+xlab("Method")+ylab("SCC Difference")+ggtitle("Bulk-SC GSEA Sign(P) SCC Difference(All Terms)(Time-course)(Trend Rank Sum Sign(P) Based)")+annotate(geom="text",x=nrow(tmp_bar)+2.3,y=0.006,label=paste0("Raw(Median=",round(md_raw_p_all,2),")"),size=4.5)+coord_cartesian(xlim=c(1,nrow(tmp_bar)+3.5))+theme(plot.title=element_text(size=16),legend.title=element_text(size=15),legend.text=element_text(size=14),axis.title=element_text(size=18),axis.text.x=element_text(angle=90,size=15),axis.text.y=element_text(size=15))+scale_fill_brewer(palette="Set2")
+tc_p_all_scc_bp_rst
+```
+
+heatmap
+```{r}
+tmp_hm <- p_all_res_melt[,]
+#tmp_hm$value <- ifelse(tmp_hm$value<(-0.2),-0.2,tmp_hm$value)
+colnames(tmp_hm)[3] <- "SCC_Difference"
+tc_p_all_scc_hm_rst <- ggplot(tmp_hm,aes(variable,group,fill=SCC_Difference))+geom_tile()+scale_fill_gradient2(low="blue",mid="white",high="red",midpoint=0)+geom_vline(xintercept=neg_md+0.5,linetype="dashed")+xlab("Method")+ggtitle("Bulk-SC GSEA Sign(P) SCC Difference(All Terms)(Time-course)(Trend Rank Sum Sign(P) Based)")+theme(plot.title=element_text(size=16),legend.title=element_text(size=15),legend.text=element_text(size=14),axis.title=element_text(size=18),axis.text.x=element_text(angle=90,size=15),axis.text.y=element_text(size=15))
+tc_p_all_scc_hm_rst
+```
+
+box plot
+p_005_res
+```{r}
+#rank
+mdv <- p_005_res_melt %>% dplyr::group_by(variable) %>% dplyr::summarise(md=median(value,na.rm=TRUE))
+rank1 <- mdv[order(mdv$md),]$variable
+p_005_res_melt$Method <- as.character(p_005_res_melt$variable)
+p_005_res_melt$variable <- factor(p_005_res_melt$variable,levels=rank1)
+neg_md <- sum(mdv$md<=0)
+
+p_005_res <- p_005_res[,-which(colnames(p_005_res)=="New")]
+tmp_bar <- apply(p_005_res[,-ncol(p_005_res)],2,median)
+tmp_bar <- data.frame(method=colnames(p_005_res)[-ncol(p_005_res)],scc_diff=tmp_bar)
+tmp_bar$Method <- factor(tmp_bar$method,levels=tmp_bar[order(tmp_bar$method),"method"])
+tmp_bar$method <- factor(tmp_bar$method,levels=rank1)
+
+tmp_bar$Type <- "Deep learning based"
+tmp_bar[tmp_bar$Method%in%c("ccImpute","I_Impute","kNN_smoothing","MAGIC","MAGIC_log"),]$Type <- "Model or smoothing based"
+tmp_bar[tmp_bar$Method%in%c("ALRA","Bfimpute","afMF","scRMD"),]$Type <- "Matrix based"
+tmp_bar$Type <- factor(tmp_bar$Type,levels=c("Matrix based","Model or smoothing based","Deep learning based"))
+
+tc_p_005_scc_bp_rst <- ggbarplot(tmp_bar,x="method",y="scc_diff",fill="Type")+geom_hline(yintercept=0,linetype="dashed")+geom_vline(xintercept=neg_md+0.5,linetype="dashed")+xlab("Method")+ylab("SCC Difference")+ggtitle("Bulk-SC GSEA Sign(P) SCC Difference(P<0.05 Terms)(Time-course)(Trend Rank Sum Sign(P) Based)")+annotate(geom="text",x=nrow(tmp_bar)+2.3,y=0.005,label=paste0("Raw(Median=",round(md_raw_p_005,2),")"),size=4.5)+coord_cartesian(xlim=c(1,nrow(tmp_bar)+3.5))+theme(plot.title=element_text(size=16),legend.title=element_text(size=15),legend.text=element_text(size=14),axis.title=element_text(size=18),axis.text.x=element_text(angle=90,size=15),axis.text.y=element_text(size=15))+scale_fill_brewer(palette="Set2")
+tc_p_005_scc_bp_rst
+```
+
+heatmap
+```{r}
+tmp_hm <- p_005_res_melt[,]
+#tmp_hm$value <- ifelse(tmp_hm$value<(-0.2),-0.2,tmp_hm$value)
+colnames(tmp_hm)[3] <- "SCC_Difference"
+tc_p_005_scc_hm_rst <- ggplot(tmp_hm,aes(variable,group,fill=SCC_Difference))+geom_tile()+scale_fill_gradient2(low="blue",mid="white",high="red",midpoint=0)+geom_vline(xintercept=neg_md+0.5,linetype="dashed")+xlab("Method")+ggtitle("Bulk-SC GSEA Sign(P) SCC Difference(P<0.05 Terms)(Time-course)(Trend Rank Sum Sign(P) Based)")+theme(plot.title=element_text(size=16),legend.title=element_text(size=15),legend.text=element_text(size=14),axis.title=element_text(size=18),axis.text.x=element_text(angle=90,size=15),axis.text.y=element_text(size=15))
+tc_p_005_scc_hm_rst
+```
+
+### sc level MAST
+#### sign log10P based
+```{r message=FALSE, warning=FALSE}
+#rank sum test
+Enrich_res_p <- list.files("results/SC_Bulk_DE_GSEAenrichment/")
+Enrich_res_p <- Enrich_res_p[grep("MAST_signlog10P",Enrich_res_p)]
+
+datasets <- c("GSE75748timecourse","GSE79578","GSE90047")
+p_all <- data.frame()
+p_005 <- data.frame()
+
+for(x in datasets){
+    tmp <- Enrich_res_p[grep(x,Enrich_res_p)]
+    tmppath <- paste0("results/SC_Bulk_DE_GSEAenrichment/",tmp)
+    tmp <- readRDS(tmppath)
+    tmp_name <- grep("result",names(tmp))
+    for(i in tmp_name){
+        Compare_names <- strsplit(names(tmp)[i],"result")[[1]][2]
+        p_all <- rbind(p_all,tmp[[i]][,1])
+        p_005 <- rbind(p_005,tmp[[i]][,2])
+        rownames(p_all)[nrow(p_all)] <- paste0("all",Compare_names,"_",x)
+        rownames(p_005)[nrow(p_005)] <- paste0("p0.05",Compare_names,"_",x) 
+    }
+}
+colnames(p_all) <- sapply(rownames(tmp[[tmp_name[1]]]),function(x) strsplit(x,"\\.")[[1]][1])
+colnames(p_005) <- sapply(rownames(tmp[[tmp_name[1]]]),function(x) strsplit(x,"\\.")[[1]][1])
+
+```
+
+process data
+```{r}
+md_raw_p_all <- median(p_all$raw)
+p_all_res <- as.data.frame(apply(p_all[,-1],2,function(x) x-p_all[,1] ))
+p_all_res$group <- rownames(p_all_res)
+md_raw_p_005 <- median(p_005$raw)
+p_005_res <- as.data.frame(apply(p_005[,-1],2,function(x) x-p_005[,1] ))
+p_005_res$group <- rownames(p_005_res)
+
+p_all_res_melt <- data.table::melt(p_all_res,id.vars=c("group"))
+head(p_all_res_melt)
+p_005_res_melt <- data.table::melt(p_005_res,id.vars=c("group"))
+```
+
+box plot
+p_all_res
+```{r}
+#rank
+mdv <- p_all_res_melt %>% dplyr::group_by(variable) %>% dplyr::summarise(md=median(value,na.rm=TRUE))
+rank1 <- mdv[order(mdv$md),]$variable
+p_all_res_melt$Method <- as.character(p_all_res_melt$variable)
+p_all_res_melt$variable <- factor(p_all_res_melt$variable,levels=rank1)
+neg_md <- sum(mdv$md<=0)
+
+p_all_res <- p_all_res[,-which(colnames(p_all_res)=="New")]
+tmp_bar <- apply(p_all_res[,-ncol(p_all_res)],2,median)
+tmp_bar <- data.frame(method=colnames(p_all_res)[-ncol(p_all_res)],scc_diff=tmp_bar)
+tmp_bar$Method <- factor(tmp_bar$method,levels=tmp_bar[order(tmp_bar$method),"method"])
+tmp_bar$method <- factor(tmp_bar$method,levels=rank1)
+
+tmp_bar$Type <- "Deep learning based"
+tmp_bar[tmp_bar$Method%in%c("ccImpute","I_Impute","kNN_smoothing","MAGIC","MAGIC_log"),]$Type <- "Model or smoothing based"
+tmp_bar[tmp_bar$Method%in%c("ALRA","Bfimpute","afMF","scRMD"),]$Type <- "Matrix based"
+tmp_bar$Type <- factor(tmp_bar$Type,levels=c("Matrix based","Model or smoothing based","Deep learning based"))
+
+tc_p_all_scc_bp_mast <- ggbarplot(tmp_bar,x="method",y="scc_diff",fill="Type")+geom_hline(yintercept=0,linetype="dashed")+geom_vline(xintercept=neg_md+0.5,linetype="dashed")+xlab("Method")+ylab("SCC Difference")+ggtitle("Bulk-SC GSEA Sign(P) SCC Difference(All Terms)(Time-course)(MAST Sign(P) Based)")+annotate(geom="text",x=nrow(tmp_bar)+2.3,y=0.02,label=paste0("Raw(Median=",round(md_raw_p_all,2),")"),size=4.5)+coord_cartesian(xlim=c(1,nrow(tmp_bar)+3.5))+theme(plot.title=element_text(size=16),legend.title=element_text(size=15),legend.text=element_text(size=14),axis.title=element_text(size=18),axis.text.x=element_text(angle=90,size=15),axis.text.y=element_text(size=15))+scale_fill_brewer(palette="Set2")
+tc_p_all_scc_bp_mast
+```
+
+heatmap
+```{r}
+tmp_hm <- p_all_res_melt[,]
+#tmp_hm$value <- ifelse(tmp_hm$value<(-0.2),-0.2,tmp_hm$value)
+colnames(tmp_hm)[3] <- "SCC_Difference"
+tc_p_all_scc_hm_mast <- ggplot(tmp_hm,aes(variable,group,fill=SCC_Difference))+geom_tile()+scale_fill_gradient2(low="blue",mid="white",high="red",midpoint=0)+geom_vline(xintercept=neg_md+0.5,linetype="dashed")+xlab("Method")+ggtitle("Bulk-SC GSEA Sign(P) SCC Difference(All Terms)(Time-course)(MAST Sign(P) Based)")+theme(plot.title=element_text(size=16),legend.title=element_text(size=15),legend.text=element_text(size=14),axis.title=element_text(size=18),axis.text.x=element_text(angle=90,size=15),axis.text.y=element_text(size=15))
+tc_p_all_scc_hm_mast
+```
+
+box plot
+p_005_res
+```{r}
+#rank
+mdv <- p_005_res_melt %>% dplyr::group_by(variable) %>% dplyr::summarise(md=median(value,na.rm=TRUE))
+rank1 <- mdv[order(mdv$md),]$variable
+p_005_res_melt$Method <- as.character(p_005_res_melt$variable)
+p_005_res_melt$variable <- factor(p_005_res_melt$variable,levels=rank1)
+neg_md <- sum(mdv$md<=0)
+
+p_005_res <- p_005_res[,-which(colnames(p_005_res)=="New")]
+tmp_bar <- apply(p_005_res[,-ncol(p_005_res)],2,median)
+tmp_bar <- data.frame(method=colnames(p_005_res)[-ncol(p_005_res)],scc_diff=tmp_bar)
+tmp_bar$Method <- factor(tmp_bar$method,levels=tmp_bar[order(tmp_bar$method),"method"])
+tmp_bar$method <- factor(tmp_bar$method,levels=rank1)
+
+tmp_bar$Type <- "Deep learning based"
+tmp_bar[tmp_bar$Method%in%c("ccImpute","I_Impute","kNN_smoothing","MAGIC","MAGIC_log"),]$Type <- "Model or smoothing based"
+tmp_bar[tmp_bar$Method%in%c("ALRA","Bfimpute","afMF","scRMD"),]$Type <- "Matrix based"
+tmp_bar$Type <- factor(tmp_bar$Type,levels=c("Matrix based","Model or smoothing based","Deep learning based"))
+
+tc_p_005_scc_bp_mast <- ggbarplot(tmp_bar,x="method",y="scc_diff",fill="Type")+geom_hline(yintercept=0,linetype="dashed")+geom_vline(xintercept=neg_md+0.5,linetype="dashed")+xlab("Method")+ylab("SCC Difference")+ggtitle("Bulk-SC GSEA Sign(P) SCC Difference(P<0.05 Terms)(Time-course)(MAST Sign(P) Based)")+annotate(geom="text",x=nrow(tmp_bar)+2.3,y=0.01,label=paste0("Raw(Median=",round(md_raw_p_005,2),")"),size=4.5)+coord_cartesian(xlim=c(1,nrow(tmp_bar)+3.5))+theme(plot.title=element_text(size=16),legend.title=element_text(size=15),legend.text=element_text(size=14),axis.title=element_text(size=18),axis.text.x=element_text(angle=90,size=15),axis.text.y=element_text(size=15))+scale_fill_brewer(palette="Set2")
+tc_p_005_scc_bp_mast
+```
+
+heatmap
+```{r}
+tmp_hm <- p_005_res_melt[,]
+#tmp_hm$value <- ifelse(tmp_hm$value<(-0.2),-0.2,tmp_hm$value)
+colnames(tmp_hm)[3] <- "SCC_Difference"
+tc_p_005_scc_hm_mast <- ggplot(tmp_hm,aes(variable,group,fill=SCC_Difference))+geom_tile()+scale_fill_gradient2(low="blue",mid="white",high="red",midpoint=0)+geom_vline(xintercept=neg_md+0.5,linetype="dashed")+xlab("Method")+ggtitle("Bulk-SC GSEA Sign(P) SCC Difference(P<0.05 Terms)(Time-course)(MAST Sign(P) Based)")+theme(plot.title=element_text(size=16),legend.title=element_text(size=15),legend.text=element_text(size=14),axis.title=element_text(size=18),axis.text.x=element_text(angle=90,size=15),axis.text.y=element_text(size=15))
+tc_p_005_scc_hm_mast
+```
+
+#### logFC based
+```{r message=FALSE, warning=FALSE}
+#rank sum test
+Enrich_res_fc <- list.files("results/SC_Bulk_DE_GSEAenrichment/")
+Enrich_res_fc <- Enrich_res_fc[grep("MAST_logFC",Enrich_res_fc)]
+
+datasets <- c("GSE75748timecourse","GSE79578","GSE90047")
+p_all <- data.frame()
+p_005 <- data.frame()
+
+for(x in datasets){
+    tmp <- Enrich_res_fc[grep(x,Enrich_res_fc)]
+    tmppath <- paste0("results/SC_Bulk_DE_GSEAenrichment/",tmp)
+    tmp <- readRDS(tmppath)
+    tmp_name <- grep("result",names(tmp))
+    for(i in tmp_name){
+        Compare_names <- strsplit(names(tmp)[i],"result")[[1]][2]
+        p_all <- rbind(p_all,tmp[[i]][,1])
+        p_005 <- rbind(p_005,tmp[[i]][,2])
+        rownames(p_all)[nrow(p_all)] <- paste0("all",Compare_names,"_",x)
+        rownames(p_005)[nrow(p_005)] <- paste0("p0.05",Compare_names,"_",x) 
+    }
+}
+colnames(p_all) <- sapply(rownames(tmp[[tmp_name[1]]]),function(x) strsplit(x,"\\.")[[1]][1])
+colnames(p_005) <- sapply(rownames(tmp[[tmp_name[1]]]),function(x) strsplit(x,"\\.")[[1]][1])
+
+```
+
+process data
+```{r}
+md_raw_p_all <- median(p_all$raw)
+p_all_res <- as.data.frame(apply(p_all[,-1],2,function(x) x-p_all[,1] ))
+p_all_res$group <- rownames(p_all_res)
+md_raw_p_005 <- median(p_005$raw)
+p_005_res <- as.data.frame(apply(p_005[,-1],2,function(x) x-p_005[,1] ))
+p_005_res$group <- rownames(p_005_res)
+
+p_all_res_melt <- data.table::melt(p_all_res,id.vars=c("group"))
+head(p_all_res_melt)
+p_005_res_melt <- data.table::melt(p_005_res,id.vars=c("group"))
+```
+
+box plot
+fc_all_res
+```{r}
+#rank
+mdv <- p_all_res_melt %>% dplyr::group_by(variable) %>% dplyr::summarise(md=median(value,na.rm=TRUE))
+rank1 <- mdv[order(mdv$md),]$variable
+p_all_res_melt$Method <- as.character(p_all_res_melt$variable)
+p_all_res_melt$variable <- factor(p_all_res_melt$variable,levels=rank1)
+neg_md <- sum(mdv$md<=0)
+
+p_all_res <- p_all_res[,-which(colnames(p_all_res)=="New")]
+tmp_bar <- apply(p_all_res[,-ncol(p_all_res)],2,median)
+tmp_bar <- data.frame(method=colnames(p_all_res)[-ncol(p_all_res)],scc_diff=tmp_bar)
+tmp_bar$Method <- factor(tmp_bar$method,levels=tmp_bar[order(tmp_bar$method),"method"])
+tmp_bar$method <- factor(tmp_bar$method,levels=rank1)
+
+tmp_bar$Type <- "Deep learning based"
+tmp_bar[tmp_bar$Method%in%c("ccImpute","I_Impute","kNN_smoothing","MAGIC","MAGIC_log"),]$Type <- "Model or smoothing based"
+tmp_bar[tmp_bar$Method%in%c("ALRA","Bfimpute","afMF","scRMD"),]$Type <- "Matrix based"
+tmp_bar$Type <- factor(tmp_bar$Type,levels=c("Matrix based","Model or smoothing based","Deep learning based"))
+
+tc_fc_all_scc_bp_mast <- ggbarplot(tmp_bar,x="method",y="scc_diff",fill="Type")+geom_hline(yintercept=0,linetype="dashed")+geom_vline(xintercept=neg_md+0.5,linetype="dashed")+xlab("Method")+ylab("SCC Difference")+ggtitle("Bulk-SC GSEA Sign(P) SCC Difference(All Terms)(Time-course)(MAST logFC Based)")+annotate(geom="text",x=nrow(tmp_bar)+2.3,y=0.02,label=paste0("Raw(Median=",round(md_raw_p_all,2),")"),size=4.5)+coord_cartesian(xlim=c(1,nrow(tmp_bar)+3.5))+theme(plot.title=element_text(size=16),legend.title=element_text(size=15),legend.text=element_text(size=14),axis.title=element_text(size=18),axis.text.x=element_text(angle=90,size=15),axis.text.y=element_text(size=15))+scale_fill_brewer(palette="Set2")
+tc_fc_all_scc_bp_mast
+```
+
+heatmap
+```{r}
+tmp_hm <- p_all_res_melt[,]
+#tmp_hm$value <- ifelse(tmp_hm$value<(-0.2),-0.2,tmp_hm$value)
+colnames(tmp_hm)[3] <- "SCC_Difference"
+tc_fc_all_scc_hm_mast <- ggplot(tmp_hm,aes(variable,group,fill=SCC_Difference))+geom_tile()+scale_fill_gradient2(low="blue",mid="white",high="red",midpoint=0)+geom_vline(xintercept=neg_md+0.5,linetype="dashed")+xlab("Method")+ggtitle("Bulk-SC GSEA Sign(P) SCC Difference(All Terms)(Time-course)(MAST logFC Based)")+theme(plot.title=element_text(size=16),legend.title=element_text(size=15),legend.text=element_text(size=14),axis.title=element_text(size=18),axis.text.x=element_text(angle=90,size=15),axis.text.y=element_text(size=15))
+tc_fc_all_scc_hm_mast
+```
+
+box plot
+fc_005_res
+```{r}
+#rank
+mdv <- p_005_res_melt %>% dplyr::group_by(variable) %>% dplyr::summarise(md=median(value,na.rm=TRUE))
+rank1 <- mdv[order(mdv$md),]$variable
+p_005_res_melt$Method <- as.character(p_005_res_melt$variable)
+p_005_res_melt$variable <- factor(p_005_res_melt$variable,levels=rank1)
+neg_md <- sum(mdv$md<=0)
+
+p_005_res <- p_005_res[,-which(colnames(p_005_res)=="New")]
+tmp_bar <- apply(p_005_res[,-ncol(p_005_res)],2,median)
+tmp_bar <- data.frame(method=colnames(p_005_res)[-ncol(p_005_res)],scc_diff=tmp_bar)
+tmp_bar$Method <- factor(tmp_bar$method,levels=tmp_bar[order(tmp_bar$method),"method"])
+tmp_bar$method <- factor(tmp_bar$method,levels=rank1)
+
+tmp_bar$Type <- "Deep learning based"
+tmp_bar[tmp_bar$Method%in%c("ccImpute","I_Impute","kNN_smoothing","MAGIC","MAGIC_log"),]$Type <- "Model or smoothing based"
+tmp_bar[tmp_bar$Method%in%c("ALRA","Bfimpute","afMF","scRMD"),]$Type <- "Matrix based"
+tmp_bar$Type <- factor(tmp_bar$Type,levels=c("Matrix based","Model or smoothing based","Deep learning based"))
+
+tc_fc_005_scc_bp_mast <- ggbarplot(tmp_bar,x="method",y="scc_diff",fill="Type")+geom_hline(yintercept=0,linetype="dashed")+geom_vline(xintercept=neg_md+0.5,linetype="dashed")+xlab("Method")+ylab("SCC Difference")+ggtitle("Bulk-SC GSEA Sign(P) SCC Difference(P<0.05 Terms)(Time-course)(MAST logFC Based)")+annotate(geom="text",x=nrow(tmp_bar)+2.3,y=0.02,label=paste0("Raw(Median=",round(md_raw_p_005,2),")"),size=4.5)+coord_cartesian(xlim=c(1,nrow(tmp_bar)+3.5))+theme(plot.title=element_text(size=16),legend.title=element_text(size=15),legend.text=element_text(size=14),axis.title=element_text(size=18),axis.text.x=element_text(angle=90,size=15),axis.text.y=element_text(size=15))+scale_fill_brewer(palette="Set2")
+tc_fc_005_scc_bp_mast
+```
+
+heatmap
+```{r}
+tmp_hm <- p_005_res_melt[,]
+#tmp_hm$value <- ifelse(tmp_hm$value<(-0.2),-0.2,tmp_hm$value)
+colnames(tmp_hm)[3] <- "SCC_Difference"
+tc_fc_005_scc_hm_mast <- ggplot(tmp_hm,aes(variable,group,fill=SCC_Difference))+geom_tile()+scale_fill_gradient2(low="blue",mid="white",high="red",midpoint=0)+geom_vline(xintercept=neg_md+0.5,linetype="dashed")+xlab("Method")+ggtitle("Bulk-SC GSEA Sign(P) SCC Difference(P<0.05 Terms)(Time-course)(MAST logFC Based)")+theme(plot.title=element_text(size=16),legend.title=element_text(size=15),legend.text=element_text(size=14),axis.title=element_text(size=18),axis.text.x=element_text(angle=90,size=15),axis.text.y=element_text(size=15))
+tc_fc_005_scc_hm_mast
+```
+
+
+# combine plot
+## main
+```{r fig.height=8, fig.width=8.8}
+mix_p_all_scc_bp_mast <- mix_p_all_scc_bp_mast+ggtitle("Bulk-SC GSEA Sign(P) SCC Difference(Mixture)(MAST Sign(P) Based)")
+mix_fc_all_scc_bp_mast <- mix_fc_all_scc_bp_mast+ggtitle("Bulk-SC GSEA Sign(P) SCC Difference(Mixture)(MAST logFC Based)")
+pur_p_all_scc_bp_mast <- pur_p_all_scc_bp_mast+ggtitle("Bulk-SC GSEA Sign(P) SCC Difference(Purified)(MAST Sign(P) Based)")
+pur_fc_all_scc_bp_mast <- pur_fc_all_scc_bp_mast+ggtitle("Bulk-SC GSEA Sign(P) SCC Difference(Purified)(MAST logFC Based)")
+tc_p_all_scc_bp_mast <- tc_p_all_scc_bp_mast+ggtitle("Bulk-SC GSEA Sign(P) SCC Difference(Time-course)(MAST Sign(P) Based)")
+tc_fc_all_scc_bp_mast <- tc_fc_all_scc_bp_mast+ggtitle("Bulk-SC GSEA Sign(P) SCC Difference(Time-course)(MAST logFC Based)")
+
+ggarrange(mix_p_all_scc_bp_mast,mix_fc_all_scc_bp_mast,pur_p_all_scc_bp_mast,pur_fc_all_scc_bp_mast,tc_p_all_scc_bp_mast,tc_fc_all_scc_bp_mast,ncol=2,nrow=3,labels="AUTO")
+```
+
+## supp1
+```{r fig.height=8, fig.width=10.2}
+ggarrange(mix_p_005_scc_bp_mast,mix_fc_005_scc_bp_mast,pur_p_005_scc_bp_mast,pur_fc_005_scc_bp_mast,tc_p_005_scc_bp_mast,tc_fc_005_scc_bp_mast,ncol=2,nrow=3,labels="AUTO")
+```
+
+## supp2
+```{r fig.height=8.2, fig.width=11}
+ggarrange(mix_p_all_scc_bp_rst,mix_p_005_scc_bp_rst,pur_p_all_scc_bp_rst,pur_p_005_scc_bp_rst,tc_p_all_scc_bp_rst,tc_p_005_scc_bp_rst,ncol=2,nrow=3,labels="AUTO")
+```
+
+## supp3
+```{r fig.height=7.5, fig.width=12}
+ggarrange(mix_p_all_scc_hm_mast,mix_fc_all_scc_hm_mast,pur_p_all_scc_hm_mast,pur_fc_all_scc_hm_mast,tc_p_all_scc_hm_mast,tc_fc_all_scc_hm_mast,ncol=2,nrow=3,labels="AUTO")
+```
+
+## supp4
+```{r fig.height=7.5, fig.width=6}
+ggarrange(mix_p_all_scc_hm_rst,pur_p_all_scc_hm_rst,tc_p_all_scc_hm_rst,ncol=1,nrow=3,labels="AUTO")
+```
+
+## supp5
+```{r fig.height=5, fig.width=9.7}
+ggarrange(pur_p_all_scc_bp_limma,pur_p_005_scc_bp_limma,pur_fc_all_scc_bp_limma,pur_fc_005_scc_bp_limma,ncol=2,nrow=2,labels="AUTO")
+```
+
+
