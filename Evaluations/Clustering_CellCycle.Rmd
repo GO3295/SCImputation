@@ -1,0 +1,902 @@
+---
+title: "Clustering_Cellcycle"
+output: html_notebook
+---
+
+load library
+```{r message=FALSE, warning=FALSE}
+library(Seurat)
+library(ggplot2)
+library(SingleCellExperiment)
+library(scran)
+library(SeuratData)
+library(edgeR)
+library(limma)
+library(clusterProfiler)
+library(data.table)
+library(SingleCellExperiment)
+library(SummarizedExperiment)
+library(muscat)
+library(pROC)
+library(igraph)
+library(mclust)
+library(cluster)
+library(SCINA)
+library(caret)
+library(robCompositions)
+library(easyCODA)
+library(MAST)
+library(AUCell)
+library(HGNChelper)
+library(SeuratDisk)
+library(scmap)
+library(monocle3)
+library(ggpubr)
+library(slingshot)
+library(grDevices)
+library(RColorBrewer)
+library(randomForest)
+library(caTools)
+library(mltools)
+#library(stringr)
+library(reldist)
+library(aricode)
+library(TSCAN)
+library(reshape2)
+library(pheatmap)
+library(philentropy)
+library(SCeQTL)
+library(eQTLsingle)
+library(rawr)
+library(splatter)
+library(combinat)
+
+selected_palette <- c("aquamarine4","azure4","powderblue","burlywood","coral","cornflowerblue","cyan3","darkgoldenrod2","darkorange3","peachpuff","royalblue","khaki2","plum1","lightsalmon")
+selected_palette2 <- c("plum1","aquamarine4","azure4","powderblue","burlywood","coral","cornflowerblue","cyan3","darkgoldenrod2","darkorange3","peachpuff","royalblue")
+```
+
+clustering functions
+```{r message=FALSE, warning=FALSE}
+getCluster <- function(x,meta,reso=0.01,npc=10,cent=4){
+    tmp <- CreateSeuratObject(counts=x,meta.data=meta,min.cells=0,min.features=0)
+    tmp <- FindVariableFeatures(tmp,nfeatures=3000,verbose=FALSE)
+    tmp <- ScaleData(tmp,verbose=FALSE)
+    tmp <- RunPCA(tmp,verbose=FALSE)
+    tmp$kmeans <- kmeans(tmp@reductions$pca@cell.embeddings[,1:npc],centers=cent)$cluster
+    tmp <- FindNeighbors(tmp,dims=1:npc,verbose=FALSE)
+    tmp <- FindClusters(tmp,resolution=reso,verbose=FALSE)
+    tmpgraph <- buildSNNGraph(tmp@reductions$pca@cell.embeddings[,1:npc],transposed=T,k=10,d=NA)
+    res <- cluster_louvain(tmpgraph)$membership
+    cc <- aggregate(tmp@reductions$pca@cell.embeddings[,1:npc],list(res),mean)
+    cc <- as.matrix(cc[,-1])
+    hclu <- hclust(dist(cc))
+    clu <- cutree(hclu,cent)
+    clu <- clu[res]      
+    tmp$lv_clu <- clu
+    #tmp <- tmp@meta.data
+    tmp <- RunUMAP(tmp,dims=1:npc,verbose=FALSE)
+    return(tmp)
+}
+
+evalClustering <- function(x,npc=10,method="lv_clu"){
+    
+    acc <- -mean(sapply(unique(x@meta.data[,method]),function(i){
+        p <- table(x@meta.data[x@meta.data[,method]==i,"celltype"])/sum(x@meta.data[,method]==i)
+        sum(p*log(p),na.rm=TRUE)
+    }))
+
+    pur <- -mean(sapply(unique(x$celltype),function(sct){
+        p <- table(x@meta.data[x$celltype==sct,method])/sum(x$celltype==sct)
+        sum(p*log(p),na.rm=TRUE)
+    }))
+
+    ARI <- adjustedRandIndex(x$celltype,x@meta.data[,method])
+
+    d <- dist(x@reductions$pca@cell.embeddings[,1:npc])
+    s <- silhouette(x@meta.data[,method],dist=d)
+    medianSil <- median(s[,3])
+    
+    NMI_value <- NMI(x@meta.data[,method],x$celltype)
+    #NMI_value <- NMI(x$lv_clu,x$celltype,variant="sum")
+    
+    df <- c(acc,pur,ARI,medianSil,NMI_value)
+    names(df) <- c("acc","pur","ARI","medianSil","NMI")
+    return(df)
+}
+
+evalClustering_status <- function(x,npc=10,method="lv_clu"){
+    
+    acc <- -mean(sapply(unique(x@meta.data[,method]),function(i){
+        p <- table(x@meta.data[x@meta.data[,method]==i,"label"])/sum(x@meta.data[,method]==i)
+        sum(p*log(p),na.rm=TRUE)
+    }))
+
+    pur <- -mean(sapply(unique(x$label),function(sct){
+        p <- table(x@meta.data[x$label==sct,method])/sum(x$label==sct)
+        sum(p*log(p),na.rm=TRUE)
+    }))
+
+    ARI <- adjustedRandIndex(x$label,x@meta.data[,method])
+
+    d <- dist(x@reductions$pca@cell.embeddings[,1:npc])
+    s <- silhouette(x@meta.data[,method],dist=d)
+    medianSil <- median(s[,3])
+    
+    NMI_value <- NMI(x@meta.data[,method],x$label)
+    #NMI_value <- NMI(x$lv_clu,x$celltype,variant="sum")
+    
+    df <- c(acc,pur,ARI,medianSil,NMI_value)
+    names(df) <- c("acc","pur","ARI","medianSil","NMI")
+    return(df)
+}
+```
+
+# clustering for mixture samples
+## GSE75748 cell type
+cell level
+read data
+```{r message=FALSE, warning=FALSE}
+##bulk
+bulk_dat <- read.csv("bulk/GSE75748_bulk_cell_type_ec.csv",header=TRUE,row.names=1)
+bulk_dat <- DGEList(bulk_dat)
+keep <- filterByExpr(bulk_dat)
+bulk_dat <- bulk_dat[keep,,keep.lib.sizes=FALSE]
+bulk_dat <- calcNormFactors(bulk_dat)
+bulk_meta <- c("H1","H1","H1","H1","H9","H9","H9","DEC","DEC","EC","EC","EC","HFF","HFF","HFF","NPC","NPC","TB","TB") 
+mm <- model.matrix(~0 + bulk_meta)
+bulk_dat <- voom(bulk_dat,mm,plot=FALSE)$E
+bulk_dat <- data.frame(H1=apply(bulk_dat[,1:4],1,mean),H9=apply(bulk_dat[,5:7],1,mean),DEC=apply(bulk_dat[,8:9],1,mean),EC=apply(bulk_dat[,10:12],1,mean),HFF=apply(bulk_dat[,13:15],1,mean),NPC=apply(bulk_dat[,16:17],1,mean),TB=apply(bulk_dat[,18:19],1,mean))
+
+##raw
+raw_dat <- fread("rawcount_txt/GSE75748_sc_cell_type_genebycell.txt",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+raw_dat <- as.matrix(raw_dat,rownames=1)
+##imputed
+MAGIC_dat <- fread("MAGIC/GSE75748_sc_cell_type_genebycell.tsv",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+MAGIC_dat <- as.matrix(MAGIC_dat,rownames=1)
+alra_dat <- fread("alra/GSE75748_sc_cell_type_genebycell_alra.txt",sep="\t",stringsAsFactors=FALSE)
+alra_dat <- as.matrix(alra_dat,rownames=1)
+dca_dat <- fread("dca/GSE75748_sc_cell_type/mean.tsv",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+dca_dat <- as.matrix(dca_dat,rownames=1)
+MAGIClog_dat <- fread("MAGIC_log/GSE75748_sc_cell_type_genebycell.tsv",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+MAGIClog_dat <- as.matrix(MAGIClog_dat,rownames=1)
+AutoClass_dat <- fread("AutoClass/GSE75748_sc_cell_type_genebycell_AC.txt",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+AutoClass_dat <- as.matrix(AutoClass_dat,rownames=1)
+ccImpute_dat <- fread("ccImpute/GSE75748_sc_cell_type_genebycell_cc.txt",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+ccImpute_dat <- as.matrix(ccImpute_dat,rownames=1)
+ks_dat <- fread("knn_smoothing/GSE75748_sc_cell_type_genebycell_ks.txt",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+ks_dat <- as.matrix(ks_dat,rownames=1)
+Iimpute_dat <- fread("I_Impute/GSE75748_sc_cell_type_genebycell_CImp.txt",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+Iimpute_dat <- as.matrix(Iimpute_dat,rownames=1)
+scRMDnorm_dat <- fread("scRMD/GSE75748_sc_cell_type_genebycell_scRMDlognorm.txt",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+scRMDnorm_dat <- as.matrix(scRMDnorm_dat,rownames=1)
+Bf_dat <- fread("Bfimpute/GSE75748_sc_cell_type_genebycell_Bf_specc.txt",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+Bf_dat <- as.matrix(Bf_dat,rownames=1)
+afMF_dat <- fread("afMF/imputed_data/GSE75748_sc_cell_type_sigma3_0_convergence_True.txt",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+afMF_dat <- as.matrix(afMF_dat,rownames=1)
+
+metadat <- sapply(colnames(raw_dat),function(x) strsplit(x,"\\_")[[1]][1])
+metadat <- data.frame(cell=colnames(raw_dat),celltype=metadat)
+```
+
+normalized/log2 data
+```{r}
+raw_dat <- CreateSeuratObject(counts=raw_dat,meta.data=metadat,min.cells=0,min.features=0)
+raw_dat <- NormalizeData(raw_dat)
+raw_dat <- as.matrix(raw_dat@assays$RNA@data)
+
+dca_dat <- log2(dca_dat)
+
+ks_dat <- CreateSeuratObject(counts=ks_dat,meta.data=metadat,min.cells=0,min.features=0)
+ks_dat <- NormalizeData(ks_dat)
+ks_dat <- as.matrix(ks_dat@assays$RNA@data)
+
+Iimpute_dat <- log2(Iimpute_dat)
+```
+
+combine normalized data
+```{r}
+dat <- list(raw=raw_dat,ALRA=alra_dat,AutoClass=AutoClass_dat,Bfimpute=Bf_dat,ccImpute=ccImpute_dat,DCA=dca_dat,I_Impute=Iimpute_dat,kNN_smoothing=ks_dat,MAGIC=MAGIC_dat,MAGIC_log=MAGIClog_dat,scRMD=scRMDnorm_dat,afMF=afMF_dat)
+rm(raw_dat)
+rm(alra_dat)
+rm(AutoClass_dat)
+rm(Bf_dat)
+rm(ccImpute_dat)
+rm(Iimpute_dat)
+rm(ks_dat)
+rm(dca_dat)
+rm(MAGIC_dat)
+rm(MAGIClog_dat)
+rm(scRMDnorm_dat)
+rm(afMF_dat)
+
+#remove inconsistant genes
+colnames(dat$ALRA) <- rownames(metadat)
+bulk_dat <- bulk_dat[rownames(bulk_dat)%in%rownames(dat$DCA),]
+dat <- lapply(dat,function(x) x[rownames(bulk_dat),] )
+```
+
+cluster
+```{r message=FALSE, warning=FALSE}
+datCluster <- lapply(dat,getCluster,metadat,cent=7)
+```
+
+evaluate lv
+```{r}
+res1_lv <- as.data.frame(lapply(datCluster,evalClustering))
+as.data.frame(t(res1_lv))
+```
+
+evaluate km
+```{r}
+res1_km <- as.data.frame(lapply(datCluster,evalClustering,method="kmeans"))
+as.data.frame(t(res1_km))
+```
+
+writeout/read
+```{r}
+#writeout
+all_res <- list(lv=res1_lv,km=res1_km)
+saveRDS(all_res,"results/SC_Clustering/SC_Clustering_EvalRes_GSE75748.rds")
+```
+
+UMAP lv celltype
+```{r}
+for(x in names(datCluster)){
+    p <- DimPlot(datCluster[[x]],reduction="umap",group.by="celltype")+ggtitle(x)
+    print(p)
+}
+```
+
+PCA cell type
+```{r}
+for(x in names(datCluster)){
+    p <- DimPlot(datCluster[[x]],reduction="pca",group.by="celltype")+ggtitle(x)
+    print(p)
+}
+```
+
+## GSE81861
+read data
+```{r message=FALSE, warning=FALSE}
+bulk_dat <- readRDS("bulk/bulk_of_GSE81861_with_replicates_TPM.rds")
+bulk_dat <- bulk_dat[rowSums(bulk_dat>0)>0,]
+filterGene <- which(apply(bulk_dat,1,max)<5)
+bulk_dat <- bulk_dat[-filterGene,]
+bulk_meta <- c("K562","K562","A549","A549","GM12878","GM12878","K562","K562","IMR90","IMR90","H1","H1","GM12878","GM12878") 
+bulk_dat <- log2(bulk_dat+1)
+
+##raw
+raw_dat <- fread("rawcount_txt/GSE81861_ENCODE_genebycell.txt",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+raw_dat <- as.matrix(raw_dat,rownames=1)
+##imputed
+MAGIC_dat <- fread("MAGIC/GSE81861_ENCODE_genebycell.tsv",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+MAGIC_dat <- as.matrix(MAGIC_dat,rownames=1)
+alra_dat <- fread("alra/GSE81861_ENCODE_genebycell_alra.txt",sep="\t",stringsAsFactors=FALSE)
+alra_dat <- as.matrix(alra_dat,rownames=1)
+dca_dat <- fread("dca/GSE81861_ENCODE/mean.tsv",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+dca_dat <- as.matrix(dca_dat,rownames=1)
+MAGIClog_dat <- fread("MAGIC_log/GSE81861_ENCODE_genebycell.tsv",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+MAGIClog_dat <- as.matrix(MAGIClog_dat,rownames=1)
+AutoClass_dat <- fread("AutoClass/GSE81861_ENCODE_genebycell_AC.txt",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+AutoClass_dat <- as.matrix(AutoClass_dat,rownames=1)
+ccImpute_dat <- fread("ccImpute/GSE81861_ENCODE_genebycell_cc.txt",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+ccImpute_dat <- as.matrix(ccImpute_dat,rownames=1)
+ks_dat <- fread("knn_smoothing/GSE81861_ENCODE_genebycell_ks.txt",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+ks_dat <- as.matrix(ks_dat,rownames=1)
+Iimpute_dat <- fread("I_Impute/GSE81861_ENCODE_genebycell_CImp.txt",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+Iimpute_dat <- as.matrix(Iimpute_dat,rownames=1)
+scRMDnorm_dat <- fread("scRMD/GSE81861_ENCODE_genebycell_scRMDlognorm.txt",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+scRMDnorm_dat <- as.matrix(scRMDnorm_dat,rownames=1)
+Bf_dat <- fread("Bfimpute/GSE81861_ENCODE_genebycell_Bf_specc.txt",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+Bf_dat <- as.matrix(Bf_dat,rownames=1)
+afMF_dat <- fread("afMF/imputed_data/GSE81861_ENCODE_sigma3_0_convergence_True.txt",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+afMF_dat <- as.matrix(afMF_dat,rownames=1)
+
+metadat <- sapply(colnames(raw_dat),function(x) strsplit(x,"\\_")[[1]][1])
+metadat <- data.frame(cell=colnames(raw_dat),celltype=metadat)
+```
+
+normalized/log2 data
+```{r}
+raw_dat <- CreateSeuratObject(counts=raw_dat,meta.data=metadat,min.cells=0,min.features=0)
+raw_dat <- NormalizeData(raw_dat)
+raw_dat <- as.matrix(raw_dat@assays$RNA@data)
+
+dca_dat <- log2(dca_dat)
+
+ks_dat <- CreateSeuratObject(counts=ks_dat,meta.data=metadat,min.cells=0,min.features=0)
+ks_dat <- NormalizeData(ks_dat)
+ks_dat <- as.matrix(ks_dat@assays$RNA@data)
+
+Iimpute_dat <- log2(Iimpute_dat)
+```
+
+combine normalized data
+```{r}
+dat <- list(raw=raw_dat,ALRA=alra_dat,AutoClass=AutoClass_dat,Bfimpute=Bf_dat,ccImpute=ccImpute_dat,DCA=dca_dat,I_Impute=Iimpute_dat,kNN_smoothing=ks_dat,MAGIC=MAGIC_dat,MAGIC_log=MAGIClog_dat,scRMD=scRMDnorm_dat,afMF=afMF_dat)
+rm(raw_dat)
+rm(alra_dat)
+rm(AutoClass_dat)
+rm(Bf_dat)
+rm(ccImpute_dat)
+rm(Iimpute_dat)
+rm(ks_dat)
+rm(dca_dat)
+rm(MAGIC_dat)
+rm(MAGIClog_dat)
+rm(scRMDnorm_dat)
+rm(afMF_dat)
+
+#remove inconsistant genes
+colnames(dat$ALRA) <- rownames(metadat)
+bulk_dat <- bulk_dat[rownames(bulk_dat)%in%rownames(dat$DCA),]
+dat <- lapply(dat,function(x) x[rownames(bulk_dat),] )
+```
+
+cluster
+```{r message=FALSE, warning=FALSE}
+datCluster <- lapply(dat,getCluster,metadat,cent=5)
+```
+
+evaluate lv
+```{r}
+res1_lv <- as.data.frame(lapply(datCluster,evalClustering))
+as.data.frame(t(res1_lv))
+```
+
+evaluate km
+```{r}
+res1_km <- as.data.frame(lapply(datCluster,evalClustering,method="kmeans"))
+as.data.frame(t(res1_km))
+```
+
+writeout/read
+```{r}
+#writeout
+all_res <- list(lv=res1_lv,km=res1_km)
+saveRDS(all_res,"results/SC_Clustering/SC_Clustering_EvalRes_GSE81861.rds")
+```
+
+UMAP lv celltype
+```{r}
+for(x in names(datCluster)){
+    p <- DimPlot(datCluster[[x]],reduction="umap",group.by="celltype")+ggtitle(x)
+    print(p)
+}
+```
+
+PCA cell type
+```{r}
+for(x in names(datCluster)){
+    p <- DimPlot(datCluster[[x]],reduction="pca",group.by="celltype")+ggtitle(x)
+    print(p)
+}
+```
+
+## cell bench
+read data
+```{r message=FALSE, warning=FALSE}
+##bulk
+bulk_dat <- readRDS("bulk/cellbench/GSE86337_processed_count.rds")
+bulk_dat <- DGEList(bulk_dat)
+bulk_dat <- calcNormFactors(bulk_dat)
+bulk_meta <- c("HCC827","HCC827","H2228","H2228","H838","H838","A549","A549","H1975","H1975") 
+
+##raw
+raw_dat <- fread("rawcount_txt/cellbench_sc_10x_5cl_genebycell.txt",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+raw_dat <- as.matrix(raw_dat,rownames=1)
+##imputed
+MAGIC_dat <- fread("MAGIC/cellbench_sc_10x_5cl_genebycell.tsv",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+MAGIC_dat <- as.matrix(MAGIC_dat,rownames=1)
+alra_dat <- fread("alra/cellbench_sc_10x_5cl_genebycell_alra.txt",sep="\t",stringsAsFactors=FALSE)
+alra_dat <- as.matrix(alra_dat,rownames=1)
+dca_dat <- fread("dca/cellbench_sc_10x_5cl/mean.tsv",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+dca_dat <- as.matrix(dca_dat,rownames=1)
+MAGIClog_dat <- fread("MAGIC_log/cellbench_sc_10x_5cl_genebycell.tsv",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+MAGIClog_dat <- as.matrix(MAGIClog_dat,rownames=1)
+AutoClass_dat <- fread("AutoClass/cellbench_sc_10x_5cl_genebycell_AC.txt",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+AutoClass_dat <- as.matrix(AutoClass_dat,rownames=1)
+ccImpute_dat <- fread("ccImpute/cellbench_sc_10x_5cl_genebycell_cc.txt",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+ccImpute_dat <- as.matrix(ccImpute_dat,rownames=1)
+ks_dat <- fread("knn_smoothing/cellbench_sc_10x_5cl_genebycell_ks.txt",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+ks_dat <- as.matrix(ks_dat,rownames=1)
+Iimpute_dat <- fread("I_Impute/cellbench_sc_10x_5cl_genebycell_CImp.txt",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+Iimpute_dat <- as.matrix(Iimpute_dat,rownames=1)
+scRMDnorm_dat <- fread("scRMD/cellbench_sc_10x_5cl_genebycell_scRMDlognorm.txt",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+scRMDnorm_dat <- as.matrix(scRMDnorm_dat,rownames=1)
+Bf_dat <- fread("Bfimpute/cellbench_sc_10x_5cl_genebycell_Bf_specc.txt",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+Bf_dat <- as.matrix(Bf_dat,rownames=1)
+afMF_dat <- fread("afMF/imputed_data/cellbench_sc_10x_5cl_sigma3_0_convergence_True.txt",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+afMF_dat <- as.matrix(afMF_dat,rownames=1)
+
+metadat <- sapply(colnames(raw_dat),function(x) strsplit(x,"\\.")[[1]][2])
+metadat <- data.frame(cell=colnames(raw_dat),celltype=metadat)
+```
+
+normalized/log2 data
+```{r}
+raw_dat <- CreateSeuratObject(counts=raw_dat,meta.data=metadat,min.cells=0,min.features=0)
+raw_dat <- NormalizeData(raw_dat)
+raw_dat <- as.matrix(raw_dat@assays$RNA@data)
+
+dca_dat <- log2(dca_dat)
+
+ks_dat <- CreateSeuratObject(counts=ks_dat,meta.data=metadat,min.cells=0,min.features=0)
+ks_dat <- NormalizeData(ks_dat)
+ks_dat <- as.matrix(ks_dat@assays$RNA@data)
+
+Iimpute_dat <- log2(Iimpute_dat+min(Iimpute_dat[Iimpute_dat!=0]))
+```
+
+combine normalized data
+```{r}
+dat <- list(raw=raw_dat,ALRA=alra_dat,AutoClass=AutoClass_dat,Bfimpute=Bf_dat,ccImpute=ccImpute_dat,DCA=dca_dat,I_Impute=Iimpute_dat,kNN_smoothing=ks_dat,MAGIC=MAGIC_dat,MAGIC_log=MAGIClog_dat,scRMD=scRMDnorm_dat,afMF=afMF_dat)
+rm(raw_dat)
+rm(alra_dat)
+rm(AutoClass_dat)
+rm(Bf_dat)
+rm(ccImpute_dat)
+rm(Iimpute_dat)
+rm(ks_dat)
+rm(dca_dat)
+rm(MAGIC_dat)
+rm(MAGIClog_dat)
+rm(scRMDnorm_dat)
+rm(afMF_dat)
+
+#remove inconsistant genes
+colnames(dat$ALRA) <- rownames(metadat)
+bulk_dat <- bulk_dat[rownames(bulk_dat)%in%rownames(dat$DCA),]
+dat <- lapply(dat,function(x) x[rownames(bulk_dat),] )
+```
+
+
+cluster
+```{r message=FALSE, warning=FALSE}
+datCluster <- lapply(dat,getCluster,metadat,cent=5)
+```
+
+evaluate lv
+```{r}
+res1_lv <- as.data.frame(lapply(datCluster,evalClustering))
+as.data.frame(t(res1_lv))
+```
+
+evaluate km
+```{r}
+res1_km <- as.data.frame(lapply(datCluster,evalClustering,method="kmeans"))
+as.data.frame(t(res1_km))
+```
+
+writeout/read
+```{r}
+#writeout
+all_res <- list(lv=res1_lv,km=res1_km)
+saveRDS(all_res,"results/SC_Clustering/SC_Clustering_EvalRes_cellbench.rds")
+```
+
+UMAP celltype
+```{r fig.height=10,fig.width=10}
+p_list <- list()
+for(x in names(datCluster)[names(datCluster)!="New"]){
+    p_list[[x]] <- DimPlot(datCluster[[x]],reduction="umap",group.by="celltype")+ggtitle(x)+scale_color_brewer(palette="Set2")
+    #print(p)
+}
+clu_cellbench_umap_ct <- ggarrange(plotlist=p_list[c("raw","AutoClass","DCA","afMF","ALRA","ccImpute","I_Impute","Bfimpute","scRMD","kNN_smoothing","MAGIC_log","MAGIC")],nrow=4,ncol=3)
+clu_cellbench_umap_ct
+```
+
+UMAP lv clu
+```{r fig.height=10,fig.width=10}
+p_list <- list()
+for(x in names(datCluster)[names(datCluster)!="New"]){
+    p_list[[x]] <- DimPlot(datCluster[[x]],reduction="umap",group.by="lv_clu")+ggtitle(x)+scale_color_brewer(palette="Set2")
+    #print(p)
+}
+clu_cellbench_umap_lv <- ggarrange(plotlist=p_list[c("raw","AutoClass","DCA","afMF","ALRA","ccImpute","I_Impute","Bfimpute","scRMD","kNN_smoothing","MAGIC_log","MAGIC")],nrow=4,ncol=3)
+clu_cellbench_umap_lv
+```
+
+PCA cell type
+```{r}
+for(x in names(datCluster)){
+    p <- DimPlot(datCluster[[x]],reduction="pca",group.by="celltype")+ggtitle(x)
+    print(p)
+}
+```
+
+## summary and visualization
+read data
+```{r}
+d1 <- readRDS("results/SC_Clustering/SC_Clustering_EvalRes_GSE75748.rds")
+d2 <- readRDS("results/SC_Clustering/SC_Clustering_EvalRes_GSE81861.rds")
+d3 <- readRDS("results/SC_Clustering/SC_Clustering_EvalRes_cellbench.rds")
+
+res1_lv <- d1$lv
+res2_lv <- d2$lv
+res3_lv <- d3$lv
+
+res1_km <- d1$km
+res2_km <- d2$km
+res3_km <- d3$km
+```
+
+### process data lv
+```{r}
+##LV cluster
+rownames(res1_lv) <- c("Hacc","Hpur","ARI","medianSil","NMI")
+
+res_lv <- data.frame()
+res_lv_median <- data.frame()
+for(i in 1:2){
+    tmp1 <- res1_lv[i,1]-res1_lv[i,-1]
+    tmp2 <- res2_lv[i,1]-res2_lv[i,-1]
+    tmp3 <- res3_lv[i,1]-res3_lv[i,-1]
+    tmp <- rbind(tmp1,tmp2,tmp3)
+    rownames(tmp) <- paste0(rownames(res1_lv)[i],"_",c("GSE75748","GSE81861","cellbench"))
+    tmp_median <- apply(tmp,2,median)
+    res_lv <- rbind(res_lv,tmp)
+    res_lv_median <- rbind(res_lv_median,tmp_median)
+}
+
+for(i in 3:5){
+    tmp1 <- res1_lv[i,-1]-res1_lv[i,1]
+    tmp2 <- res2_lv[i,-1]-res2_lv[i,1]
+    tmp3 <- res3_lv[i,-1]-res3_lv[i,1]
+    tmp <- rbind(tmp1,tmp2,tmp3)
+    rownames(tmp) <- paste0(rownames(res1_lv)[i],"_",c("GSE75748","GSE81861","cellbench"))
+    tmp_median <- apply(tmp,2,median)
+    res_lv <- rbind(res_lv,tmp)
+    res_lv_median <- rbind(res_lv_median,tmp_median)
+}
+
+res_lv_median <- as.data.frame(t(res_lv_median))
+rownames(res_lv_median) <- colnames(res1_lv)[-1]
+colnames(res_lv_median) <- c("Hacc","Hpur","ARI","medianSil","NMI")
+
+res_lv_median$method <- rownames(res_lv_median)
+res_lv_median_melt <- data.table::melt(res_lv_median,id.vars=c("method"))
+colnames(res_lv_median_melt)[2:3] <- c("Metrics","Metrics_Difference")
+head(res_lv_median_melt)
+
+res_lv$Metrics_Datasets <- rownames(res_lv)
+res_lv$Metrics <- sapply(rownames(res_lv),function(x) strsplit(x,"\\_")[[1]][1] )
+res_lv_melt <- data.table::melt(res_lv,id.vars=c("Metrics_Datasets","Metrics"))
+colnames(res_lv_melt)[3:4] <- c("method","Metrics_Difference")
+head(res_lv_melt)
+```
+
+heatmap(median metrics)
+```{r}
+rank1 <- apply(res_lv_median[,-ncol(res_lv_median)],2,rank)
+rank1 <- apply(rank1,1,median)
+rank1 <- names(rank1[order(rank1)])
+res_lv_median_melt$Method <- factor(res_lv_median_melt$method,levels=unique(res_lv_median_melt$method[order(res_lv_median_melt$method)]))
+res_lv_median_melt$method <- factor(res_lv_median_melt$method,levels=rank1)
+
+tmp_hm <- res_lv_median_melt[,]
+tmp_hm[tmp_hm$Metrics_Difference<(-0.03),]$Metrics_Difference <- -0.03
+tmp_hm[tmp_hm$Metrics_Difference>(0.03),]$Metrics_Difference <- 0.03
+tmp_hm <- tmp_hm[tmp_hm$Metrics!="medianSil",]
+clu_4metric_lv_hm <- ggplot(tmp_hm,aes(method,Metrics,fill=Metrics_Difference))+geom_tile()+theme(axis.text.x=element_text(angle=90))+scale_fill_gradient2(low="blue",mid="white",high="red",midpoint=0)+ggtitle("Louvain Clustering Evaluation Metrics(Values of Difference)")+xlab("Method")+theme(legend.title=element_text(size=15),legend.text=element_text(size=14),axis.text=element_text(size=15),axis.title=element_text(size=15),plot.title=element_text(size=15))#+geom_vline(xintercept=neg_md+0.5,linetype="dashed")
+clu_4metric_lv_hm
+```
+
+### process data kmeans
+```{r}
+##LV cluster
+rownames(res1_km) <- c("Hacc","Hpur","ARI","medianSil","NMI")
+
+res_km <- data.frame()
+res_km_median <- data.frame()
+for(i in 1:2){
+    tmp1 <- res1_km[i,1]-res1_km[i,-1]
+    tmp2 <- res2_km[i,1]-res2_km[i,-1]
+    tmp3 <- res3_km[i,1]-res3_km[i,-1]
+    tmp <- rbind(tmp1,tmp2,tmp3)
+    rownames(tmp) <- paste0(rownames(res1_km)[i],"_",c("GSE75748","GSE81861","cellbench"))
+    tmp_median <- apply(tmp,2,median)
+    res_km <- rbind(res_km,tmp)
+    res_km_median <- rbind(res_km_median,tmp_median)
+}
+
+for(i in 3:5){
+    tmp1 <- res1_km[i,-1]-res1_km[i,1]
+    tmp2 <- res2_km[i,-1]-res2_km[i,1]
+    tmp3 <- res3_km[i,-1]-res3_km[i,1]
+    tmp <- rbind(tmp1,tmp2,tmp3)
+    rownames(tmp) <- paste0(rownames(res1_km)[i],"_",c("GSE75748","GSE81861","cellbench"))
+    tmp_median <- apply(tmp,2,median)
+    res_km <- rbind(res_km,tmp)
+    res_km_median <- rbind(res_km_median,tmp_median)
+}
+
+res_km_median <- as.data.frame(t(res_km_median))
+rownames(res_km_median) <- colnames(res1_km)[-1]
+colnames(res_km_median) <- c("Hacc","Hpur","ARI","medianSil","NMI")
+
+res_km_median$method <- rownames(res_km_median)
+res_km_median_melt <- data.table::melt(res_km_median,id.vars=c("method"))
+colnames(res_km_median_melt)[2:3] <- c("Metrics","Metrics_Difference")
+head(res_km_median_melt)
+
+res_km$Metrics_Datasets <- rownames(res_km)
+res_km$Metrics <- sapply(rownames(res_km),function(x) strsplit(x,"\\_")[[1]][1] )
+res_km_melt <- data.table::melt(res_km,id.vars=c("Metrics_Datasets","Metrics"))
+colnames(res_km_melt)[3:4] <- c("method","Metrics_Difference")
+head(res_km_melt)
+```
+
+heatmap(median metrics)
+```{r}
+rank1 <- apply(res_km_median[,-ncol(res_km_median)],2,rank)
+rank1 <- apply(rank1,1,median)
+rank1 <- names(rank1[order(rank1)])
+res_km_median_melt$Method <- factor(res_km_median_melt$method,levels=unique(res_km_median_melt$method[order(res_km_median_melt$method)]))
+res_km_median_melt$method <- factor(res_km_median_melt$method,levels=rank1)
+res_km_median_melt <- res_km_median_melt[res_km_median_melt$method!="New",]
+
+tmp_hm <- res_km_median_melt[,]
+tmp_hm[tmp_hm$Metrics_Difference<(-0.01),]$Metrics_Difference <- -0.01
+tmp_hm[tmp_hm$Metrics_Difference>(0.01),]$Metrics_Difference <- 0.01
+tmp_hm <- tmp_hm[tmp_hm$Metrics!="medianSil",]
+clu_4metric_km_hm <- ggplot(tmp_hm,aes(method,Metrics,fill=Metrics_Difference))+geom_tile()+theme(axis.text.x=element_text(angle=90))+scale_fill_gradient2(low="blue",mid="white",high="red",midpoint=0)+ggtitle("K-means Clustering Evaluation Metrics(Values of Difference)")+xlab("Method")+theme(legend.title=element_text(size=15),legend.text=element_text(size=14),axis.text=element_text(size=15),axis.title=element_text(size=15),plot.title=element_text(size=15))#+geom_vline(xintercept=neg_md+0.5,linetype="dashed")
+clu_4metric_km_hm
+```
+
+# cell cycle dynamics
+## GSE64016
+### preprocess
+```{r message=FALSE, warning=FALSE}
+##raw
+raw_dat <- fread("rawcount_txt/GSE64016_genebycell.txt",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+raw_dat <- as.matrix(raw_dat,rownames=1)
+##imputed
+MAGIC_dat <- fread("MAGIC/GSE64016_genebycell.tsv",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+MAGIC_dat <- as.matrix(MAGIC_dat,rownames=1)
+alra_dat <- fread("alra/GSE64016_genebycell_alra.txt",sep="\t",stringsAsFactors=FALSE)
+alra_dat <- as.matrix(alra_dat,rownames=1)
+dca_dat <- fread("dca/GSE64016/mean.tsv",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+dca_dat <- as.matrix(dca_dat,rownames=1)
+ks_dat <- fread("knn_smoothing/GSE64016_genebycell_ks.txt",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+ks_dat <- as.matrix(ks_dat,rownames=1)
+MAGIClog_dat <- fread("MAGIC_log/GSE64016_genebycell.tsv",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+MAGIClog_dat <- as.matrix(MAGIClog_dat,rownames=1)
+AutoClass_dat <- fread("AutoClass/GSE64016_genebycell_AC.txt",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+AutoClass_dat <- as.matrix(AutoClass_dat,rownames=1)
+ccImpute_dat <- fread("ccImpute/GSE64016_genebycell_cc.txt",sep="\t",stringsAsFactors=FALSE)
+ccImpute_dat <- as.matrix(ccImpute_dat,rownames=1)
+Iimpute_dat <- fread("I_Impute/GSE64016_genebycell_CImp.txt",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+Iimpute_dat <- as.matrix(Iimpute_dat,rownames=1)
+scRMDnorm_dat <- fread("scRMD/GSE64016_genebycell_scRMDlognorm.txt",sep="\t",stringsAsFactors=FALSE)
+scRMDnorm_dat <- as.matrix(scRMDnorm_dat,rownames=1)
+Bf_dat <- fread("Bfimpute/GSE64016_genebycell_Bfimpute_specc.txt",sep="\t",stringsAsFactors=FALSE)
+Bf_dat <- as.matrix(Bf_dat,rownames=1)
+afMF_dat <- fread("afMF/imputed_data/GSE64016_sigma3_0_convergence_True.txt",sep="\t",header=TRUE,stringsAsFactors=FALSE)
+afMF_dat <- as.matrix(afMF_dat,rownames=1)
+
+metadat <- sapply(colnames(raw_dat),function(x) strsplit(x,"\\_")[[1]][1])
+metadat <- data.frame(cell=colnames(raw_dat),celltype=metadat)
+```
+
+normalized data
+```{r}
+raw_dat <- CreateSeuratObject(counts=raw_dat,meta.data=metadat,min.cells=0,min.features=0)
+raw_dat <- NormalizeData(raw_dat)
+raw_dat <- as.matrix(raw_dat@assays$RNA@data)
+
+dca_dat <- log2(dca_dat+min(dca_dat[dca_dat!=0]))
+
+ks_dat <- CreateSeuratObject(counts=ks_dat,meta.data=metadat,min.cells=0,min.features=0)
+ks_dat <- NormalizeData(ks_dat)
+ks_dat <- as.matrix(ks_dat@assays$RNA@data)
+
+Iimpute_dat <- log2(Iimpute_dat)
+```
+
+combine normalized data
+```{r}
+dat <- list(raw=raw_dat,ALRA=alra_dat,AutoClass=AutoClass_dat,Bfimpute=Bf_dat,ccImpute=ccImpute_dat,DCA=dca_dat,I_Impute=Iimpute_dat,kNN_smoothing=ks_dat,MAGIC=MAGIC_dat,MAGIC_log=MAGIClog_dat,scRMD=scRMDnorm_dat,afMF=afMF_dat)
+rm(raw_dat)
+rm(alra_dat)
+rm(AutoClass_dat)
+rm(Bf_dat)
+rm(ccImpute_dat)
+rm(Iimpute_dat)
+rm(ks_dat)
+rm(dca_dat)
+rm(MAGIC_dat)
+rm(MAGIClog_dat)
+rm(scRMDnorm_dat)
+rm(afMF_dat)
+
+colnames(dat$ALRA) <- colnames(dat$raw)
+
+#keep cells with cell cycle label
+metadat <- metadat[metadat$celltype!="H1",]
+metadat[metadat$celltype=="G2",]$celltype <- "G2M"
+metadat$Phase <- factor(metadat$celltype,levels=c("G1","S","G2M"))
+dat <- lapply(dat,function(x) x[,metadat$cell] )
+```
+
+### clustering for cells:cell cycle scores with Seurat
+```{r}
+sgenes <- cc.genes$s.genes
+g2mgenes <- cc.genes$g2m.genes
+AllccGenes <- unique(c(sgenes,g2mgenes))
+
+getSeuratCC <- function(x){
+    tmp <- CreateSeuratObject(x,min.cells=0,min.features=0)
+    tmp <- ScaleData(tmp,features=rownames(tmp))
+    tmp <- CellCycleScoring(tmp,s.features=sgenes,g2m.features=g2mgenes,set.ident=TRUE,seed=42)
+    tmp <- RunPCA(tmp,features=AllccGenes,verbose=FALSE)
+    tmp <- RunUMAP(tmp,verbose=FALSE,dims=1:50)
+    return(tmp)
+}
+
+dat2 <- lapply(dat,getSeuratCC)
+
+getTruePhase <- function(x){
+    x$TruePhase <- metadat$celltype
+    return(x)
+}
+dat2 <- lapply(dat2,getTruePhase)
+```
+
+#### eval acc and f1
+```{r}
+evalPhaseAcc <- function(x,metad){
+    acc <- sum(x$Phase==metad$celltype)/nrow(metad)
+    return(acc)
+}
+
+evalCellCycleP <- function(x,metad,phase){
+    phaseCol <- paste0(phase,".Score")
+    res1 <- x@meta.data[metad$celltype==phase,phaseCol]
+    res2 <- x@meta.data[metad$celltype!=phase,phaseCol]
+    res <- wilcox.test(res1,res2,alternative="greater")$p.value
+    return(res)
+}
+
+evalPhasemedianF1 <- function(x,metad){
+    tmp <- confusionMatrix(factor(x$Phase,levels=levels(metad$Phase)),metad$Phase,mode="everything")
+    tmp <- median(tmp$byClass[,"F1"],na.rm=TRUE)
+    return(tmp)
+}
+
+evalPhaseF1 <- function(x,metad){
+    tmp <- confusionMatrix(factor(x$Phase,levels=levels(metad$Phase)),metad$Phase,mode="everything")
+    tmp <- tmp$byClass[,"F1"]
+    return(tmp)
+}
+
+```
+
+```{r}
+##accracy
+res_acc1 <- as.data.frame(lapply(dat2,evalPhaseAcc,metadat))
+res_acc1 <- as.data.frame(t(res_acc1))
+res_acc1
+
+#F1 median
+res_mf1 <- as.data.frame(lapply(dat2,evalPhasemedianF1,metadat))
+res_mf1 <- as.data.frame(t(res_mf1))
+res_mf1
+
+#cell cycle p
+res_ccp1 <- as.data.frame(lapply(dat2,evalCellCycleP,metadat,"S"))
+res_ccp2 <- as.data.frame(lapply(dat2,evalCellCycleP,metadat,"G2M"))
+res_ccp <- rbind(res_ccp1,res_ccp2)
+res_ccp <- as.data.frame(t(res_ccp))
+res_ccp
+
+#F1 all
+res_f1 <- as.data.frame(lapply(dat2,evalPhaseF1,metadat))
+res_f1
+```
+
+barplot
+Acc
+```{r}
+res_acc1$methods <- rownames(res_acc1)
+rank1 <- res_acc1[order(res_acc1$V1),]$methods
+res_acc1$Method <- factor(res_acc1$methods,levels=c("raw",res_acc1$methods[-1][order(res_acc1$methods[-1])]))
+res_acc1$method <- factor(res_acc1$methods,levels=rank1)
+
+res_acc1$Type <- "Deep learning based"
+res_acc1[res_acc1$method%in%c("ADimpute","ccImpute","I_Impute","kNN_smoothing","MAGIC","MAGIC_log","RESCUE"),]$Type <- "Model or smoothing based"
+res_acc1[res_acc1$method%in%c("ALRA","Bfimpute","afMF","scRMDraw","scRMDnorm"),]$Type <- "Matrix based"
+res_acc1[res_acc1$method%in%c("raw"),]$Type <- "Raw"
+res_acc1$Type <- factor(res_acc1$Type,levels=c("Matrix based","Model or smoothing based","Deep learning based","Raw"))
+
+colnames(res_acc1)[1] <- "Accuracy"
+
+tmp_bar <- res_acc1[,]
+
+CCD_acc_bp <- ggbarplot(tmp_bar,x="method",y="Accuracy",fill="Type",position=position_dodge(0.9),xlab="Method",ylab="Accuracy,%")+ggtitle("Predicted Cell Cycle Accuracy")+geom_hline(yintercept=res_acc1[res_acc1$methods=="raw","Accuracy"],linetype="dashed")+coord_cartesian(ylim=c(0.25,0.65))+theme(plot.title=element_text(size=16),legend.title=element_text(size=15),legend.text=element_text(size=14),axis.title=element_text(size=18),axis.text.x=element_text(angle=90,size=15),axis.text.y=element_text(size=15),legend.position="right")+scale_fill_brewer(palette="Set2")
+CCD_acc_bp
+```
+
+F1
+```{r}
+res_mf1$methods <- rownames(res_mf1)
+rank1 <- res_mf1[order(res_mf1$V1),]$methods
+res_mf1$Method <- factor(res_mf1$methods,levels=c("raw",res_mf1$methods[-1][order(res_mf1$methods[-1])]))
+res_mf1$method <- factor(res_mf1$methods,levels=rank1)
+colnames(res_mf1)[1] <- "F1"
+
+res_mf1$Type <- "Deep learning based"
+res_mf1[res_mf1$method%in%c("ADimpute","ccImpute","I_Impute","kNN_smoothing","MAGIC","MAGIC_log","RESCUE"),]$Type <- "Model or smoothing based"
+res_mf1[res_mf1$method%in%c("ALRA","Bfimpute","afMF","scRMDraw","scRMDnorm"),]$Type <- "Matrix based"
+res_mf1[res_mf1$method%in%c("raw"),]$Type <- "Raw"
+res_mf1$Type <- factor(res_mf1$Type,levels=c("Matrix based","Model or smoothing based","Deep learning based","Raw"))
+
+tmp_bar <- res_mf1[,]
+
+CCD_f1_bp <- ggbarplot(tmp_bar,x="method",y="F1",fill="Type",position=position_dodge(0.9),xlab="Method",ylab="F1 score")+ggtitle("Predicted Cell Cycle F1 score(Median)")+geom_hline(yintercept=res_mf1[res_mf1$methods=="raw","F1"],linetype="dashed")+coord_cartesian(ylim=c(0.35,0.8))+theme(plot.title=element_text(size=16),legend.title=element_text(size=15),legend.text=element_text(size=14),axis.title=element_text(size=18),axis.text.x=element_text(angle=90,size=15),axis.text.y=element_text(size=15),legend.position="right")+scale_fill_brewer(palette="Set2")
+CCD_f1_bp
+```
+
+Pvalue
+```{r}
+colnames(res_ccp) <- c("S vs Others","G2M vs Others")
+res_ccp$`S vs Others` <- log10(res_ccp$`S vs Others`)*(-1)
+res_ccp$`G2M vs Others` <- log10(res_ccp$`G2M vs Others`)*(-1)
+res_ccp$methods <- rownames(res_ccp)
+res_ccp_melt <- data.table::melt(res_ccp,id.vars=c("methods"),variable.name="Cell_Cycle",value.name="log10P")
+head(res_ccp_melt)
+```
+
+barplot
+```{r}
+res_ccp_melt$Method <- factor(res_ccp_melt$methods,levels=c("raw",res_ccp$methods[-1][order(res_ccp$methods[-1])]))
+
+tmp_bar <- res_ccp_melt[,]
+CCD_compare_bp <- ggbarplot(tmp_bar,x="Cell_Cycle",y="log10P",fill="Method",palette=selected_palette2,position=position_dodge(0.9),xlab="Cell Cycle Comparison",ylab="-log10(P)")+ggtitle("Comparison of predicted cell cycle score between known cell cycle status")+theme(legend.title=element_text(size=15),legend.text=element_text(size=14),axis.text=element_text(size=15),axis.title=element_text(size=15),plot.title=element_text(size=15))
+CCD_compare_bp
+```
+
+#### pca and umap
+pca(not clear; removed)
+```{r}
+for(x in names(dat2)){
+    print(DimPlot(dat2[[x]],group.by="TruePhase",reduction="pca",pt.size=5)+ggtitle(x))
+}
+```
+
+umap true phase
+```{r fig.height=8, fig.width=12}
+p_list <- list()
+
+rank_name <- c("raw",names(dat2)[-1][order(names(dat2)[-1])])
+for(x in rank_name){
+    p_list[[x]] <- DimPlot(dat2[[x]],group.by="TruePhase",reduction="umap",pt.size=5)+ggtitle(x)+scale_color_brewer(palette="Set2")
+}
+
+CCD_umap_true <- ggarrange(plotlist=p_list[c("raw","MAGIC","AutoClass","DCA","afMF","ALRA","ccImpute","I_Impute","Bfimpute","scRMD","kNN_smoothing","MAGIC_log")],ncol=4,nrow=3)
+CCD_umap_true
+```
+
+
+# combine plot
+## main
+```{r fig.height=7.4, fig.width=11}
+#h12.3 w11 for 3
+p1 <- ggarrange(clu_4metric_lv_hm,clu_4metric_km_hm,CCD_compare_bp,ncol=3,labels="AUTO")
+p2 <- ggarrange(CCD_umap_true,labels=c("D"))
+
+ggarrange(p1,p2,nrow=2,heights=c(1,2))
+```
+
+## supp1
+```{r fig.height=2.5,fig.width=8}
+ggarrange(CCD_acc_bp,CCD_f1_bp,ncol=2,nrow=1,labels="AUTO")
+```
+
+## supp2
+```{r fig.height=5, fig.width=11}
+ggarrange(difftraj_umap2_raw,difftraj_umap2_afMF,difftraj_umap2_alra,difftraj_umap2_ac,difftraj_umap2_magic,ncol=3,nrow=2,labels="AUTO")
+```
+
+
+
