@@ -12,6 +12,5 @@ print(imputed_dat.iloc[:, : 5].head(5))
 
 Pesudo Code : 
 
-![pesudo_1](https://github.com/user-attachments/assets/463da4ee-3fa7-44df-9524-721b520c9346)
-![pesudo_2](https://github.com/user-attachments/assets/e80e6b0f-76b4-48fb-9c6d-1778ac19e881)
-![pesudo_3](https://github.com/user-attachments/assets/98099bf7-d06b-4678-b1c7-b28d50a94467)
+![pesudo_1](https://github.com/user-attachments/assets/afcd39fc-15b5-4d55-984f-410fa322a878)
+![pesudo_2](https://github.com/user-attachments/assets/7ff1af88-3486-48bf-a967-e2fb8bf735ba)
